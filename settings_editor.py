@@ -11,6 +11,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+VERSION = "1.1.0"
+
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
     CONFIG_DIR = Path(os.environ.get("APPDATA", "")) / APP_NAME
@@ -39,8 +41,8 @@ def main():
     config = load_config()
     
     dialog = tk.Tk()
-    dialog.title("Stream Monitor Settings")
-    dialog.geometry("450x420")
+    dialog.title(f"Stream Monitor Settings - v{VERSION}")
+    dialog.geometry("450x450")
     dialog.resizable(False, False)
     
     # Center window

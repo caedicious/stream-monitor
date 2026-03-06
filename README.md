@@ -10,6 +10,7 @@ A Windows application that monitors Twitch streamers and automatically opens the
 - **Unlimited Streamers**: Monitor as many streamers as you want
 - **Smart Detection**: Only opens browser when streamer goes from offline → live (no spam)
 - **Settings GUI**: Right-click tray icon to change streamers anytime
+- **Auto-Update Check**: Notifies you when a new version is available
 
 ## For Users
 
@@ -20,6 +21,10 @@ Download the installer from the Releases page and run it. The setup wizard will 
 3. Entering your API credentials
 
 After setup, Stream Monitor runs in your system tray and automatically starts when you log in.
+
+### Updating
+
+When a new version is available, you'll see "Update available" in the tray tooltip. Click "Check for Updates" in the menu to download the new installer. Your settings will be preserved during the update.
 
 ### Changing Settings
 

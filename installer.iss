@@ -2,7 +2,7 @@
 ; Download Inno Setup from: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "Stream Monitor"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.1"
 #define MyAppPublisher "Stream Monitor"
 #define MyAppExeName "StreamMonitor.exe"
 #define MyAppSetupExeName "StreamMonitorSetup.exe"
@@ -23,6 +23,10 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
+; Allow upgrading without uninstalling
+UsePreviousAppDir=yes
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -39,22 +43,53 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Comment: "Start Stream Monitor with Windows"
 
 [Run]
-; Run the setup wizard after installation
-Filename: "{app}\{#MyAppSetupExeName}"; Description: "Configure Stream Monitor"; Flags: nowait postinstall skipifsilent
+; Run the setup wizard only on fresh install, or main app on upgrade
+Filename: "{app}\{#MyAppSetupExeName}"; Description: "Configure Stream Monitor"; Flags: nowait postinstall skipifsilent; Check: IsFirstInstall
+Filename: "{app}\{#MyAppExeName}"; Description: "Start Stream Monitor"; Flags: nowait postinstall skipifsilent; Check: IsUpgrade
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{userappdata}\StreamMonitor"
+; Only delete config on full uninstall, not upgrade
+; Config is preserved during upgrade since we're not explicitly deleting it during install
 
 [Code]
+var
+  ConfigExists: Boolean;
+
+function InitializeSetup(): Boolean;
+var
+  ConfigPath: String;
+begin
+  // Check if config exists (indicates existing installation)
+  ConfigPath := ExpandConstant('{userappdata}\StreamMonitor\config.json');
+  ConfigExists := FileExists(ConfigPath);
+  Result := True;
+end;
+
+function IsFirstInstall(): Boolean;
+begin
+  Result := not ConfigExists;
+end;
+
+function IsUpgrade(): Boolean;
+begin
+  Result := ConfigExists;
+end;
+
 // Remove startup shortcut on uninstall
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   StartupPath: String;
+  ConfigDir: String;
 begin
   if CurUninstallStep = usPostUninstall then
   begin
     StartupPath := ExpandConstant('{userstartup}\{#MyAppName}.lnk');
     if FileExists(StartupPath) then
       DeleteFile(StartupPath);
+    
+    // Delete config directory on full uninstall
+    ConfigDir := ExpandConstant('{userappdata}\StreamMonitor');
+    if DirExists(ConfigDir) then
+      DelTree(ConfigDir, True, True, True);
   end;
 end;

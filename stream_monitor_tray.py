@@ -19,6 +19,10 @@ import pystray
 from pystray import MenuItem as Item
 from PIL import Image, ImageDraw
 
+# Version
+VERSION = "1.1.0"
+GITHUB_REPO = "caedicious/stream-monitor"
+
 # Configuration paths
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
@@ -282,6 +286,69 @@ class StreamMonitorApp:
         if self.monitor and self.monitor.running:
             self.monitor.stop()
     
+    def on_check_updates(self, icon, item):
+        """Check for updates and notify user."""
+        threading.Thread(target=self._check_for_updates_ui, daemon=True).start()
+    
+    def _check_for_updates_ui(self):
+        """Check for updates with UI feedback."""
+        self.update_status("Checking for updates...")
+        update_available, latest_version, download_url = self.check_for_updates()
+        
+        if update_available:
+            self.update_status(f"Update available: v{latest_version}")
+            # Open browser to releases page
+            webbrowser.open(download_url)
+        else:
+            self.update_status("Up to date!")
+            time.sleep(3)
+            if self.monitor and self.monitor.running:
+                self.update_status("Monitoring...")
+            else:
+                self.update_status("Stopped")
+    
+    def check_for_updates(self) -> tuple[bool, str, str]:
+        """
+        Check GitHub for newer releases.
+        Returns: (update_available, latest_version, download_url)
+        """
+        try:
+            response = requests.get(
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            latest_version = data.get("tag_name", "").lstrip("v")
+            download_url = data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases")
+            
+            # Compare versions
+            if self._is_newer_version(latest_version, VERSION):
+                return True, latest_version, download_url
+            
+            return False, latest_version, download_url
+            
+        except requests.RequestException as e:
+            print(f"Update check failed: {e}")
+            return False, VERSION, f"https://github.com/{GITHUB_REPO}/releases"
+    
+    def _is_newer_version(self, latest: str, current: str) -> bool:
+        """Compare version strings (e.g., '1.2.0' > '1.1.0')."""
+        try:
+            latest_parts = [int(x) for x in latest.split(".")]
+            current_parts = [int(x) for x in current.split(".")]
+            
+            # Pad to same length
+            while len(latest_parts) < len(current_parts):
+                latest_parts.append(0)
+            while len(current_parts) < len(latest_parts):
+                current_parts.append(0)
+            
+            return latest_parts > current_parts
+        except ValueError:
+            return False
+    
     def on_exit(self, icon, item):
         if self.monitor:
             self.monitor.stop()
@@ -290,6 +357,8 @@ class StreamMonitorApp:
     def create_menu(self):
         return pystray.Menu(
             Item("Settings", self.on_settings),
+            Item("Check for Updates", self.on_check_updates),
+            pystray.Menu.SEPARATOR,
             Item("Start", self.on_start),
             Item("Stop", self.on_stop),
             pystray.Menu.SEPARATOR,
@@ -314,8 +383,18 @@ class StreamMonitorApp:
         else:
             self.update_status("Not configured")
         
+        # Check for updates on startup (silently)
+        threading.Thread(target=self._startup_update_check, daemon=True).start()
+        
         # Run the icon (blocking)
         self.icon.run()
+    
+    def _startup_update_check(self):
+        """Check for updates silently on startup."""
+        time.sleep(5)  # Wait a bit after startup
+        update_available, latest_version, download_url = self.check_for_updates()
+        if update_available:
+            self.update_status(f"Update available: v{latest_version}")
 
 
 def main():

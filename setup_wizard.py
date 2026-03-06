@@ -15,6 +15,8 @@ from tkinter import ttk, messagebox
 
 import requests
 
+VERSION = "1.1.0"
+
 # Configuration
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
@@ -30,7 +32,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 class SetupWizard:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Stream Monitor Setup")
+        self.root.title(f"Stream Monitor Setup - v{VERSION}")
         self.root.geometry("600x500")
         self.root.resizable(False, False)
         
