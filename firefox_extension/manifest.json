@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Stream Monitor Tab Closer",
+  "version": "1.2.0",
+  "description": "Automatically closes Twitch tabs when the streamer raids someone else. Works with Stream Monitor.",
+  
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "stream-monitor-tab-closer@caedicious",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": ["none"],
+        "optional": []
+      }
+    }
+  },
+  
+  "permissions": [
+    "tabs"
+  ],
+  
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  
+  "background": {
+    "scripts": ["background.js"]
+  },
+  
+  "action": {
+    "default_icon": {
+      "48": "icon-48.png",
+      "96": "icon-96.png"
+    },
+    "default_title": "Stream Monitor Tab Closer"
+  },
+  
+  "icons": {
+    "48": "icon-48.png",
+    "96": "icon-96.png"
+  }
+}

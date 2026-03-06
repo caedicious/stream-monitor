@@ -11,6 +11,7 @@ A Windows application that monitors Twitch streamers and automatically opens the
 - **Smart Detection**: Only opens browser when streamer goes from offline → live (no spam)
 - **Settings GUI**: Right-click tray icon to change streamers anytime
 - **Auto-Update Check**: Notifies you when a new version is available
+- **Raid Detection** (Firefox Extension): Automatically closes tabs when streamer raids someone else
 
 ## For Users
 
@@ -21,6 +22,17 @@ Download the installer from the Releases page and run it. The setup wizard will 
 3. Entering your API credentials
 
 After setup, Stream Monitor runs in your system tray and automatically starts when you log in.
+
+### Firefox Extension (Optional)
+
+If you want tabs to auto-close when a streamer raids someone else:
+
+1. Download `stream_monitor_tab_closer.xpi` from the Releases page
+2. Open Firefox → `about:addons`
+3. Click gear icon → "Install Add-on From File"
+4. Select the downloaded .xpi file
+
+The extension communicates with the desktop app to know which streamers you're monitoring.
 
 ### Updating
 

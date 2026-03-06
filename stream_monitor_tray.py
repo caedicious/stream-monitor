@@ -13,6 +13,7 @@ import webbrowser
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional, Callable
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 import pystray
@@ -20,8 +21,9 @@ from pystray import MenuItem as Item
 from PIL import Image, ImageDraw
 
 # Version
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 GITHUB_REPO = "caedicious/stream-monitor"
+CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
 # Configuration paths
 APP_NAME = "StreamMonitor"
@@ -31,6 +33,50 @@ else:
     CONFIG_DIR = Path.home() / ".config" / APP_NAME.lower()
 
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+class ConfigRequestHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler to serve config to the browser extension."""
+    
+    config_data = {}
+    
+    def do_GET(self):
+        if self.path == "/config":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "moz-extension://*")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(self.config_data).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_OPTIONS(self):
+        """Handle CORS preflight."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+    
+    def log_message(self, format, *args):
+        """Suppress logging."""
+        pass
+
+
+def start_config_server(config: "Config"):
+    """Start a localhost HTTP server to serve config to the browser extension."""
+    ConfigRequestHandler.config_data = {
+        "streamers": config.streamers,
+        "version": VERSION
+    }
+    
+    try:
+        server = HTTPServer(("127.0.0.1", CONFIG_SERVER_PORT), ConfigRequestHandler)
+        server.serve_forever()
+    except OSError as e:
+        print(f"Config server failed to start: {e}")
 
 
 @dataclass
@@ -271,6 +317,11 @@ class StreamMonitorApp:
                 new_config = json.dumps(asdict(new_config_obj), sort_keys=True)
                 if new_config != old_config:
                     self.config = new_config_obj
+                    # Update config server for browser extension
+                    ConfigRequestHandler.config_data = {
+                        "streamers": self.config.streamers,
+                        "version": VERSION
+                    }
                     if self.monitor:
                         self.monitor.config = self.config
                         self.monitor.restart()
@@ -366,6 +417,9 @@ class StreamMonitorApp:
         )
     
     def run(self):
+        # Start config server for browser extension
+        threading.Thread(target=lambda: start_config_server(self.config), daemon=True).start()
+        
         # Create monitor
         self.monitor = TwitchMonitor(self.config, self.update_status)
         
