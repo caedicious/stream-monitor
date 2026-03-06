@@ -5,10 +5,6 @@
 [![License](https://img.shields.io/badge/license-All%20Rights%20Reserved-red)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 
-A Windows application that monitors Twitch streamers...
-
-A Windows application that monitors Twitch streamers...
-
 A Windows application that monitors Twitch streamers and automatically opens their stream in your browser when they go live.
 
 ## Features
