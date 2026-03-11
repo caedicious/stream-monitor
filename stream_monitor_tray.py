@@ -21,7 +21,7 @@ from pystray import MenuItem as Item
 from PIL import Image, ImageDraw
 
 # Version
-VERSION = "1.2.0"
+VERSION = "1.3.2"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -35,11 +35,18 @@ else:
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
+def _get_about_html_path() -> Path:
+    """Return the path to about.html, works both frozen (exe) and as script."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent / "about.html"
+    return Path(__file__).parent / "about.html"
+
+
 class ConfigRequestHandler(BaseHTTPRequestHandler):
-    """Simple HTTP handler to serve config to the browser extension."""
-    
+    """Simple HTTP handler to serve config and about page."""
+
     config_data = {}
-    
+
     def do_GET(self):
         if self.path == "/config":
             self.send_response(200)
@@ -48,6 +55,17 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(self.config_data).encode())
+        elif self.path.startswith("/about"):
+            about_file = _get_about_html_path()
+            if about_file.exists():
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(about_file.read_bytes())
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"about.html not found")
         else:
             self.send_response(404)
             self.end_headers()
@@ -85,6 +103,8 @@ class Config:
     client_secret: str = ""
     streamers: list = None
     check_interval: int = 60
+    last_run_version: str = ""
+    paused: bool = False
     
     def __post_init__(self):
         if self.streamers is None:
@@ -126,6 +146,7 @@ class TwitchMonitor:
         self.oauth_token: Optional[str] = None
         self.streamers: dict[str, StreamerState] = {}
         self.running = False
+        self.paused = False
         self.thread: Optional[threading.Thread] = None
         self.status_callback = status_callback or (lambda x: None)
         
@@ -188,21 +209,29 @@ class TwitchMonitor:
         live_count = 0
         for username, is_live in current_status.items():
             state = self.streamers[username]
-            
+
             if is_live:
                 live_count += 1
                 if not state.was_live and not state.browser_opened:
-                    self.status_callback(f"{username} went LIVE!")
-                    self.open_stream(username)
-                    state.browser_opened = True
+                    if self.paused:
+                        self.status_callback(f"{username} went LIVE! (paused)")
+                    else:
+                        self.status_callback(f"{username} went LIVE!")
+                        self.open_stream(username)
+                        state.browser_opened = True
                 state.was_live = True
             else:
                 if state.was_live:
                     self.status_callback(f"{username} went offline")
                     state.was_live = False
                     state.browser_opened = False
-        
-        if live_count > 0:
+
+        if self.paused:
+            if live_count > 0:
+                self.status_callback(f"PAUSED — {live_count} streamer(s) live")
+            else:
+                self.status_callback("Paused")
+        elif live_count > 0:
             self.status_callback(f"{live_count} streamer(s) live")
         else:
             self.status_callback("Monitoring...")
@@ -280,6 +309,7 @@ class StreamMonitorApp:
         self.monitor: Optional[TwitchMonitor] = None
         self.icon: Optional[pystray.Icon] = None
         self.status = "Starting..."
+        self.paused = self.config.paused
         
     def update_status(self, status: str):
         self.status = status
@@ -400,6 +430,29 @@ class StreamMonitorApp:
         except ValueError:
             return False
     
+    def on_pause_toggle(self, icon, item):
+        """Toggle pause state."""
+        self.paused = not self.paused
+        self.config.paused = self.paused
+        self.config.save()
+        if self.monitor:
+            self.monitor.paused = self.paused
+        if self.paused:
+            self.update_status("Paused")
+            self.icon.icon = create_icon_image("gray")
+        else:
+            self.icon.icon = create_icon_image("purple")
+            if self.monitor and self.monitor.running:
+                self.update_status("Monitoring...")
+            else:
+                self.update_status("Stopped")
+        # Rebuild menu to update checkmark
+        self.icon.menu = self.create_menu()
+
+    def on_about(self, icon, item):
+        """Open the about page in the browser."""
+        webbrowser.open(f"http://127.0.0.1:{CONFIG_SERVER_PORT}/about?v={VERSION}")
+
     def on_exit(self, icon, item):
         if self.monitor:
             self.monitor.stop()
@@ -410,9 +463,11 @@ class StreamMonitorApp:
             Item("Settings", self.on_settings),
             Item("Check for Updates", self.on_check_updates),
             pystray.Menu.SEPARATOR,
+            Item("Pause", self.on_pause_toggle, checked=lambda item: self.paused),
             Item("Start", self.on_start),
             Item("Stop", self.on_stop),
             pystray.Menu.SEPARATOR,
+            Item("About (CaedVT)", self.on_about),
             Item("Exit", self.on_exit)
         )
     
@@ -422,27 +477,62 @@ class StreamMonitorApp:
         
         # Create monitor
         self.monitor = TwitchMonitor(self.config, self.update_status)
-        
-        # Create system tray icon
+        self.monitor.paused = self.paused
+
+        # Create system tray icon (gray if paused)
+        icon_color = "gray" if self.paused else "purple"
         self.icon = pystray.Icon(
             "stream_monitor",
-            create_icon_image("purple"),
+            create_icon_image(icon_color),
             "Stream Monitor",
             self.create_menu()
         )
-        
+
         # Auto-start if config is valid
         if self.config.is_valid():
             threading.Thread(target=lambda: time.sleep(1) or self.monitor.start(), daemon=True).start()
         else:
             self.update_status("Not configured")
+
+        # Show warning if paused
+        if self.paused:
+            self.update_status("Paused")
+            threading.Thread(target=self._show_paused_warning, daemon=True).start()
         
+        # Show welcome page on first run or after update
+        if self.config.last_run_version != VERSION:
+            self.config.last_run_version = VERSION
+            self.config.save()
+            # Delay slightly so the config server is ready
+            threading.Thread(
+                target=lambda: (
+                    time.sleep(2),
+                    webbrowser.open(
+                        f"http://127.0.0.1:{CONFIG_SERVER_PORT}/about?v={VERSION}&welcome=1"
+                    ),
+                ),
+                daemon=True,
+            ).start()
+
         # Check for updates on startup (silently)
         threading.Thread(target=self._startup_update_check, daemon=True).start()
-        
+
         # Run the icon (blocking)
         self.icon.run()
     
+    def _show_paused_warning(self):
+        """Show a warning dialog that stream opening is paused."""
+        import ctypes
+        time.sleep(2)  # Wait for tray icon to appear
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            "Stream Monitor is currently PAUSED.\n\n"
+            "Streams will NOT open automatically when monitored streamers go live.\n\n"
+            "Right-click the tray icon and uncheck 'Pause' to resume.",
+            "Stream Monitor — Paused",
+            0x30  # MB_ICONWARNING
+        )
+
     def _startup_update_check(self):
         """Check for updates silently on startup."""
         time.sleep(5)  # Wait a bit after startup
