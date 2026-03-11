@@ -30,9 +30,7 @@ pyinstaller --onefile --windowed --name "StreamMonitor" --icon=icon.ico stream_m
 
 echo.
 echo [6/6] Packaging Firefox Extension...
-cd firefox_extension
-tar -cvf ../dist/stream_monitor_tab_closer.xpi *
-cd ..
+python -c "import zipfile,os;xpi='dist/stream_monitor_tab_closer.xpi';[os.remove(xpi)] if os.path.exists(xpi) else None;zf=zipfile.ZipFile(xpi,'w',zipfile.ZIP_DEFLATED);[zf.write(os.path.join(r,f),os.path.relpath(os.path.join(r,f),'firefox_extension')) for r,d,fs in os.walk('firefox_extension') for f in fs];zf.close();print('Created',xpi)"
 
 echo.
 echo ========================================
