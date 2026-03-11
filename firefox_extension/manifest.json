@@ -16,7 +16,9 @@
   },
   
   "permissions": [
-    "tabs"
+    "tabs",
+    "storage",
+    "alarms"
   ],
   
   "host_permissions": [
