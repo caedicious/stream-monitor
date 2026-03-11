@@ -53,4 +53,10 @@ document.getElementById("open-full").addEventListener("click", (e) => {
   window.close();
 });
 
+document.getElementById("credit-link").addEventListener("click", (e) => {
+  e.preventDefault();
+  browser.tabs.create({ url: "http://127.0.0.1:52832/about" });
+  window.close();
+});
+
 loadDebugInfo();

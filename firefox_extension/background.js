@@ -247,6 +247,13 @@ browser.tabs.onUpdated.addListener(onTabUpdated);
 browser.tabs.onRemoved.addListener(onTabRemoved);
 browser.alarms.onAlarm.addListener(onAlarm);
 
+// Open welcome page on first install only (not on updates)
+browser.runtime.onInstalled.addListener((details) => {
+  if (details.reason === "install") {
+    browser.tabs.create({ url: browser.runtime.getURL("welcome.html") });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Initialization — runs every time the event page starts (or restarts)
 // ---------------------------------------------------------------------------
