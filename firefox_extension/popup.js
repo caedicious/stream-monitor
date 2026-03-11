@@ -1,3 +1,18 @@
+// --- Settings ---
+const autoMuteEl = document.getElementById("auto-mute");
+
+async function loadSettings() {
+  const { autoMute = false } = await browser.storage.local.get("autoMute");
+  autoMuteEl.checked = autoMute;
+}
+
+autoMuteEl.addEventListener("change", async () => {
+  await browser.storage.local.set({ autoMute: autoMuteEl.checked });
+});
+
+loadSettings();
+
+// --- Debug info ---
 async function loadDebugInfo() {
   const { debugLog = [], trackedTabs = {}, monitoredStreamers = [] } =
     await browser.storage.local.get(["debugLog", "trackedTabs", "monitoredStreamers"]);

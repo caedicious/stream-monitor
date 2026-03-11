@@ -52,6 +52,55 @@
     }
     button:hover { background: #8e44ad; }
     .controls { margin-bottom: 10px; }
+    .setting {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #16213e;
+      padding: 8px;
+      border-radius: 4px;
+      margin-bottom: 8px;
+    }
+    .setting label {
+      cursor: pointer;
+    }
+    .toggle {
+      position: relative;
+      width: 36px;
+      height: 20px;
+      flex-shrink: 0;
+      margin-left: 10px;
+    }
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .toggle .slider {
+      position: absolute;
+      inset: 0;
+      background: #444;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .toggle .slider::before {
+      content: "";
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      left: 3px;
+      top: 3px;
+      background: white;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    .toggle input:checked + .slider {
+      background: #9b59b6;
+    }
+    .toggle input:checked + .slider::before {
+      transform: translateX(16px);
+    }
     a {
       color: #3498db;
       text-decoration: none;
@@ -66,6 +115,14 @@
     <button id="refresh">Refresh</button>
     <button id="clear">Clear Log</button>
     <a href="#" id="open-full">Open in full tab</a>
+  </div>
+  <div class="section-title">— Settings —</div>
+  <div class="setting">
+    <label for="auto-mute">Auto-mute opened tabs</label>
+    <div class="toggle">
+      <input type="checkbox" id="auto-mute">
+      <label class="slider" for="auto-mute"></label>
+    </div>
   </div>
   <div class="section-title">— State —</div>
   <div id="state" class="state-block">Loading...</div>
