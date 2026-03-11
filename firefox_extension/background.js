@@ -63,6 +63,19 @@ async function saveMonitoredStreamers(streamersSet) {
   await browser.storage.local.set({ monitoredStreamers: Array.from(streamersSet) });
 }
 
+async function shouldAutoMute() {
+  const { autoMute = false } = await browser.storage.local.get("autoMute");
+  return autoMute;
+}
+
+async function muteTabIfEnabled(tabId) {
+  if (await shouldAutoMute()) {
+    await browser.tabs.update(tabId, { muted: true });
+    return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
@@ -142,7 +155,8 @@ async function scanExistingTabs() {
     const streamer = getStreamerFromUrl(tab.url);
     if (streamer && monitoredStreamers.has(streamer) && !trackedTabs[String(tab.id)]) {
       trackedTabs[String(tab.id)] = { originalStreamer: streamer };
-      await log("info", `Scan: tracking tab ${tab.id} for ${streamer}`);
+      const muted = await muteTabIfEnabled(tab.id);
+      await log("info", `Scan: tracking tab ${tab.id} for ${streamer}${muted ? " (muted)" : ""}`);
       changed = true;
     }
   }
@@ -164,7 +178,8 @@ async function onTabCreated(tab) {
   if (streamer && monitoredStreamers.has(streamer)) {
     trackedTabs[String(tab.id)] = { originalStreamer: streamer };
     await saveTrackedTabs(trackedTabs);
-    await log("info", `Tab ${tab.id} created for monitored streamer: ${streamer}`);
+    const muted = await muteTabIfEnabled(tab.id);
+    await log("info", `Tab ${tab.id} created for monitored streamer: ${streamer}${muted ? " (muted)" : ""}`);
   }
 }
 
@@ -198,7 +213,8 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
     // New navigation to a monitored streamer in an untracked tab
     trackedTabs[tabKey] = { originalStreamer: newStreamer };
     await saveTrackedTabs(trackedTabs);
-    await log("info", `Tab ${tabId} navigated to monitored streamer: ${newStreamer}`);
+    const muted = await muteTabIfEnabled(tabId);
+    await log("info", `Tab ${tabId} navigated to monitored streamer: ${newStreamer}${muted ? " (muted)" : ""}`);
   }
 }
 
