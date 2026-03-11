@@ -82,21 +82,37 @@ function getStreamerFromUrl(url) {
 // ---------------------------------------------------------------------------
 
 async function fetchConfig() {
+  // Check if host permission is granted
+  const hasPerm = await browser.permissions.contains({ origins: ["http://127.0.0.1/*"] });
+  await log("info", "Host permission granted:", hasPerm);
+
   try {
-    const response = await fetch(CONFIG_URL);
-    if (response.ok) {
-      const data = await response.json();
-      if (data.streamers && Array.isArray(data.streamers)) {
-        const streamersSet = new Set(data.streamers.map(s => s.toLowerCase()));
-        await saveMonitoredStreamers(streamersSet);
-        await log("info", "Config loaded, streamers:", Array.from(streamersSet));
-        return streamersSet;
-      }
-    } else {
-      await log("warn", "Config server returned status", response.status);
+    // Use XMLHttpRequest — more reliable for cross-origin in Firefox extensions
+    const data = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("GET", CONFIG_URL);
+      xhr.responseType = "json";
+      xhr.timeout = 5000;
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(xhr.response);
+        } else {
+          reject(new Error(`HTTP ${xhr.status}`));
+        }
+      };
+      xhr.onerror = () => reject(new Error("XHR network error"));
+      xhr.ontimeout = () => reject(new Error("XHR timeout"));
+      xhr.send();
+    });
+
+    if (data?.streamers && Array.isArray(data.streamers)) {
+      const streamersSet = new Set(data.streamers.map(s => s.toLowerCase()));
+      await saveMonitoredStreamers(streamersSet);
+      await log("info", "Config loaded, streamers:", Array.from(streamersSet));
+      return streamersSet;
     }
-  } catch {
-    await log("info", "Could not connect to Stream Monitor app (not running?)");
+  } catch (e) {
+    await log("warn", "Config fetch failed:", e?.message || String(e));
   }
   return null;
 }
@@ -205,35 +221,6 @@ async function onAlarm(alarm) {
   }
 }
 
-async function onActionClicked() {
-  // Dump debug log to a new tab for easy viewing
-  const { debugLog = [] } = await browser.storage.local.get("debugLog");
-  const { trackedTabs = {}, monitoredStreamers = [] } =
-    await browser.storage.local.get(["trackedTabs", "monitoredStreamers"]);
-
-  const lines = [
-    "=== Stream Monitor Tab Closer — Debug Log ===",
-    "",
-    `Monitored streamers: ${monitoredStreamers.length > 0 ? monitoredStreamers.join(", ") : "(none)"}`,
-    `Tracked tabs: ${JSON.stringify(trackedTabs, null, 2)}`,
-    "",
-    `--- Last ${debugLog.length} log entries ---`,
-    "",
-    ...debugLog.map(e => `[${e.ts}] [${e.level}] ${e.msg}`),
-  ];
-
-  const html = `<html><head><title>Stream Monitor Debug</title>
-<style>body{background:#1a1a2e;color:#e0e0e0;font-family:monospace;font-size:13px;padding:20px;white-space:pre-wrap;line-height:1.5}
-h1{color:#9b59b6;font-size:18px}</style></head>
-<body><h1>Stream Monitor Tab Closer — Debug Log</h1>
-${lines.map(l => l.replace(/</g, "&lt;")).join("\n")}</body></html>`;
-
-  const blob = new Blob([html], { type: "text/html" });
-  const url = URL.createObjectURL(blob);
-  await browser.tabs.create({ url });
-  await log("info", "Debug log opened in new tab");
-}
-
 // ---------------------------------------------------------------------------
 // CRITICAL: Register all event listeners SYNCHRONOUSLY at the top level.
 // This ensures Firefox re-wires them when the event page wakes up.
@@ -243,7 +230,6 @@ browser.tabs.onCreated.addListener(onTabCreated);
 browser.tabs.onUpdated.addListener(onTabUpdated);
 browser.tabs.onRemoved.addListener(onTabRemoved);
 browser.alarms.onAlarm.addListener(onAlarm);
-browser.action.onClicked.addListener(onActionClicked);
 
 // ---------------------------------------------------------------------------
 // Initialization — runs every time the event page starts (or restarts)

@@ -20,7 +20,7 @@
     "storage",
     "alarms"
   ],
-  
+
   "host_permissions": [
     "http://127.0.0.1/*"
   ],
@@ -34,7 +34,8 @@
       "48": "icon-48.png",
       "96": "icon-96.png"
     },
-    "default_title": "Stream Monitor Tab Closer"
+    "default_title": "Stream Monitor Tab Closer",
+    "default_popup": "popup.html"
   },
   
   "icons": {

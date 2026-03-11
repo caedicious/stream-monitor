@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: monospace;
+      font-size: 12px;
+      padding: 12px;
+      margin: 0;
+      width: 380px;
+      max-height: 500px;
+      overflow-y: auto;
+    }
+    h1 {
+      color: #9b59b6;
+      font-size: 14px;
+      margin: 0 0 10px 0;
+    }
+    .section-title {
+      color: #3498db;
+      font-size: 12px;
+      margin: 10px 0 4px 0;
+    }
+    .state-block {
+      background: #16213e;
+      padding: 8px;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .log-entry {
+      white-space: pre-wrap;
+      padding: 1px 0;
+      word-break: break-all;
+    }
+    .log-entry.error { color: #e74c3c; }
+    .log-entry.warn { color: #f39c12; }
+    .log-entry.info { color: #e0e0e0; }
+    button {
+      background: #9b59b6;
+      color: white;
+      border: none;
+      padding: 5px 10px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 11px;
+      margin-right: 6px;
+    }
+    button:hover { background: #8e44ad; }
+    .controls { margin-bottom: 10px; }
+    a {
+      color: #3498db;
+      text-decoration: none;
+      font-size: 11px;
+    }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>Stream Monitor Debug</h1>
+  <div class="controls">
+    <button id="refresh">Refresh</button>
+    <button id="clear">Clear Log</button>
+    <a href="#" id="open-full">Open in full tab</a>
+  </div>
+  <div class="section-title">— State —</div>
+  <div id="state" class="state-block">Loading...</div>
+  <div class="section-title">— Recent Log —</div>
+  <div id="log">Loading...</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
