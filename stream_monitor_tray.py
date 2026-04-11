@@ -187,16 +187,31 @@ class TwitchMonitor:
                 params=params,
                 timeout=10
             )
+
+            # Re-authenticate on 401 (expired token) and retry once
+            if response.status_code == 401:
+                self.status_callback("Token expired, re-authenticating...")
+                if self._get_oauth_token():
+                    response = requests.get(
+                        self.TWITCH_API_URL,
+                        headers=self._get_headers(),
+                        params=params,
+                        timeout=10
+                    )
+                else:
+                    self.status_callback("Re-authentication failed")
+                    return {name: False for name in self.streamers}
+
             response.raise_for_status()
             data = response.json()
-            
+
             live_streamers = {
-                stream["user_login"].lower() 
+                stream["user_login"].lower()
                 for stream in data.get("data", [])
             }
-            
+
             return {name: name in live_streamers for name in self.streamers}
-            
+
         except requests.RequestException as e:
             self.status_callback(f"API error: {e}")
             return {name: False for name in self.streamers}
