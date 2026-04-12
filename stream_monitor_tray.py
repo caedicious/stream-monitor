@@ -21,7 +21,7 @@ from pystray import MenuItem as Item
 from PIL import Image, ImageDraw
 
 # Version
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
