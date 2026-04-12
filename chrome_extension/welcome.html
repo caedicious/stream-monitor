@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Stream Monitor — Welcome!</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #2b2b2b;
+      color: #f0f0f0;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 40px 20px;
+    }
+
+    .container {
+      max-width: 580px;
+      width: 100%;
+      text-align: center;
+    }
+
+    .icon-wrapper {
+      margin-bottom: 24px;
+      position: relative;
+      display: inline-block;
+    }
+
+    .icon-wrapper img {
+      width: 96px;
+      height: 96px;
+      border-radius: 20px;
+      box-shadow: 0 8px 32px rgba(239, 82, 255, 0.3);
+    }
+
+    .sparkle {
+      position: absolute;
+      width: 8px;
+      height: 8px;
+      background: #ef52ff;
+      border-radius: 50%;
+      animation: sparkle 2s ease-in-out infinite;
+    }
+    .sparkle:nth-child(2) { top: -4px; right: 10px; animation-delay: 0.3s; }
+    .sparkle:nth-child(3) { top: 10px; right: -6px; animation-delay: 0.7s; }
+    .sparkle:nth-child(4) { bottom: 10px; left: -6px; animation-delay: 1.1s; }
+
+    @keyframes sparkle {
+      0%, 100% { opacity: 0; transform: scale(0.5); }
+      50% { opacity: 1; transform: scale(1); }
+    }
+
+    h1 {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      background: linear-gradient(135deg, #ef52ff, #faa0d7);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .subtitle {
+      font-size: 15px;
+      color: #aaa;
+      margin-bottom: 32px;
+      line-height: 1.5;
+    }
+
+    .card {
+      background: #333;
+      border-radius: 16px;
+      padding: 28px;
+      margin-bottom: 20px;
+      border: 1px solid #444;
+      text-align: left;
+    }
+
+    .card h2 {
+      font-size: 16px;
+      font-weight: 600;
+      color: #faa0d7;
+      margin-bottom: 12px;
+    }
+
+    .card p {
+      font-size: 14px;
+      line-height: 1.6;
+      color: #ccc;
+    }
+
+    .features {
+      list-style: none;
+      padding: 0;
+    }
+
+    .features li {
+      padding: 8px 0;
+      font-size: 14px;
+      color: #ccc;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .features li::before {
+      content: "\2726";
+      color: #ef52ff;
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+
+    .links {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .link-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 14px 24px;
+      border-radius: 12px;
+      text-decoration: none;
+      font-size: 15px;
+      font-weight: 600;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+      cursor: pointer;
+    }
+
+    .link-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+    }
+
+    .link-btn:active {
+      transform: translateY(0);
+    }
+
+    .link-btn.twitch {
+      background: linear-gradient(135deg, #9146ff, #772ce8);
+      color: white;
+    }
+
+    .link-btn.github {
+      background: #444;
+      color: #f0f0f0;
+      border: 1px solid #555;
+    }
+
+    .link-btn.kofi {
+      background: linear-gradient(135deg, #ef52ff, #faa0d7);
+      color: #2b2b2b;
+    }
+
+    .link-btn svg {
+      width: 20px;
+      height: 20px;
+      flex-shrink: 0;
+    }
+
+    .divider {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, #555, transparent);
+      margin: 24px 0;
+    }
+
+    .footer {
+      margin-top: 32px;
+      font-size: 12px;
+      color: #666;
+    }
+
+    .heart {
+      color: #ef52ff;
+      display: inline-block;
+      animation: heartbeat 1.5s ease-in-out infinite;
+    }
+
+    @keyframes heartbeat {
+      0%, 100% { transform: scale(1); }
+      15% { transform: scale(1.15); }
+      30% { transform: scale(1); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon-wrapper">
+      <img src="icon-96.png" alt="Stream Monitor">
+      <span class="sparkle"></span>
+      <span class="sparkle"></span>
+      <span class="sparkle"></span>
+    </div>
+
+    <h1>Thanks for installing Stream Monitor!</h1>
+    <p class="subtitle">
+      You're all set. The extension will automatically close Twitch tabs when a
+      streamer you're watching raids someone else.
+    </p>
+
+    <div class="card">
+      <h2>How it works</h2>
+      <ul class="features">
+        <li>Connects to the Stream Monitor desktop app on your PC</li>
+        <li>Tracks tabs opened for your monitored streamers</li>
+        <li>Detects raids and automatically closes the tab</li>
+        <li>Optional auto-mute for opened streams</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>Get started</h2>
+      <p>
+        Make sure the <strong>Stream Monitor</strong> desktop app is running in your
+        system tray. Click the extension icon in your toolbar to see the debug
+        panel and toggle settings.
+      </p>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="card" style="text-align: center; border-color: #ef52ff33;">
+      <h2 style="text-align: center;">Made by CaedVT</h2>
+      <p style="text-align: center; margin-bottom: 16px;">
+        If you enjoy this extension, consider following me on Twitch or checking
+        out my other projects on GitHub. Donations are never expected but always
+        appreciated!
+      </p>
+      <div class="links">
+        <a href="https://www.twitch.tv/CaedVT" class="link-btn twitch" id="link-twitch">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M11.571 4.714h1.715v5.143H11.57zm4.715 0H18v5.143h-1.714zM6 0L1.714 4.286v15.428h5.143V24l4.286-4.286h3.428L22.286 12V0zm14.571 11.143l-3.428 3.428h-3.429l-3 3v-3H6.857V1.714h13.714z"/></svg>
+          Follow on Twitch
+        </a>
+        <a href="https://github.com/caedicious/stream-monitor" class="link-btn github" id="link-github">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          Star on GitHub
+        </a>
+        <a href="https://ko-fi.com/caedvt" class="link-btn kofi" id="link-kofi">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.667-2.059 3.015z"/></svg>
+          Support on Ko-fi
+        </a>
+      </div>
+    </div>
+
+    <p class="footer">
+      Stream Monitor Tab Closer — made with <span class="heart">&#9829;</span> by CaedVT
+    </p>
+  </div>
+
+  <script src="welcome.js"></script>
+</body>
+</html>

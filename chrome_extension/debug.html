@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Stream Monitor Debug</title>
+  <style>
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: monospace;
+      font-size: 13px;
+      padding: 20px;
+      line-height: 1.5;
+      margin: 0;
+    }
+    h1 {
+      color: #9b59b6;
+      font-size: 18px;
+      margin-top: 0;
+    }
+    .section {
+      margin-bottom: 20px;
+    }
+    .section-title {
+      color: #3498db;
+      font-size: 14px;
+      margin-bottom: 8px;
+    }
+    .log-entry {
+      white-space: pre-wrap;
+      padding: 2px 0;
+    }
+    .log-entry.error { color: #e74c3c; }
+    .log-entry.warn { color: #f39c12; }
+    .log-entry.info { color: #e0e0e0; }
+    .state-block {
+      background: #16213e;
+      padding: 12px;
+      border-radius: 4px;
+      white-space: pre-wrap;
+    }
+    .controls {
+      margin-bottom: 20px;
+    }
+    button {
+      background: #9b59b6;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 13px;
+      margin-right: 8px;
+    }
+    button:hover { background: #8e44ad; }
+    .refresh-note { color: #666; font-size: 11px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Stream Monitor Tab Closer — Debug Log</h1>
+  <div class="controls">
+    <button id="refresh">Refresh</button>
+    <button id="clear">Clear Log</button>
+    <div class="refresh-note">Click Refresh to see latest entries</div>
+  </div>
+  <div class="section">
+    <div class="section-title">— State —</div>
+    <div id="state" class="state-block">Loading...</div>
+  </div>
+  <div class="section">
+    <div class="section-title">— Log Entries —</div>
+    <div id="log">Loading...</div>
+  </div>
+  <script src="debug.js"></script>
+</body>
+</html>

@@ -460,34 +460,32 @@ Enjoy!
             "streamers": self.streamers,
             "check_interval": 60
         }
-        
+
+        # Preserve any existing config fields (from a previous install/upgrade)
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    existing = json.load(f)
+                existing.update(config)
+                config = existing
+            except (json.JSONDecodeError, ValueError):
+                pass
+
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
             json.dump(config, f, indent=2)
-        
+
         # Create startup shortcut (Windows)
         if sys.platform == "win32":
             self.create_windows_startup()
-        
+
         messagebox.showinfo(
             "Setup Complete",
-            "Stream Monitor has been installed!\n\nIt will now start and run in your system tray."
+            "Stream Monitor is configured and will now start monitoring!\n\n"
+            "Look for the purple circle in your system tray."
         )
-        
-        # Start the main app
+
         self.root.destroy()
-        
-        # Launch the tray app
-        import subprocess
-        app_path = Path(__file__).parent / "stream_monitor_tray.py"
-        if getattr(sys, 'frozen', False):
-            # Running as compiled exe
-            exe_path = Path(sys.executable).parent / "StreamMonitor.exe"
-            if exe_path.exists():
-                subprocess.Popen([str(exe_path)], creationflags=subprocess.CREATE_NO_WINDOW)
-        else:
-            # Running as script
-            subprocess.Popen([sys.executable, str(app_path)], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
     
     def create_windows_startup(self):
         """Create a startup shortcut on Windows."""
