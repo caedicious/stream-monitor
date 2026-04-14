@@ -240,6 +240,7 @@
       player.dispatchEvent(new MouseEvent("mousemove", {
         bubbles: true, clientX: 100, clientY: 100
       }));
+      console.log(LOG_PREFIX, "Keepalive: simulated mousemove on player");
     }
 
     // Ensure video is still playing and unmuted at player level
