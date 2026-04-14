@@ -38,28 +38,36 @@
   function ensurePlaying(video) {
     if (!video) return;
 
-    // Unmute the player (this is the Twitch player mute, not the browser tab)
-    if (video.muted) {
-      video.muted = false;
-      console.log(LOG_PREFIX, "Unmuted video player");
-    }
-
-    // Set volume to audible level if it was zeroed
-    if (video.volume < 0.01) {
-      video.volume = 0.05;
-      console.log(LOG_PREFIX, "Set video volume to 5%");
+    // Unmute and set volume only when video is already playing —
+    // if paused, we handle mute state carefully in the play logic below
+    if (!video.paused) {
+      if (video.muted) {
+        video.muted = false;
+        console.log(LOG_PREFIX, "Unmuted video player");
+      }
+      if (video.volume < 0.01) {
+        video.volume = 0.05;
+        console.log(LOG_PREFIX, "Set video volume to 5%");
+      }
     }
 
     // Ensure video is playing
     if (video.paused) {
+      // Browsers block unmuted autoplay in background tabs. Muted autoplay
+      // is always allowed. Strategy: mute the video element, start playback,
+      // then unmute. The browser tab is already muted via auto-mute so the
+      // user won't hear anything during the brief muted window.
+      const wasMuted = video.muted;
+      video.muted = true;
       video.play().then(() => {
-        console.log(LOG_PREFIX, "Started video playback");
+        // Playback started — now unmute the player so Twitch counts the viewer
+        video.muted = false;
+        console.log(LOG_PREFIX, "Started video playback (mute-start-unmute)");
         playFailCount = 0;
       }).catch((e) => {
+        video.muted = wasMuted; // restore original state on failure
         playFailCount++;
         console.warn(LOG_PREFIX, `Could not auto-play (attempt ${playFailCount}):`, e.message);
-        // After 3 failed attempts, ask background to reload the tab.
-        // On fresh page load Twitch autoplays without a user gesture.
         if (playFailCount >= 3) {
           console.log(LOG_PREFIX, "Requesting background to reload tab");
           chrome.runtime.sendMessage({ action: "reloadTab" }).catch(() => {});
