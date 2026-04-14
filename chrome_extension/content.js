@@ -232,8 +232,22 @@
 
   function startKeepalive() {
     if (keepaliveTimer) return;
-    keepaliveTimer = setInterval(keepalive, KEEPALIVE_INTERVAL_MS);
-    console.log(LOG_PREFIX, "Keepalive started (every 2 min)");
+
+    // Use a Web Worker for the timer — setInterval gets throttled to once
+    // per minute (or worse) in background tabs. Web Workers run on their
+    // own thread and are not subject to background throttling.
+    try {
+      const workerCode = `setInterval(() => postMessage("tick"), ${KEEPALIVE_INTERVAL_MS});`;
+      const blob = new Blob([workerCode], { type: "application/javascript" });
+      const worker = new Worker(URL.createObjectURL(blob));
+      worker.onmessage = () => keepalive();
+      keepaliveTimer = worker;
+      console.log(LOG_PREFIX, "Keepalive started via Web Worker (every 2 min)");
+    } catch (e) {
+      // Fallback to setInterval if Web Worker fails
+      keepaliveTimer = setInterval(keepalive, KEEPALIVE_INTERVAL_MS);
+      console.log(LOG_PREFIX, "Keepalive started via setInterval fallback (every 2 min)");
+    }
   }
 
   // -----------------------------------------------------------------------
