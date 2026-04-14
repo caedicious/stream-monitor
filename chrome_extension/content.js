@@ -50,14 +50,22 @@
 
     // Ensure video is playing
     if (video.paused) {
-      // Try clicking Twitch's own play button first — this counts as a
-      // trusted UI action and bypasses autoplay restrictions that block
-      // video.play() in background tabs without prior user interaction.
-      const playBtn = document.querySelector('[data-a-target="player-play-pause-button"]');
-      if (playBtn) {
-        playBtn.click();
-        console.log(LOG_PREFIX, "Clicked Twitch play button");
+      // Twitch uses a React-based player. Clicking DOM buttons dispatches
+      // synthetic (untrusted) events which don't grant autoplay permission.
+      // However, the Twitch player's internal keyboard handler listens for
+      // 'k' (play/pause toggle) on the document — and content scripts CAN
+      // dispatch trusted-equivalent KeyboardEvents that Twitch's JS handles.
+      const playerContainer = document.querySelector('.video-player__container') ||
+                              document.querySelector('[data-a-target="video-player"]');
+      if (playerContainer) {
+        // Focus the player so keyboard events target it
+        playerContainer.focus();
+        playerContainer.dispatchEvent(new KeyboardEvent("keydown", {
+          key: "k", code: "KeyK", bubbles: true
+        }));
+        console.log(LOG_PREFIX, "Sent 'k' keypress to toggle play");
       } else {
+        // Fallback to video.play()
         video.play().then(() => {
           console.log(LOG_PREFIX, "Started video playback via play()");
         }).catch((e) => {
