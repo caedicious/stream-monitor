@@ -128,12 +128,43 @@ async function handleTabError(tabId) {
   }
 }
 
-// Listen for error reports from content scripts
+// Listen for messages from content scripts
 browser.runtime.onMessage.addListener((message, sender) => {
   if (message.action === "tabError" && sender.tab) {
     handleTabError(sender.tab.id);
+  } else if (message.action === "reloadTab" && sender.tab) {
+    reloadTrackedTab(sender.tab.id);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Reload tracked tab — preserves sm=1 and re-activates player after load
+// ---------------------------------------------------------------------------
+
+async function reloadTrackedTab(tabId) {
+  const { trackedTabs } = await loadState();
+  const tabKey = String(tabId);
+  if (!trackedTabs[tabKey]) return;
+
+  const now = Date.now();
+  const lastReload = tabReloadCooldowns[tabId] || 0;
+  if (now - lastReload < RELOAD_COOLDOWN_MS) {
+    await log("info", `Tab ${tabId} reload requested but on cooldown`);
+    return;
+  }
+  tabReloadCooldowns[tabId] = now;
+
+  const streamer = trackedTabs[tabKey].originalStreamer;
+  const url = `https://www.twitch.tv/${streamer}?sm=1`;
+  await log("info", `Reloading tracked tab ${tabId} with sm=1: ${url}`);
+
+  try {
+    // Navigate to URL with sm=1 preserved (Twitch SPA may strip it on reload)
+    await browser.tabs.update(tabId, { url });
+  } catch (e) {
+    await log("warn", `Failed to reload tab ${tabId}:`, e.message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Utility
@@ -260,6 +291,15 @@ async function onTabCreated(tab) {
 }
 
 async function onTabUpdated(tabId, changeInfo, _tab) {
+  // Re-activate player control when a tracked tab finishes loading
+  // (e.g. after a reload triggered by keepalive or error recovery)
+  if (changeInfo.status === "complete") {
+    const { trackedTabs } = await loadState();
+    if (trackedTabs[String(tabId)]) {
+      setTimeout(() => activatePlayerControl(tabId), 3000);
+    }
+  }
+
   if (!changeInfo.url) return;
 
   const { trackedTabs, monitoredStreamers } = await loadState();

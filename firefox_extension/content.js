@@ -33,6 +33,8 @@
     return document.querySelector("video");
   }
 
+  let playFailCount = 0;
+
   function ensurePlaying(video) {
     if (!video) return;
 
@@ -50,28 +52,22 @@
 
     // Ensure video is playing
     if (video.paused) {
-      // Twitch uses a React-based player. Clicking DOM buttons dispatches
-      // synthetic (untrusted) events which don't grant autoplay permission.
-      // However, the Twitch player's internal keyboard handler listens for
-      // 'k' (play/pause toggle) on the document — and content scripts CAN
-      // dispatch trusted-equivalent KeyboardEvents that Twitch's JS handles.
-      const playerContainer = document.querySelector('.video-player__container') ||
-                              document.querySelector('[data-a-target="video-player"]');
-      if (playerContainer) {
-        // Focus the player so keyboard events target it
-        playerContainer.focus();
-        playerContainer.dispatchEvent(new KeyboardEvent("keydown", {
-          key: "k", code: "KeyK", bubbles: true
-        }));
-        console.log(LOG_PREFIX, "Sent 'k' keypress to toggle play");
-      } else {
-        // Fallback to video.play()
-        video.play().then(() => {
-          console.log(LOG_PREFIX, "Started video playback via play()");
-        }).catch((e) => {
-          console.warn(LOG_PREFIX, "Could not auto-play:", e.message);
-        });
-      }
+      video.play().then(() => {
+        console.log(LOG_PREFIX, "Started video playback");
+        playFailCount = 0;
+      }).catch((e) => {
+        playFailCount++;
+        console.warn(LOG_PREFIX, `Could not auto-play (attempt ${playFailCount}):`, e.message);
+        // After 3 failed attempts, ask background to reload the tab.
+        // On fresh page load Twitch autoplays without a user gesture.
+        if (playFailCount >= 3) {
+          console.log(LOG_PREFIX, "Requesting background to reload tab");
+          browser.runtime.sendMessage({ action: "reloadTab" }).catch(() => {});
+          playFailCount = 0;
+        }
+      });
+    } else {
+      playFailCount = 0;
     }
   }
 
@@ -224,15 +220,6 @@
         video.currentTime = video.currentTime;
       } catch (e) {
         // Ignore seek errors on live streams
-      }
-      // If still stuck, try clicking the play button or pause/play
-      const playBtn = document.querySelector('[data-a-target="player-play-pause-button"]');
-      if (playBtn) {
-        playBtn.click(); // pause
-        setTimeout(() => playBtn.click(), 500); // play
-      } else {
-        video.pause();
-        video.play().catch(() => {});
       }
     }
     lastVideoTime = video.currentTime;
