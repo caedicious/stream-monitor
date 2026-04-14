@@ -50,11 +50,20 @@
 
     // Ensure video is playing
     if (video.paused) {
-      video.play().then(() => {
-        console.log(LOG_PREFIX, "Started video playback");
-      }).catch((e) => {
-        console.warn(LOG_PREFIX, "Could not auto-play:", e.message);
-      });
+      // Try clicking Twitch's own play button first — this counts as a
+      // trusted UI action and bypasses autoplay restrictions that block
+      // video.play() in background tabs without prior user interaction.
+      const playBtn = document.querySelector('[data-a-target="player-play-pause-button"]');
+      if (playBtn) {
+        playBtn.click();
+        console.log(LOG_PREFIX, "Clicked Twitch play button");
+      } else {
+        video.play().then(() => {
+          console.log(LOG_PREFIX, "Started video playback via play()");
+        }).catch((e) => {
+          console.warn(LOG_PREFIX, "Could not auto-play:", e.message);
+        });
+      }
     }
   }
 
@@ -208,9 +217,15 @@
       } catch (e) {
         // Ignore seek errors on live streams
       }
-      // If still stuck, try pause/play
-      video.pause();
-      video.play().catch(() => {});
+      // If still stuck, try clicking the play button or pause/play
+      const playBtn = document.querySelector('[data-a-target="player-play-pause-button"]');
+      if (playBtn) {
+        playBtn.click(); // pause
+        setTimeout(() => playBtn.click(), 500); // play
+      } else {
+        video.pause();
+        video.play().catch(() => {});
+      }
     }
     lastVideoTime = video.currentTime;
 
