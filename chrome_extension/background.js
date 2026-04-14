@@ -9,7 +9,9 @@
 const CONFIG_URL = "http://127.0.0.1:52832/config";
 const TWITCH_URL_PATTERN = /^https?:\/\/(?:www\.)?twitch\.tv\/([a-zA-Z0-9_]+)/;
 const CONFIG_ALARM = "refresh-config";
+const KEEPALIVE_ALARM = "keepalive";
 const CONFIG_INTERVAL_MINUTES = 1;
+const KEEPALIVE_INTERVAL_MINUTES = 2;
 const MAX_LOG_ENTRIES = 200;
 
 const IGNORED_PATHS = new Set([
@@ -328,6 +330,17 @@ async function onAlarm(alarm) {
     await fetchConfig();
     // Re-scan tabs in case streamers list changed
     await scanExistingTabs();
+  } else if (alarm.name === KEEPALIVE_ALARM) {
+    // Send keepalive ping to all tracked tabs — this drives the content
+    // script's keepalive from the background, avoiding browser throttling
+    // of timers in background tabs.
+    const { trackedTabs } = await loadState();
+    const tabIds = Object.keys(trackedTabs);
+    if (tabIds.length === 0) return;
+    await log("info", `Keepalive alarm: pinging ${tabIds.length} tracked tab(s)`);
+    for (const tabId of tabIds) {
+      sendToContentScript(Number(tabId), { action: "keepalive" });
+    }
   }
 }
 
@@ -358,13 +371,21 @@ chrome.runtime.onInstalled.addListener((details) => {
   // Fetch config from desktop app
   await fetchConfig();
 
-  // Ensure the periodic alarm exists (survives service worker termination)
+  // Ensure the periodic alarms exist (survive service worker termination)
   const existing = await chrome.alarms.get(CONFIG_ALARM);
   if (!existing) {
     chrome.alarms.create(CONFIG_ALARM, { periodInMinutes: CONFIG_INTERVAL_MINUTES });
     await log("info", `Created '${CONFIG_ALARM}' alarm (every ${CONFIG_INTERVAL_MINUTES} min)`);
   } else {
     await log("info", `'${CONFIG_ALARM}' alarm already exists`);
+  }
+
+  const existingKeepalive = await chrome.alarms.get(KEEPALIVE_ALARM);
+  if (!existingKeepalive) {
+    chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_INTERVAL_MINUTES });
+    await log("info", `Created '${KEEPALIVE_ALARM}' alarm (every ${KEEPALIVE_INTERVAL_MINUTES} min)`);
+  } else {
+    await log("info", `'${KEEPALIVE_ALARM}' alarm already exists`);
   }
 
   // Reconcile tracked tabs with reality
