@@ -5,6 +5,8 @@ Runs in the background and opens streams when monitored streamers go live.
 """
 
 import json
+import logging
+import logging.handlers
 import os
 import sys
 import threading
@@ -15,13 +17,32 @@ from dataclasses import dataclass, asdict
 from typing import Optional, Callable
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import certifi
+import shutil
 import requests
 import pystray
 from pystray import MenuItem as Item
 from PIL import Image, ImageDraw
 
+# Fix for PyInstaller --onefile: the _MEI temp extraction folder can be cleaned
+# up by Windows or a new exe instance while this process is still running. This
+# breaks certifi's CA bundle path. Copy it to a stable location at startup.
+def _stable_ca_bundle():
+    if getattr(sys, 'frozen', False):
+        stable_path = Path(os.environ.get("APPDATA", "")) / "StreamMonitor" / "cacert.pem"
+        try:
+            src = certifi.where()
+            # Always refresh on startup in case certifi was updated
+            stable_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, stable_path)
+            os.environ["REQUESTS_CA_BUNDLE"] = str(stable_path)
+        except Exception:
+            pass  # Fall back to default certifi path
+
+_stable_ca_bundle()
+
 # Version
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -33,6 +54,31 @@ else:
     CONFIG_DIR = Path.home() / ".config" / APP_NAME.lower()
 
 CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_FILE = CONFIG_DIR / "stream_monitor.log"
+
+
+def setup_logging():
+    """Set up file logging with rotation."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("StreamMonitor")
+    logger.setLevel(logging.DEBUG)
+
+    # Rotate at 2 MB, keep 3 old files
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
+
+
+log = setup_logging()
 
 
 def _get_about_html_path() -> Path:
@@ -97,7 +143,7 @@ def start_config_server(config: "Config"):
         server = HTTPServer(("127.0.0.1", CONFIG_SERVER_PORT), ConfigRequestHandler)
         server.serve_forever()
     except OSError as e:
-        print(f"Config server failed to start: {e}")
+        log.error("Config server failed to start: %s", e)
 
 
 @dataclass
@@ -128,10 +174,9 @@ class Config:
                 filtered = {k: v for k, v in data.items() if k in valid_fields}
                 return cls(**filtered)
             except Exception as e:
-                print(f"Config load error: {e}")
-                print(f"Config file path: {CONFIG_FILE}")
+                log.error("Config load error: %s (path: %s)", e, CONFIG_FILE)
         else:
-            print(f"Config file not found: {CONFIG_FILE}")
+            log.info("Config file not found: %s", CONFIG_FILE)
         return cls()
     
     def save(self):
@@ -170,9 +215,11 @@ class TwitchMonitor:
         self.live_streamers: list[str] = []  # Current live streamers for config server
         self.missed_while_paused: dict[str, str] = {}  # { streamer: went_live_time }
         self.user_ids: dict[str, str] = {}  # { username: user_id } cache
+        self.consecutive_errors: int = 0  # Track consecutive API failures
         
     def _get_oauth_token(self) -> bool:
         try:
+            log.info("Requesting OAuth token")
             response = requests.post(
                 self.TOKEN_URL,
                 params={
@@ -184,8 +231,13 @@ class TwitchMonitor:
             )
             response.raise_for_status()
             self.oauth_token = response.json().get("access_token")
+            if self.oauth_token:
+                log.info("OAuth token obtained successfully")
+            else:
+                log.error("OAuth response OK but no access_token in body")
             return bool(self.oauth_token)
         except requests.RequestException as e:
+            log.error("OAuth token request failed: %s", e)
             self.status_callback(f"Auth error: {e}")
             return False
     
@@ -199,10 +251,12 @@ class TwitchMonitor:
         """Make a GET request with automatic token refresh on 401."""
         response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
         if response.status_code == 401:
+            log.warning("API returned 401, token expired. Re-authenticating...")
             self.status_callback("Token expired, re-authenticating...")
             if self._get_oauth_token():
                 response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
             else:
+                log.error("Re-authentication failed after 401")
                 self.status_callback("Re-authentication failed")
                 return None
         response.raise_for_status()
@@ -220,8 +274,10 @@ class TwitchMonitor:
             params.append(("user_login", own_channel))
 
         try:
+            log.debug("Checking streams for: %s", list(self.streamers.keys()))
             data = self._api_get(self.TWITCH_API_URL, params)
             if data is None:
+                log.warning("API returned None, treating all streamers as offline")
                 return {name: False for name in self.streamers}
 
             live_set = set()
@@ -232,14 +288,21 @@ class TwitchMonitor:
                 if "user_id" in stream:
                     self.user_ids[login] = stream["user_id"]
 
+            if live_set:
+                log.info("Live streamers: %s", live_set)
+            else:
+                log.debug("No monitored streamers are live")
+
             # Update auto-pause based on user's own channel
             if own_channel and self.config.im_live_pause:
                 was_auto_paused = self.auto_paused
                 self.auto_paused = own_channel in live_set
                 if self.auto_paused and not was_auto_paused:
+                    log.info("Auto-paused: own channel '%s' is live", own_channel)
                     self.status_callback("Auto-paused (you're live)")
                     self.notify_callback("Stream Monitor", "Auto-paused because you're live!")
                 elif not self.auto_paused and was_auto_paused:
+                    log.info("Auto-pause lifted: own channel '%s' went offline", own_channel)
                     self.status_callback("Resumed (you went offline)")
                     self.notify_callback("Stream Monitor", "You went offline, resuming monitoring!")
 
@@ -249,8 +312,9 @@ class TwitchMonitor:
             return {name: name in live_set for name in self.streamers}
 
         except requests.RequestException as e:
+            log.error("API request failed: %s", e)
             self.status_callback(f"API error: {e}")
-            return {name: False for name in self.streamers}
+            raise  # Let _monitor_loop handle error counting and notifications
 
     def get_latest_vod_url(self, username: str) -> Optional[str]:
         """Fetch the most recent VOD URL for a user."""
@@ -279,6 +343,7 @@ class TwitchMonitor:
     
     def open_stream(self, username: str):
         url = f"https://twitch.tv/{username}?sm=1"
+        log.info("Opening stream tab: %s", url)
         webbrowser.open(url)
     
     @property
@@ -299,6 +364,9 @@ class TwitchMonitor:
             if is_live:
                 live_count += 1
                 if not state.was_live and not state.browser_opened:
+                    log.info("State change: %s went LIVE (was_live=%s, browser_opened=%s, paused=%s, auto_paused=%s)",
+                             username, state.was_live, state.browser_opened, self.paused, self.auto_paused)
+
                     # Desktop notification for all live events
                     self.notify_callback(
                         "Stream Monitor",
@@ -306,6 +374,7 @@ class TwitchMonitor:
                     )
 
                     if self.effectively_paused:
+                        log.info("Skipping tab open for %s (effectively paused)", username)
                         self.status_callback(f"{username} went LIVE! (paused)")
                         # Track missed streams while paused
                         self.missed_while_paused[username] = time.strftime("%H:%M:%S")
@@ -313,17 +382,25 @@ class TwitchMonitor:
                         self.status_callback(f"{username} went LIVE!")
                         self.open_stream(username)
                         state.browser_opened = True
+                elif is_live and state.was_live:
+                    log.debug("Already tracking %s as live (was_live=%s, browser_opened=%s)",
+                              username, state.was_live, state.browser_opened)
                 state.was_live = True
             else:
                 if state.was_live:
+                    log.info("State change: %s went OFFLINE", username)
                     self.status_callback(f"{username} went offline")
 
                     # VOD fallback: if stream was missed, open the VOD
                     if not state.browser_opened and self.config.vod_fallback:
+                        log.info("VOD fallback triggered for %s", username)
                         vod_url = self.get_latest_vod_url(username)
                         if vod_url:
                             self.status_callback(f"Opening VOD for {username}")
+                            log.info("Opening VOD: %s", vod_url)
                             webbrowser.open(vod_url)
+                        else:
+                            log.info("No VOD found for %s", username)
 
                     # Track missed streaks: went live + offline while paused
                     if username in self.missed_while_paused:
@@ -349,44 +426,70 @@ class TwitchMonitor:
             self.status_callback("Monitoring...")
     
     def _monitor_loop(self):
+        log.info("Monitor loop started (interval: %ds)", self.config.check_interval)
         while self.running:
-            current_status = self.check_streams()
-            if current_status:
-                self.process_state_changes(current_status)
-            
+            try:
+                current_status = self.check_streams()
+                if current_status:
+                    self.process_state_changes(current_status)
+                    if self.consecutive_errors > 0:
+                        log.info("API recovered after %d consecutive error(s)", self.consecutive_errors)
+                        self.notify_callback("Stream Monitor", "Connection restored! Monitoring is working again.")
+                    self.consecutive_errors = 0
+            except Exception as e:
+                self.consecutive_errors += 1
+                log.error("Unexpected error in monitor loop (streak: %d): %s", self.consecutive_errors, e, exc_info=True)
+                if self.consecutive_errors == 1:
+                    self.status_callback("Error: API connection failed")
+                    self.notify_callback(
+                        "Stream Monitor - Error",
+                        f"API calls are failing: {e}\nStreams won't open until this is resolved. Try restarting Stream Monitor."
+                    )
+                elif self.consecutive_errors == 5:
+                    self.status_callback("Error: API still failing")
+                    self.notify_callback(
+                        "Stream Monitor - Error",
+                        "API has been failing for 5 minutes. Stream Monitor needs to be restarted."
+                    )
+
             for _ in range(self.config.check_interval):
                 if not self.running:
                     break
                 time.sleep(1)
     
     def start(self) -> bool:
+        log.info("Starting monitor...")
         if not self.config.is_valid():
+            log.error("Cannot start: config is invalid (missing client_id, client_secret, or streamers)")
             self.status_callback("Invalid config")
             return False
-        
+
         self.status_callback("Authenticating...")
         if not self._get_oauth_token():
             self.status_callback("Auth failed")
             return False
-        
+
         self.streamers = {
             name.lower(): StreamerState(name=name.lower())
             for name in self.config.streamers
         }
-        
+        log.info("Monitoring %d streamer(s): %s", len(self.streamers), list(self.streamers.keys()))
+
         self.running = True
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.thread.start()
         self.status_callback("Monitoring...")
         return True
-    
+
     def stop(self):
+        log.info("Stopping monitor")
         self.running = False
         if self.thread:
             self.thread.join(timeout=2)
         self.status_callback("Stopped")
-    
+
     def restart(self):
+        log.info("Restarting monitor")
         self.stop()
         time.sleep(0.5)
         self.start()
@@ -429,11 +532,12 @@ class StreamMonitorApp:
 
     def send_notification(self, title: str, message: str):
         """Send a system tray notification."""
+        log.info("Notification: [%s] %s", title, message)
         if self.icon:
             try:
                 self.icon.notify(message, title)
             except Exception as e:
-                print(f"Notification failed: {e}")
+                log.error("Notification failed: %s", e)
     
     def on_settings(self, icon, item):
         """Open settings dialog by launching the settings editor."""
@@ -530,7 +634,7 @@ class StreamMonitorApp:
             return False, latest_version, download_url
             
         except requests.RequestException as e:
-            print(f"Update check failed: {e}")
+            log.error("Update check failed: %s", e)
             return False, VERSION, f"https://github.com/{GITHUB_REPO}/releases"
     
     def _is_newer_version(self, latest: str, current: str) -> bool:
@@ -549,11 +653,19 @@ class StreamMonitorApp:
         except ValueError:
             return False
     
+    def on_view_log(self, icon, item):
+        """Open the log file in the default text editor."""
+        if LOG_FILE.exists():
+            os.startfile(LOG_FILE)
+        else:
+            self.update_status("No log file found")
+
     def on_about(self, icon, item):
         """Open the about page in the browser."""
         webbrowser.open(f"http://127.0.0.1:{CONFIG_SERVER_PORT}/about?v={VERSION}")
 
     def on_exit(self, icon, item):
+        log.info("Exiting Stream Monitor")
         if self.monitor:
             self.monitor.stop()
         icon.stop()
@@ -569,6 +681,7 @@ class StreamMonitorApp:
             Item("Start", self.on_start, checked=lambda item: self._is_running()),
             Item("Stop", self.on_stop, checked=lambda item: not self._is_running()),
             pystray.Menu.SEPARATOR,
+            Item("View Log", self.on_view_log),
             Item("About (CaedVT)", self.on_about),
             Item("Exit", self.on_exit)
         )
@@ -708,9 +821,15 @@ class StreamMonitorApp:
         return result["completed"]
 
     def run(self):
+        log.info("Stream Monitor v%s starting", VERSION)
+        log.info("Config path: %s", CONFIG_FILE)
+        log.info("Log path: %s", LOG_FILE)
+
         # If config is missing or has no credentials, run first-time setup
         if not self.config.is_valid():
+            log.info("Config invalid or missing, launching first-time setup")
             if not self._run_first_time_setup():
+                log.info("First-time setup cancelled, exiting")
                 return
 
         # Start config server for browser extension

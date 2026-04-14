@@ -22,6 +22,8 @@
   let lowQualityApplied = false;
   let pollTimer = null;
   let retryCount = 0;
+  let keepaliveTimer = null;
+  let lastVideoTime = -1;
 
   // -----------------------------------------------------------------------
   // Video element helpers
@@ -160,6 +162,81 @@
   }
 
   // -----------------------------------------------------------------------
+  // Player keepalive — prevent Twitch from marking viewer as idle
+  // Runs every 2 minutes even in background tabs. Simulates viewer
+  // activity so Twitch continues counting you as a viewer.
+  // -----------------------------------------------------------------------
+
+  const KEEPALIVE_INTERVAL_MS = 120000; // 2 minutes
+
+  function dismissOverlays() {
+    // "Click to unmute" banner
+    const unmuteBanner = document.querySelector('[data-a-target="player-unmute-overlay-button"]');
+    if (unmuteBanner) {
+      unmuteBanner.click();
+      console.log(LOG_PREFIX, "Keepalive: dismissed unmute overlay");
+    }
+
+    // "Stream has encountered an error" / refresh prompt
+    const refreshBtn = document.querySelector('[data-a-target="player-overlay-content-gate"] button');
+    if (refreshBtn) {
+      refreshBtn.click();
+      console.log(LOG_PREFIX, "Keepalive: clicked refresh/error overlay button");
+    }
+
+    // Content gate / mature content warning
+    const contentGateBtn = document.querySelector('[data-a-target="content-classification-gate-overlay-start-watching-button"]');
+    if (contentGateBtn) {
+      contentGateBtn.click();
+      console.log(LOG_PREFIX, "Keepalive: dismissed content gate");
+    }
+  }
+
+  function keepalive() {
+    const video = getVideoElement();
+    if (!video) return;
+
+    // Dismiss any overlays blocking the player
+    dismissOverlays();
+
+    // Check if video has stalled (currentTime hasn't changed)
+    if (video.currentTime === lastVideoTime && !video.paused && lastVideoTime > 0) {
+      console.log(LOG_PREFIX, "Keepalive: video appears stalled, attempting recovery");
+      // Try seeking slightly to kick the buffer
+      try {
+        video.currentTime = video.currentTime;
+      } catch (e) {
+        // Ignore seek errors on live streams
+      }
+      // If still stuck, try pause/play
+      video.pause();
+      video.play().catch(() => {});
+    }
+    lastVideoTime = video.currentTime;
+
+    // Simulate minimal viewer activity — move mouse over the player
+    // This triggers Twitch's internal activity tracking
+    const player = document.querySelector('.video-player__container') ||
+                   document.querySelector('[data-a-target="video-player"]');
+    if (player) {
+      player.dispatchEvent(new MouseEvent("mousemove", {
+        bubbles: true, clientX: 100, clientY: 100
+      }));
+    }
+
+    // Ensure video is still playing and unmuted at player level
+    if (ensurePlaybackEnabled) {
+      ensurePlaying(video);
+    }
+  }
+
+  function startKeepalive() {
+    if (keepaliveTimer) return;
+    keepaliveTimer = setInterval(keepalive, KEEPALIVE_INTERVAL_MS);
+    console.log(LOG_PREFIX, "Keepalive started (every 2 min)");
+  }
+
+  // -----------------------------------------------------------------------
   // Error detection — notify background script if the stream has an error
   // -----------------------------------------------------------------------
 
@@ -216,6 +293,7 @@
       case "ensurePlaying":
         ensurePlaybackEnabled = true;
         startPolling();
+        startKeepalive();
         sendResponse({ ok: true });
         break;
 
@@ -234,6 +312,7 @@
           ensurePlayback: ensurePlaybackEnabled,
           lowQuality: lowQualityEnabled,
           lowQualityApplied,
+          keepaliveActive: !!keepaliveTimer,
           hasError: checkForErrors(),
         });
         break;
