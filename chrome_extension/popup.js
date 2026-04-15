@@ -6,7 +6,7 @@ const raidFollowEl = document.getElementById("raid-follow");
 const maxTabsEl = document.getElementById("max-tabs");
 
 async function loadSettings() {
-  const result = await browser.storage.local.get([
+  const result = await chrome.storage.local.get([
     "autoMute", "extensionPaused", "lowQuality", "raidFollowThrough", "maxTabs"
   ]);
   autoMuteEl.checked = result.autoMute || false;
@@ -17,33 +17,34 @@ async function loadSettings() {
 }
 
 autoMuteEl.addEventListener("change", async () => {
-  await browser.storage.local.set({ autoMute: autoMuteEl.checked });
+  await chrome.storage.local.set({ autoMute: autoMuteEl.checked });
 });
 
 extensionPausedEl.addEventListener("change", async () => {
-  await browser.storage.local.set({ extensionPaused: extensionPausedEl.checked });
+  await chrome.storage.local.set({ extensionPaused: extensionPausedEl.checked });
 });
 
 lowQualityEl.addEventListener("change", async () => {
-  await browser.storage.local.set({ lowQuality: lowQualityEl.checked });
+  await chrome.storage.local.set({ lowQuality: lowQualityEl.checked });
 });
 
 raidFollowEl.addEventListener("change", async () => {
-  await browser.storage.local.set({ raidFollowThrough: raidFollowEl.checked });
+  await chrome.storage.local.set({ raidFollowThrough: raidFollowEl.checked });
 });
 
 maxTabsEl.addEventListener("change", async () => {
   const val = Math.max(0, Math.min(20, parseInt(maxTabsEl.value) || 0));
   maxTabsEl.value = val;
-  await browser.storage.local.set({ maxTabs: val });
+  await chrome.storage.local.set({ maxTabs: val });
 });
 
 loadSettings();
 
 // --- Streamer list with live status ---
 async function loadStreamerList() {
-  const { monitoredStreamers = [], liveStreamers = [] } =
-    await browser.storage.local.get(["monitoredStreamers", "liveStreamers"]);
+  const result = await chrome.storage.local.get(["monitoredStreamers", "liveStreamers"]);
+  const monitoredStreamers = result.monitoredStreamers || [];
+  const liveStreamers = result.liveStreamers || [];
 
   const listEl = document.getElementById("streamer-list");
   if (monitoredStreamers.length === 0) {
@@ -66,8 +67,9 @@ async function loadStreamerList() {
 
 // --- Debug info ---
 async function loadDebugInfo() {
-  const { debugLog = [], trackedTabs = {} } =
-    await browser.storage.local.get(["debugLog", "trackedTabs"]);
+  const result = await chrome.storage.local.get(["debugLog", "trackedTabs"]);
+  const debugLog = result.debugLog || [];
+  const trackedTabs = result.trackedTabs || {};
 
   const stateEl = document.getElementById("state");
   stateEl.textContent = `Tracked tabs: ${JSON.stringify(trackedTabs, null, 2)}`;
@@ -98,19 +100,19 @@ function refreshAll() {
 document.getElementById("refresh").addEventListener("click", refreshAll);
 
 document.getElementById("clear").addEventListener("click", async () => {
-  await browser.storage.local.set({ debugLog: [] });
+  await chrome.storage.local.set({ debugLog: [] });
   refreshAll();
 });
 
 document.getElementById("open-full").addEventListener("click", (e) => {
   e.preventDefault();
-  browser.tabs.create({ url: browser.runtime.getURL("debug.html") });
+  chrome.tabs.create({ url: chrome.runtime.getURL("debug.html") });
   window.close();
 });
 
 document.getElementById("credit-link").addEventListener("click", (e) => {
   e.preventDefault();
-  browser.tabs.create({ url: "http://127.0.0.1:52832/about" });
+  chrome.tabs.create({ url: "http://127.0.0.1:52832/about" });
   window.close();
 });
 

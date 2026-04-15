@@ -11,7 +11,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-VERSION = "1.2.0"
+VERSION = "1.4.1"
 
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
@@ -25,8 +25,10 @@ def load_config():
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        except:
+                data = json.load(f)
+            # Return full dict so we preserve all fields when saving back
+            return data
+        except (json.JSONDecodeError, ValueError):
             pass
     return {"client_id": "", "client_secret": "", "streamers": [], "check_interval": 60}
 
@@ -42,7 +44,7 @@ def main():
     
     dialog = tk.Tk()
     dialog.title(f"Stream Monitor Settings - v{VERSION}")
-    dialog.geometry("450x450")
+    dialog.geometry("450x580")
     dialog.resizable(False, False)
     
     # Center window
@@ -99,6 +101,22 @@ def main():
     interval_entry.pack(side=tk.LEFT, padx=(10, 0))
     interval_entry.insert(0, str(config.get("check_interval", 60)))
     
+    # Your channel section
+    ttk.Label(main_frame, text="Your Twitch Channel:", font=("", 10, "bold")).pack(anchor=tk.W, pady=(10, 0))
+    own_channel_entry = ttk.Entry(main_frame, width=45)
+    own_channel_entry.pack(fill=tk.X, pady=(5, 0))
+    own_channel_entry.insert(0, config.get("own_channel", ""))
+
+    # Toggles section
+    toggle_frame = ttk.Frame(main_frame)
+    toggle_frame.pack(fill=tk.X, pady=(10, 0))
+
+    im_live_var = tk.BooleanVar(value=config.get("im_live_pause", False))
+    ttk.Checkbutton(toggle_frame, text="Auto-pause when I'm live", variable=im_live_var).pack(anchor=tk.W)
+
+    vod_var = tk.BooleanVar(value=config.get("vod_fallback", False))
+    ttk.Checkbutton(toggle_frame, text="Auto-open VOD if stream missed", variable=vod_var).pack(anchor=tk.W)
+
     # Status label
     status_label = ttk.Label(main_frame, text="", font=("", 9))
     status_label.pack(pady=(5, 0))
@@ -133,6 +151,9 @@ def main():
         config["client_id"] = client_id_entry.get().strip()
         config["client_secret"] = client_secret_entry.get().strip()
         config["check_interval"] = interval
+        config["own_channel"] = own_channel_entry.get().strip()
+        config["im_live_pause"] = im_live_var.get()
+        config["vod_fallback"] = vod_var.get()
         save_config(config)
         
         status_label.config(text="✓ Settings saved! Restart Stream Monitor to apply.", foreground="green")

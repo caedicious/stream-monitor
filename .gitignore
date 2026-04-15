@@ -1,0 +1,11 @@
+# Build artifacts
+dist/
+build/
+installer_output/
+*.spec
+*.xpi
+icon.ico
+__pycache__/
+
+# Claude Code
+.claude/
