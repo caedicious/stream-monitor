@@ -1,6 +1,8 @@
 /**
- * Stream Monitor Tab Closer (Chromium)
- * Automatically closes Twitch tabs when the streamer raids someone else.
+ * Stream Monitor Companion (Chromium)
+ * Companion browser extension for the Stream Monitor desktop app.
+ * Closes Twitch tabs on raids, keeps background streams playing, and
+ * preserves viewer counts via Twitch's own play/unmute controls.
  *
  * Built for Manifest V3 service workers — all state is persisted to
  * chrome.storage.local so it survives service worker termination.
