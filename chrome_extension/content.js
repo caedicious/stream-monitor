@@ -30,52 +30,124 @@
   // -----------------------------------------------------------------------
 
   function getVideoElement() {
-    return document.querySelector("video");
+    // Return the main stream video, not an ad overlay's video. Twitch
+    // renders a separate <video> inside ad overlays (outstream-ax-overlay,
+    // ax-overlay) and document.querySelector("video") might find that one
+    // first, causing the content script to chase ghost "paused" states on
+    // an element that is not the main stream.
+    const videos = Array.from(document.querySelectorAll("video"));
+    for (const v of videos) {
+      const adAncestor = v.closest(
+        '[data-a-target*="ax-overlay"], [data-a-target*="outstream"]'
+      );
+      if (!adAncestor) return v;
+    }
+    // If everything is inside an ad overlay, fall back to the first video.
+    return videos[0] || null;
   }
 
-  let playFailCount = 0;
+  let lastPlayButtonClick = 0;
+  let lastMuteButtonClick = 0;
+  let lastVideoCurrentTime = -1;
+  let lastVideoTimeChangeMs = 0;
+  let lastReloadRequestMs = 0;
+
+  function findPlayLabelButton() {
+    // Returns a Twitch play/pause button whose aria-label starts with "Play"
+    // (meaning Twitch thinks the stream is currently paused — clicking will
+    // resume). There can be two such buttons in the DOM (main player and an
+    // ad overlay), so we iterate and take the first "Play" one.
+    // This is more reliable than reading video.paused because Twitch's React
+    // state can disagree with the raw video element, and React wins — any
+    // video.play() we do gets immediately undone by Twitch's reconciler.
+    const buttons = document.querySelectorAll('[data-a-target="player-play-pause-button"]');
+    for (const btn of buttons) {
+      const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+      if (label.startsWith("play")) {
+        return { btn, label };
+      }
+    }
+    return null;
+  }
+
+  function findUnmuteLabelButton() {
+    // Same pattern as play: Twitch's React state, not the raw video element,
+    // drives the speaker icon in the player UI. If the mute/unmute button's
+    // aria-label starts with "Unmute", Twitch thinks the player is muted and
+    // clicking will unmute it. Setting video.muted = false on the element
+    // alone is not enough — Twitch's reconciler re-mutes it.
+    const buttons = document.querySelectorAll('[data-a-target="player-mute-unmute-button"]');
+    for (const btn of buttons) {
+      const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+      if (label.startsWith("unmute")) {
+        return { btn, label };
+      }
+    }
+    return null;
+  }
+
+  function ensurePlayerUnmuted(video) {
+    // Keep the Twitch PLAYER unmuted at all times. Tab-level muting is
+    // handled separately by the background script via chrome.tabs.update.
+    if (video && video.muted) {
+      video.muted = false;
+    }
+    if (video && video.volume < 0.01) {
+      video.volume = 0.05;
+    }
+    const now = Date.now();
+    if (now - lastMuteButtonClick > 2000) {
+      const info = findUnmuteLabelButton();
+      if (info) {
+        lastMuteButtonClick = now;
+        info.btn.click();
+        console.log(LOG_PREFIX, `Clicked Twitch unmute button (label="${info.label}")`);
+      }
+    }
+  }
 
   function ensurePlaying(video) {
     if (!video) return;
 
-    // Unmute and set volume only when video is already playing —
-    // if paused, we handle mute state carefully in the play logic below
-    if (!video.paused) {
-      if (video.muted) {
-        video.muted = false;
-        console.log(LOG_PREFIX, "Unmuted video player");
-      }
-      if (video.volume < 0.01) {
-        video.volume = 0.05;
-        console.log(LOG_PREFIX, "Set video volume to 5%");
+    // Always ensure the Twitch player is unmuted — viewer count depends on
+    // it. Tab silence for the user is handled by chrome.tabs.update at the
+    // browser level, which does not affect the player's mute state.
+    ensurePlayerUnmuted(video);
+
+    // Source of truth for play state: Twitch's button label. If any
+    // play/pause button says "Play", Twitch thinks the stream is paused and
+    // we should click to resume. The button click routes through Twitch's
+    // React state machine, which is the only reliable way to keep the video
+    // playing — direct video.play() gets undone by Twitch's reconciler.
+    const now = Date.now();
+    if (now - lastPlayButtonClick > 2000) {
+      const info = findPlayLabelButton();
+      if (info) {
+        lastPlayButtonClick = now;
+        info.btn.click();
+        console.log(LOG_PREFIX, `Clicked Twitch play button (label="${info.label}")`);
+        lastVideoTimeChangeMs = now;
+        return;
       }
     }
 
-    // Ensure video is playing
-    if (video.paused) {
-      // Browsers block unmuted autoplay in background tabs. Muted autoplay
-      // is always allowed. Strategy: mute the video element, start playback,
-      // then unmute. The browser tab is already muted via auto-mute so the
-      // user won't hear anything during the brief muted window.
-      const wasMuted = video.muted;
-      video.muted = true;
-      video.play().then(() => {
-        // Playback started — now unmute the player so Twitch counts the viewer
-        video.muted = false;
-        console.log(LOG_PREFIX, "Started video playback (mute-start-unmute)");
-        playFailCount = 0;
-      }).catch((e) => {
-        video.muted = wasMuted; // restore original state on failure
-        playFailCount++;
-        console.warn(LOG_PREFIX, `Could not auto-play (attempt ${playFailCount}):`, e.message);
-        if (playFailCount >= 3) {
-          console.log(LOG_PREFIX, "Requesting background to reload tab");
-          chrome.runtime.sendMessage({ action: "reloadTab" }).catch(() => {});
-          playFailCount = 0;
-        }
-      });
+    // Track currentTime progression for diagnostic purposes only. We used
+    // to request a tab reload after 45s of no progression, but that fired
+    // false positives on streams that were playing fine (ads, buffer
+    // hiccups, measuring the wrong video element, etc.) and caused reload
+    // loops. The background script no longer reloads based on content-
+    // script heuristics — only on explicit user action. If the stream is
+    // genuinely broken, unmute/play button clicks above will recover it.
+    if (video.currentTime !== lastVideoCurrentTime) {
+      lastVideoCurrentTime = video.currentTime;
+      lastVideoTimeChangeMs = now;
     } else {
-      playFailCount = 0;
+      const stuckMs = now - lastVideoTimeChangeMs;
+      if (stuckMs > 60000 && stuckMs % 60000 < 5000) {
+        // Log a warning every minute so stalls are visible in DevTools,
+        // but DO NOT request a reload.
+        console.warn(LOG_PREFIX, `Video currentTime has not advanced for ${Math.round(stuckMs / 1000)}s (not reloading)`);
+      }
     }
   }
 
@@ -264,47 +336,32 @@
   // -----------------------------------------------------------------------
 
   function checkForErrors() {
-    // Twitch shows these elements when the stream is offline or errored
+    // Only treat very specific error overlays as genuine errors. The
+    // previous implementation also matched the generic .content-overlay-gate
+    // class (which fires on content-classification warnings that appear on
+    // many normal streams) and a readyState < 2 heuristic (which fires
+    // during normal page load), producing false-positive reloads.
+    //
+    // We now rely on the currentTime-progression stuck-detector in
+    // ensurePlaying() to trigger reloads. That check is strict (45s of no
+    // progress + 2min cooldown) so it only fires on genuine stalls.
     const errorSelectors = [
-      '[data-a-target="player-overlay-content-gate"]',
       '[data-a-target="player-error-message"]',
-      '.content-overlay-gate',
     ];
-
     for (const selector of errorSelectors) {
       const el = document.querySelector(selector);
       if (el && el.offsetParent !== null) {
         return true;
       }
     }
-
-    // Check if video element exists but has stalled
-    const video = getVideoElement();
-    if (video && video.readyState < 2 && !video.paused && video.currentTime === 0) {
-      return true;
-    }
-
     return false;
   }
 
-  // Periodically check for errors and report to background
-  let errorCheckTimer = null;
-  let lastErrorReport = 0;
-  const ERROR_CHECK_INTERVAL_MS = 15000;
-  const ERROR_REPORT_COOLDOWN_MS = 60000;
-
+  // Error reporting is intentionally disabled: the currentTime-progression
+  // check in ensurePlaying() is the only reload-trigger path now. We keep
+  // checkForErrors() exported via getStatus for popup diagnostics.
   function startErrorChecking() {
-    if (errorCheckTimer) return;
-    errorCheckTimer = setInterval(() => {
-      if (checkForErrors()) {
-        const now = Date.now();
-        if (now - lastErrorReport > ERROR_REPORT_COOLDOWN_MS) {
-          lastErrorReport = now;
-          console.log(LOG_PREFIX, "Stream error detected, notifying background");
-          chrome.runtime.sendMessage({ action: "tabError" }).catch(() => {});
-        }
-      }
-    }, ERROR_CHECK_INTERVAL_MS);
+    // no-op
   }
 
   // -----------------------------------------------------------------------
