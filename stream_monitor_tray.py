@@ -313,7 +313,9 @@ class TwitchMonitor:
 
         except requests.RequestException as e:
             log.error("API request failed: %s", e)
-            self.status_callback(f"API error: {e}")
+            # Truncate error message for tray tooltip (128 char Windows limit)
+            err_short = str(e)[:80]
+            self.status_callback(f"API error: {err_short}")
             raise  # Let _monitor_loop handle error counting and notifications
 
     def get_latest_vod_url(self, username: str) -> Optional[str]:
@@ -528,7 +530,11 @@ class StreamMonitorApp:
     def update_status(self, status: str):
         self.status = status
         if self.icon:
-            self.icon.title = f"Stream Monitor - {status}"
+            # Windows tray tooltip is limited to 128 characters
+            title = f"Stream Monitor - {status}"
+            if len(title) > 127:
+                title = title[:124] + "..."
+            self.icon.title = title
 
     def send_notification(self, title: str, message: str):
         """Send a system tray notification."""
