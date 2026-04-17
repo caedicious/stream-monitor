@@ -51,9 +51,14 @@ async function log(level, ...args) {
 async function loadState() {
   const { trackedTabs = {}, monitoredStreamers = [] } =
     await browser.storage.local.get(["trackedTabs", "monitoredStreamers"]);
+  // monitoredStreamers is stored as an ordered array. The array position
+  // encodes priority: index 0 = rank #1, index 1 = rank #2, etc. This drives
+  // the max-tabs displacement logic below.
+  const ordered = Array.isArray(monitoredStreamers) ? monitoredStreamers : [];
   return {
-    trackedTabs,                               // { [tabId]: { originalStreamer } }
-    monitoredStreamers: new Set(monitoredStreamers), // Set<string>
+    trackedTabs,                          // { [tabId]: { originalStreamer } }
+    monitoredStreamers: new Set(ordered), // fast membership check
+    orderedStreamers: ordered,            // priority order (index 0 = rank #1)
   };
 }
 
@@ -61,8 +66,33 @@ async function saveTrackedTabs(trackedTabs) {
   await browser.storage.local.set({ trackedTabs });
 }
 
-async function saveMonitoredStreamers(streamersSet) {
-  await browser.storage.local.set({ monitoredStreamers: Array.from(streamersSet) });
+async function saveMonitoredStreamers(orderedList) {
+  await browser.storage.local.set({ monitoredStreamers: orderedList });
+}
+
+// Rank helpers. A lower rank number = higher priority. Streamers no longer
+// in the monitored list (e.g. user removed them but their tab is still open)
+// sort last.
+function rankOf(name, orderedStreamers) {
+  const idx = orderedStreamers.indexOf(name);
+  return idx === -1 ? Infinity : idx;
+}
+
+function rankLabel(rank) {
+  return rank === Infinity ? "unranked" : `#${rank + 1}`;
+}
+
+async function notifyUser(title, message) {
+  try {
+    await browser.notifications.create({
+      type: "basic",
+      iconUrl: browser.runtime.getURL("icon-96.png"),
+      title,
+      message,
+    });
+  } catch (e) {
+    await log("warn", "Failed to create notification:", e?.message || String(e));
+  }
 }
 
 async function shouldAutoMute() {
@@ -217,16 +247,17 @@ async function fetchConfig() {
     });
 
     if (data?.streamers && Array.isArray(data.streamers)) {
-      const streamersSet = new Set(data.streamers.map(s => s.toLowerCase()));
-      await saveMonitoredStreamers(streamersSet);
+      // Preserve list order from the desktop app: position = priority rank.
+      const ordered = data.streamers.map(s => s.toLowerCase());
+      await saveMonitoredStreamers(ordered);
 
       // Save live status from desktop app for popup display
       if (Array.isArray(data.live_streamers)) {
         await browser.storage.local.set({ liveStreamers: data.live_streamers });
       }
 
-      await log("info", "Config loaded, streamers:", Array.from(streamersSet));
-      return streamersSet;
+      await log("info", "Config loaded, streamers:", ordered);
+      return new Set(ordered);
     }
   } catch (e) {
     await log("warn", "Config fetch failed:", e?.message || String(e));
@@ -302,7 +333,7 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
 
   if (!changeInfo.url) return;
 
-  const { trackedTabs, monitoredStreamers } = await loadState();
+  const { trackedTabs, monitoredStreamers, orderedStreamers } = await loadState();
   const tabKey = String(tabId);
   const newStreamer = getStreamerFromUrl(changeInfo.url);
   const tracked = trackedTabs[tabKey];
@@ -353,17 +384,50 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
     setTimeout(() => activatePlayerControl(tabId), 3000);
     await log("info", `Tab ${tabId} navigated to monitored streamer: ${newStreamer}${muted ? " (muted)" : ""}`);
 
-    // Enforce max tabs
+    // Enforce max tabs: when at capacity, displace the lowest-priority
+    // open tab rather than always closing the newest one. Priority comes
+    // from the order of the streamer list in the desktop app's config;
+    // the first streamer is rank #1 and so on.
     if (maxTabs > 0) {
       const tabCount = Object.keys(trackedTabs).length;
       if (tabCount > maxTabs) {
-        await log("info", `Max tabs (${maxTabs}) exceeded, closing newest tab ${tabId}`);
-        delete trackedTabs[tabKey];
+        const newRank = rankOf(newStreamer, orderedStreamers);
+        let worstTabKey = tabKey;
+        let worstRank = newRank;
+        let worstStreamer = newStreamer;
+        for (const [otherKey, info] of Object.entries(trackedTabs)) {
+          const r = rankOf(info.originalStreamer, orderedStreamers);
+          if (r > worstRank) {
+            worstRank = r;
+            worstTabKey = otherKey;
+            worstStreamer = info.originalStreamer;
+          }
+        }
+
+        if (worstTabKey === tabKey) {
+          await log("info",
+            `Max tabs (${maxTabs}) reached. ${rankLabel(newRank)} ${newStreamer} is the lowest priority; closing its new tab`
+          );
+          notifyUser(
+            "Stream Monitor",
+            `At max tabs (${maxTabs}). ${newStreamer} is the lowest-priority live streamer, so its tab was closed.`
+          );
+        } else {
+          await log("info",
+            `Max tabs (${maxTabs}) reached. Displacing ${rankLabel(worstRank)} ${worstStreamer} (tab ${worstTabKey}) to make room for ${rankLabel(newRank)} ${newStreamer}`
+          );
+          notifyUser(
+            "Stream Monitor",
+            `Closed ${worstStreamer} (${rankLabel(worstRank)}) to open ${newStreamer} (${rankLabel(newRank)}).`
+          );
+        }
+
+        delete trackedTabs[worstTabKey];
         await saveTrackedTabs(trackedTabs);
         try {
-          await browser.tabs.remove(tabId);
+          await browser.tabs.remove(Number(worstTabKey));
         } catch (e) {
-          await log("warn", `Failed to close excess tab ${tabId}:`, e.message);
+          await log("warn", `Failed to close tab ${worstTabKey}:`, e.message);
         }
       }
     }
