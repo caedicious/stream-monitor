@@ -7,6 +7,10 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 
+## 📥 [Download the latest release](https://github.com/caedicious/stream-monitor/releases/latest)
+
+**The easiest way to install Stream Monitor is to grab the installer from the [Releases page](https://github.com/caedicious/stream-monitor/releases/latest)**, or just click the **Release** badge at the top of this README. No Python or build tools needed. Just download, run the installer, and you're set.
+
 A Windows application that monitors Twitch streamers and automatically opens their stream in your browser when they go live. Pair it with the companion browser extension to auto-close tabs on raids and keep background streams counted as views.
 
 ## Features
