@@ -23,6 +23,8 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
+; Show the MIT license on the installer's license-agreement page
+LicenseFile=LICENSE
 ; Allow upgrading without uninstalling
 UsePreviousAppDir=yes
 CloseApplications=yes
@@ -36,6 +38,7 @@ Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\{#MyAppSetupExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\{#MyAppSettingsExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "about.html"; DestDir: "{app}"; Flags: ignoreversion
+Source: "LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
