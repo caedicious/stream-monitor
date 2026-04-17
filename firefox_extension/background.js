@@ -599,18 +599,27 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
     setTimeout(() => activatePlayerControl(tabId), 3000);
     await log("info", `Tab ${tabId} navigated to monitored streamer: ${newStreamer}${muted ? " (muted)" : ""}`);
 
-    // Enforce max tabs: when at capacity, displace the lowest-priority
-    // open tab rather than always closing the newest one. Priority comes
-    // from the order of the streamer list in the desktop app's config;
-    // the first streamer is rank #1 and so on. Tabs that are still within
-    // their grace period are protected from closing; if the best target is
-    // in grace we schedule a pending swap instead.
+    // Enforce max tabs: when at capacity, try to displace the lowest-
+    // priority open tab. Priority comes from the order of the streamer
+    // list in the desktop app's config; the first streamer is rank #1
+    // and so on. Core invariant (v1.5.1.1): every newly-opened monitored
+    // tab is guaranteed at least GRACE_MINUTES of viewing time so the
+    // viewer can build a Twitch view streak. That means we never close
+    // the new tab immediately here; the only options are:
+    //   - displace an existing tab with strictly-worse rank (new tab
+    //     keeps its slot indefinitely);
+    //   - all worse-ranked tabs are in grace → schedule a pending swap
+    //     for the earliest expiring one (new tab keeps its slot, target
+    //     closes when its grace ends);
+    //   - no existing tab has strictly-worse rank than new (new is the
+    //     lowest or tied-lowest priority) → schedule a pending
+    //     expiration for new at now + GRACE_MS so it gets a full
+    //     10-minute viewing window, then auto-closes.
     if (maxTabs > 0) {
       const tabCount = Object.keys(trackedTabs).length;
       if (tabCount > maxTabs) {
         const newRank = rankOf(newStreamer, orderedStreamers);
 
-        // Build a view of every candidate (including the new tab).
         const candidates = Object.entries(trackedTabs).map(([k, info]) => {
           const openedAt = info.openedAt || 0;
           return {
@@ -623,12 +632,56 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
           };
         });
 
-        // If the new tab is the overall worst candidate, give it a 10-min
-        // viewing window before closing so the viewer can still build some
-        // Twitch view-streak credit on a lower-priority streamer. When the
-        // window expires, executePendingExpiration closes the tab.
-        const overallWorst = candidates.reduce((a, b) => (b.rank > a.rank ? b : a));
-        if (overallWorst.tabKey === tabKey) {
+        const others = candidates.filter(c => c.tabKey !== tabKey);
+        // Displaceable: past grace AND worse-ranked than new. Worst-first.
+        const displaceable = others
+          .filter(c => !c.inGrace && c.rank > newRank)
+          .sort((a, b) => b.rank - a.rank);
+        // Shielded: in grace AND worse-ranked than new. Earliest-grace-first.
+        const shielded = others
+          .filter(c => c.inGrace && c.rank > newRank)
+          .sort((a, b) => a.graceUntil - b.graceUntil);
+
+        if (displaceable.length > 0) {
+          const target = displaceable[0];
+          await log("info",
+            `Max tabs (${maxTabs}) reached. Displacing ${rankLabel(target.rank)} ${target.streamer} (tab ${target.tabKey}) to make room for ${rankLabel(newRank)} ${newStreamer}`
+          );
+          notifyUser(
+            "Stream Monitor",
+            `Closed ${target.streamer} (${rankLabel(target.rank)}) to open ${newStreamer} (${rankLabel(newRank)}).`
+          );
+          delete trackedTabs[target.tabKey];
+          await saveTrackedTabs(trackedTabs);
+          await cancelPendingSwapsForTab(target.tabKey);
+          await cancelPendingExpirationForTab(target.tabKey);
+          try {
+            await browser.tabs.remove(Number(target.tabKey));
+          } catch (e) {
+            await log("warn", `Failed to close tab ${target.tabKey}:`, e.message);
+          }
+        } else if (shielded.length > 0) {
+          const target = shielded[0];
+          const minutesLeft = Math.max(1, Math.ceil((target.graceUntil - now) / 60000));
+          await log("info",
+            `Max tabs (${maxTabs}) reached but ${rankLabel(target.rank)} ${target.streamer} (tab ${target.tabKey}) is in grace (${minutesLeft}m left). Keeping both tabs open; swap scheduled.`
+          );
+          notifyUser(
+            "Stream Monitor",
+            `Protecting ${target.streamer}'s ${GRACE_MINUTES}-min streak. Will close their tab in ~${minutesLeft}m so ${newStreamer} keeps this slot.`
+          );
+          await schedulePendingSwap({
+            newTabKey: tabKey,
+            newStreamer,
+            targetTabKey: target.tabKey,
+            targetStreamer: target.streamer,
+            scheduledAt: target.graceUntil,
+          });
+        } else {
+          // No existing tab has strictly-worse rank than new. New is the
+          // lowest-priority live streamer (or tied-lowest, e.g. duplicate
+          // streamer tabs or multiple unranked tabs). Give new its
+          // guaranteed 10-minute viewing window, then auto-close.
           await log("info",
             `Max tabs (${maxTabs}) reached. ${rankLabel(newRank)} ${newStreamer} is the lowest priority; keeping tab open for ${GRACE_MINUTES}m to preserve streak, then closing.`
           );
@@ -637,75 +690,6 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
             `${newStreamer} is your lowest-priority live streamer. Keeping their tab open for ${GRACE_MINUTES} minutes to preserve streak, then closing.`
           );
           await schedulePendingExpiration(tabKey, newStreamer, now + GRACE_MS);
-        } else {
-          // Find a displaceable target (not in grace, rank worse than new).
-          // Prefer the worst-ranked displaceable so we free the "least
-          // important" slot.
-          const others = candidates.filter(c => c.tabKey !== tabKey);
-          const displaceable = others
-            .filter(c => !c.inGrace && c.rank > newRank)
-            .sort((a, b) => b.rank - a.rank);
-
-          if (displaceable.length > 0) {
-            const target = displaceable[0];
-            await log("info",
-              `Max tabs (${maxTabs}) reached. Displacing ${rankLabel(target.rank)} ${target.streamer} (tab ${target.tabKey}) to make room for ${rankLabel(newRank)} ${newStreamer}`
-            );
-            notifyUser(
-              "Stream Monitor",
-              `Closed ${target.streamer} (${rankLabel(target.rank)}) to open ${newStreamer} (${rankLabel(newRank)}).`
-            );
-            delete trackedTabs[target.tabKey];
-            await saveTrackedTabs(trackedTabs);
-            await cancelPendingSwapsForTab(target.tabKey);
-            await cancelPendingExpirationForTab(target.tabKey);
-            try {
-              await browser.tabs.remove(Number(target.tabKey));
-            } catch (e) {
-              await log("warn", `Failed to close tab ${target.tabKey}:`, e.message);
-            }
-          } else {
-            // No displaceable target right now. If there's a grace-protected
-            // tab with worse rank than new, schedule a swap for when its
-            // grace expires. Both tabs stay open until then.
-            const shielded = others
-              .filter(c => c.inGrace && c.rank > newRank)
-              .sort((a, b) => a.graceUntil - b.graceUntil);
-
-            if (shielded.length > 0) {
-              const target = shielded[0];
-              const minutesLeft = Math.max(1, Math.ceil((target.graceUntil - now) / 60000));
-              await log("info",
-                `Max tabs (${maxTabs}) reached but ${rankLabel(target.rank)} ${target.streamer} (tab ${target.tabKey}) is in grace (${minutesLeft}m left). Keeping both tabs open; swap scheduled.`
-              );
-              notifyUser(
-                "Stream Monitor",
-                `Protecting ${target.streamer}'s ${GRACE_MINUTES}-min streak. Will close their tab in ~${minutesLeft}m so ${newStreamer} keeps this slot.`
-              );
-              await schedulePendingSwap({
-                newTabKey: tabKey,
-                newStreamer,
-                targetTabKey: target.tabKey,
-                targetStreamer: target.streamer,
-                scheduledAt: target.graceUntil,
-              });
-            } else {
-              // Defensive fallback: this branch is only reachable if all
-              // non-new tabs have rank <= newRank, which should have been
-              // caught by overallWorst.tabKey === tabKey. Keep a log line
-              // in case our assumptions change.
-              await log("warn",
-                `Max tabs reached but no displaceable or shielded target found; closing new tab ${tabKey} defensively`
-              );
-              delete trackedTabs[tabKey];
-              await saveTrackedTabs(trackedTabs);
-              try {
-                await browser.tabs.remove(Number(tabKey));
-              } catch (e) {
-                await log("warn", `Failed to close tab ${tabKey}:`, e.message);
-              }
-            }
-          }
         }
       }
     }
