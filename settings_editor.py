@@ -11,7 +11,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-VERSION = "1.4.2"
+VERSION = "1.5.1.1"
 
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
@@ -44,13 +44,13 @@ def main():
     
     dialog = tk.Tk()
     dialog.title(f"Stream Monitor Settings - v{VERSION}")
-    dialog.geometry("450x580")
+    dialog.geometry("500x700")
     dialog.resizable(False, False)
-    
+
     # Center window
     dialog.update_idletasks()
-    x = (dialog.winfo_screenwidth() - 450) // 2
-    y = (dialog.winfo_screenheight() - 420) // 2
+    x = (dialog.winfo_screenwidth() - 500) // 2
+    y = (dialog.winfo_screenheight() - 700) // 2
     dialog.geometry(f"+{x}+{y}")
     
     # Make sure window gets focus
@@ -64,11 +64,92 @@ def main():
     
     # Streamers section
     ttk.Label(main_frame, text="Streamers to Monitor:", font=("", 10, "bold")).pack(anchor=tk.W)
-    ttk.Label(main_frame, text="(One per line)", font=("", 8)).pack(anchor=tk.W)
-    
-    streamers_text = tk.Text(main_frame, height=8, width=40)
-    streamers_text.pack(fill=tk.X, pady=(5, 15))
-    streamers_text.insert("1.0", "\n".join(config.get("streamers", [])))
+    ttk.Label(
+        main_frame,
+        text="Priority order: top = #1. With a max-tabs limit set, higher-ranked streamers displace lower-ranked ones.",
+        font=("", 8),
+        foreground="gray",
+        wraplength=460,
+        justify=tk.LEFT,
+    ).pack(anchor=tk.W, pady=(0, 5))
+
+    # Working copy of the streamer order. Lowercased so ranking comparisons
+    # against the extension (which lowercases everything) stay in sync.
+    streamer_order = [s.strip().lower() for s in config.get("streamers", []) if s.strip()]
+
+    list_frame = ttk.Frame(main_frame)
+    list_frame.pack(fill=tk.X, pady=(0, 5))
+
+    streamers_listbox = tk.Listbox(list_frame, height=8, font=("", 10), activestyle="dotbox")
+    streamers_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    list_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=streamers_listbox.yview)
+    list_scroll.pack(side=tk.LEFT, fill=tk.Y)
+    streamers_listbox.config(yscrollcommand=list_scroll.set)
+
+    list_buttons = ttk.Frame(list_frame)
+    list_buttons.pack(side=tk.LEFT, fill=tk.Y, padx=(6, 0))
+
+    def _render_streamers(select_index=None):
+        streamers_listbox.delete(0, tk.END)
+        for i, name in enumerate(streamer_order):
+            streamers_listbox.insert(tk.END, f"{i + 1}. {name}")
+        if select_index is not None and 0 <= select_index < len(streamer_order):
+            streamers_listbox.selection_set(select_index)
+            streamers_listbox.see(select_index)
+
+    def _move_up():
+        sel = streamers_listbox.curselection()
+        if not sel or sel[0] == 0:
+            return
+        i = sel[0]
+        streamer_order[i - 1], streamer_order[i] = streamer_order[i], streamer_order[i - 1]
+        _render_streamers(i - 1)
+
+    def _move_down():
+        sel = streamers_listbox.curselection()
+        if not sel or sel[0] >= len(streamer_order) - 1:
+            return
+        i = sel[0]
+        streamer_order[i + 1], streamer_order[i] = streamer_order[i], streamer_order[i + 1]
+        _render_streamers(i + 1)
+
+    def _remove_selected():
+        sel = streamers_listbox.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        del streamer_order[i]
+        if streamer_order:
+            _render_streamers(min(i, len(streamer_order) - 1))
+        else:
+            _render_streamers()
+
+    ttk.Button(list_buttons, text="Move Up", command=_move_up, width=10).pack(pady=2)
+    ttk.Button(list_buttons, text="Move Down", command=_move_down, width=10).pack(pady=2)
+    ttk.Button(list_buttons, text="Remove", command=_remove_selected, width=10).pack(pady=2)
+
+    add_frame = ttk.Frame(main_frame)
+    add_frame.pack(fill=tk.X, pady=(0, 15))
+
+    add_entry = ttk.Entry(add_frame)
+    add_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _add_streamer(_event=None):
+        name = add_entry.get().strip().lower()
+        if not name:
+            return
+        if name in streamer_order:
+            messagebox.showinfo("Already added", f"'{name}' is already in the list.")
+            return
+        streamer_order.append(name)
+        add_entry.delete(0, tk.END)
+        _render_streamers(len(streamer_order) - 1)
+
+    add_entry.bind("<Return>", _add_streamer)
+    ttk.Button(add_frame, text="Add", command=_add_streamer, width=10).pack(side=tk.LEFT, padx=(6, 0))
+
+    _render_streamers()
     
     # Credentials section
     ttk.Label(main_frame, text="Twitch API Credentials:", font=("", 10, "bold")).pack(anchor=tk.W)
@@ -126,8 +207,10 @@ def main():
     btn_frame.pack(fill=tk.X, pady=(15, 0))
     
     def save_settings():
-        streamers = [s.strip() for s in streamers_text.get("1.0", tk.END).strip().split("\n") if s.strip()]
-        
+        # streamer_order is the working list maintained by the listbox UI;
+        # its order is the priority order we persist to disk.
+        streamers = list(streamer_order)
+
         if not streamers:
             messagebox.showerror("Error", "Please enter at least one streamer.")
             return
@@ -162,8 +245,8 @@ def main():
     ttk.Button(btn_frame, text="Save", command=save_settings).pack(side=tk.RIGHT, padx=(10, 0))
     ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
     
-    # Focus on streamers text
-    dialog.after(100, lambda: streamers_text.focus_set())
+    # Focus on the add-streamer entry so the user can start typing immediately
+    dialog.after(100, lambda: add_entry.focus_set())
     
     dialog.mainloop()
 
