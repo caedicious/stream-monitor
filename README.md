@@ -4,7 +4,7 @@
 [![Downloads](https://img.shields.io/github/downloads/caedicious/stream-monitor/total)](https://github.com/caedicious/stream-monitor/releases)
 [![Firefox Add-on](https://img.shields.io/amo/v/stream-monitor-tab-closer?label=Firefox)](https://addons.mozilla.org/firefox/addon/stream-monitor-tab-closer/)
 [![Chrome Web Store](https://img.shields.io/chrome-web-store/v/aaaaibcmmahcedpcdfcbhnjfkgmcgcii?label=Chrome)](https://chromewebstore.google.com/detail/stream-monitor-companion/aaaaibcmmahcedpcdfcbhnjfkgmcgcii)
-[![License](https://img.shields.io/badge/license-All%20Rights%20Reserved-red)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 
 A Windows application that monitors Twitch streamers and automatically opens their stream in your browser when they go live. Pair it with the companion browser extension to auto-close tabs on raids and keep background streams counted as views.
@@ -161,4 +161,4 @@ This app uses the Twitch Helix API to check stream status. It:
 
 ## License
 
-MIT License - feel free to modify and distribute.
+Released under the [MIT License](LICENSE). You're free to use, modify, and redistribute the code; see the LICENSE file for the full terms.
