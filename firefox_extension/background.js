@@ -14,6 +14,16 @@ const CONFIG_INTERVAL_MINUTES = 1;
 const KEEPALIVE_INTERVAL_MINUTES = 2;
 const MAX_LOG_ENTRIES = 200;
 
+// Grace period: a tab that has been open for less than this duration is
+// "in grace" and should not be closed by max-tabs displacement. This
+// protects the viewer's Twitch view streak/drops eligibility on freshly
+// opened streams. When a higher-priority streamer needs the slot and the
+// only candidate to displace is still in grace, both tabs stay open
+// temporarily and the displacement is scheduled for when grace expires.
+const GRACE_MINUTES = 10;
+const GRACE_MS = GRACE_MINUTES * 60 * 1000;
+const PENDING_SWAP_ALARM_PREFIX = "pending-swap-";
+
 const IGNORED_PATHS = new Set([
   "directory", "videos", "settings", "subscriptions",
   "inventory", "drops", "wallet",
@@ -92,6 +102,112 @@ async function notifyUser(title, message) {
     });
   } catch (e) {
     await log("warn", "Failed to create notification:", e?.message || String(e));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pending swaps — deferred displacement when the target tab is in grace
+// ---------------------------------------------------------------------------
+//
+// When the only displaceable tab is still within its grace period, we keep
+// both tabs open (max_tabs + 1 temporarily) and store a "pending swap"
+// describing what to close later. A browser alarm fires at grace expiry
+// and runs executePendingSwap, which verifies both tabs are still valid
+// and then closes the target.
+//
+// pendingSwaps shape:
+//   [{ newTabKey, newStreamer, targetTabKey, targetStreamer, scheduledAt }]
+
+async function loadPendingSwaps() {
+  const { pendingSwaps = [] } = await browser.storage.local.get("pendingSwaps");
+  return Array.isArray(pendingSwaps) ? pendingSwaps : [];
+}
+
+async function savePendingSwaps(swaps) {
+  await browser.storage.local.set({ pendingSwaps: swaps });
+}
+
+function pendingSwapAlarmName(newTabKey) {
+  return `${PENDING_SWAP_ALARM_PREFIX}${newTabKey}`;
+}
+
+async function schedulePendingSwap(swap) {
+  const swaps = await loadPendingSwaps();
+  // If a swap already exists for this newTabKey, replace it (shouldn't
+  // happen in normal flow but guards against duplicates on edge replays).
+  const filtered = swaps.filter(s => s.newTabKey !== swap.newTabKey);
+  filtered.push(swap);
+  await savePendingSwaps(filtered);
+
+  // Enforce Firefox/Chrome's ~30s minimum alarm delay.
+  const fireAt = Math.max(swap.scheduledAt, Date.now() + 30000);
+  await browser.alarms.create(pendingSwapAlarmName(swap.newTabKey), { when: fireAt });
+  await log("info",
+    `Scheduled pending swap: close ${swap.targetStreamer} (tab ${swap.targetTabKey}) at ${new Date(fireAt).toISOString()} to finalize slot for ${swap.newStreamer}`
+  );
+}
+
+async function cancelPendingSwapsForTab(tabKey) {
+  const swaps = await loadPendingSwaps();
+  const remaining = [];
+  for (const s of swaps) {
+    if (s.newTabKey === tabKey || s.targetTabKey === tabKey) {
+      await browser.alarms.clear(pendingSwapAlarmName(s.newTabKey));
+      await log("info",
+        `Cancelled pending swap (${s.newStreamer} <- ${s.targetStreamer}) because tab ${tabKey} is gone`
+      );
+    } else {
+      remaining.push(s);
+    }
+  }
+  if (remaining.length !== swaps.length) {
+    await savePendingSwaps(remaining);
+  }
+}
+
+async function executePendingSwap(newTabKey) {
+  const swaps = await loadPendingSwaps();
+  const swap = swaps.find(s => s.newTabKey === newTabKey);
+  if (!swap) {
+    await log("info", `Pending swap alarm fired for tab ${newTabKey} but no matching swap in storage`);
+    return;
+  }
+
+  const remaining = swaps.filter(s => s.newTabKey !== newTabKey);
+  await savePendingSwaps(remaining);
+
+  const { trackedTabs } = await loadState();
+  const target = trackedTabs[swap.targetTabKey];
+  const stillTracking = target && target.originalStreamer === swap.targetStreamer;
+
+  if (!stillTracking) {
+    await log("info",
+      `Pending swap fired but target ${swap.targetStreamer} (tab ${swap.targetTabKey}) is no longer tracked; slot already free`
+    );
+    return;
+  }
+
+  if (!trackedTabs[swap.newTabKey]) {
+    await log("info",
+      `Pending swap fired but new tab ${swap.newTabKey} (${swap.newStreamer}) is no longer tracked; nothing to preserve`
+    );
+    return;
+  }
+
+  await log("info",
+    `Executing pending swap: closing ${swap.targetStreamer} (tab ${swap.targetTabKey}) now that grace has expired; ${swap.newStreamer} keeps its slot`
+  );
+  notifyUser(
+    "Stream Monitor",
+    `${swap.targetStreamer}'s ${GRACE_MINUTES}-min streak is safe. Closed their tab so ${swap.newStreamer} keeps the slot.`
+  );
+
+  delete trackedTabs[swap.targetTabKey];
+  await saveTrackedTabs(trackedTabs);
+  try {
+    await browser.tabs.remove(Number(swap.targetTabKey));
+  } catch (e) {
+    await log("warn", `Failed to close target tab ${swap.targetTabKey} during pending swap:`, e.message);
   }
 }
 
@@ -284,12 +400,15 @@ async function scanExistingTabs() {
     }
   }
 
-  // Add Twitch tabs opened by Stream Monitor (sm=1) that aren't tracked yet
+  // Add Twitch tabs opened by Stream Monitor (sm=1) that aren't tracked yet.
+  // We don't know when the tab was originally opened, so stamp openedAt with
+  // the current time. This conservatively gives a fresh grace window rather
+  // than guessing a past timestamp.
   const twitchTabs = await browser.tabs.query({ url: "*://*.twitch.tv/*" });
   for (const tab of twitchTabs) {
     const streamer = getStreamerFromUrl(tab.url);
     if (streamer && monitoredStreamers.has(streamer) && isStreamMonitorTab(tab.url) && !trackedTabs[String(tab.id)]) {
-      trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0 };
+      trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0, openedAt: Date.now() };
       const muted = await muteTabIfEnabled(tab.id);
       activatePlayerControl(tab.id);
       await log("info", `Scan: tracking tab ${tab.id} for ${streamer}${muted ? " (muted)" : ""}`);
@@ -312,7 +431,7 @@ async function onTabCreated(tab) {
   const streamer = getStreamerFromUrl(tab.url);
 
   if (streamer && monitoredStreamers.has(streamer) && isStreamMonitorTab(tab.url)) {
-    trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0 };
+    trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0, openedAt: Date.now() };
     await saveTrackedTabs(trackedTabs);
     const muted = await muteTabIfEnabled(tab.id);
     // Delay slightly so the page has time to load the video player
@@ -354,9 +473,12 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
       }
 
       if (raidFollowThrough && (tracked.raidHopCount || 0) === 0) {
-        // Follow through on one raid — update tracking to new streamer
+        // Follow through on one raid — update tracking to new streamer.
+        // Reset openedAt so the new streamer gets a fresh grace window
+        // instead of inheriting the displaced streamer's remaining time.
         tracked.originalStreamer = newStreamer;
         tracked.raidHopCount = 1;
+        tracked.openedAt = Date.now();
         await saveTrackedTabs(trackedTabs);
         await log("info", `Raid follow-through: ${tracked.originalStreamer} -> ${newStreamer}, staying on tab ${tabId}`);
         return;
@@ -365,6 +487,7 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
       await log("info", `Raid detected: ${tracked.originalStreamer} -> ${newStreamer}. Closing tab ${tabId}.`);
       delete trackedTabs[tabKey];
       await saveTrackedTabs(trackedTabs);
+      await cancelPendingSwapsForTab(tabKey);
       try {
         await browser.tabs.remove(tabId);
       } catch (e) {
@@ -375,10 +498,12 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
       await log("info", `Tab ${tabId} navigated away from Twitch, untracking`);
       delete trackedTabs[tabKey];
       await saveTrackedTabs(trackedTabs);
+      await cancelPendingSwapsForTab(tabKey);
     }
   } else if (newStreamer && monitoredStreamers.has(newStreamer) && isStreamMonitorTab(changeInfo.url)) {
     // New navigation to a monitored streamer opened by Stream Monitor (sm=1)
-    trackedTabs[tabKey] = { originalStreamer: newStreamer, raidHopCount: 0 };
+    const now = Date.now();
+    trackedTabs[tabKey] = { originalStreamer: newStreamer, raidHopCount: 0, openedAt: now };
     await saveTrackedTabs(trackedTabs);
     const muted = await muteTabIfEnabled(tabId);
     setTimeout(() => activatePlayerControl(tabId), 3000);
@@ -387,24 +512,33 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
     // Enforce max tabs: when at capacity, displace the lowest-priority
     // open tab rather than always closing the newest one. Priority comes
     // from the order of the streamer list in the desktop app's config;
-    // the first streamer is rank #1 and so on.
+    // the first streamer is rank #1 and so on. Tabs that are still within
+    // their grace period are protected from closing; if the best target is
+    // in grace we schedule a pending swap instead.
     if (maxTabs > 0) {
       const tabCount = Object.keys(trackedTabs).length;
       if (tabCount > maxTabs) {
         const newRank = rankOf(newStreamer, orderedStreamers);
-        let worstTabKey = tabKey;
-        let worstRank = newRank;
-        let worstStreamer = newStreamer;
-        for (const [otherKey, info] of Object.entries(trackedTabs)) {
-          const r = rankOf(info.originalStreamer, orderedStreamers);
-          if (r > worstRank) {
-            worstRank = r;
-            worstTabKey = otherKey;
-            worstStreamer = info.originalStreamer;
-          }
-        }
 
-        if (worstTabKey === tabKey) {
+        // Build a view of every candidate (including the new tab).
+        const candidates = Object.entries(trackedTabs).map(([k, info]) => {
+          const openedAt = info.openedAt || 0;
+          return {
+            tabKey: k,
+            streamer: info.originalStreamer,
+            rank: rankOf(info.originalStreamer, orderedStreamers),
+            openedAt,
+            graceUntil: openedAt + GRACE_MS,
+            inGrace: now - openedAt < GRACE_MS,
+          };
+        });
+
+        // If the new tab is the overall worst candidate, close it outright.
+        // Grace does not protect lowest-priority streamers from being closed;
+        // it only shields existing tabs from being displaced by higher-
+        // priority ones.
+        const overallWorst = candidates.reduce((a, b) => (b.rank > a.rank ? b : a));
+        if (overallWorst.tabKey === tabKey) {
           await log("info",
             `Max tabs (${maxTabs}) reached. ${rankLabel(newRank)} ${newStreamer} is the lowest priority; closing its new tab`
           );
@@ -412,22 +546,81 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
             "Stream Monitor",
             `At max tabs (${maxTabs}). ${newStreamer} is the lowest-priority live streamer, so its tab was closed.`
           );
+          delete trackedTabs[tabKey];
+          await saveTrackedTabs(trackedTabs);
+          try {
+            await browser.tabs.remove(Number(tabKey));
+          } catch (e) {
+            await log("warn", `Failed to close tab ${tabKey}:`, e.message);
+          }
         } else {
-          await log("info",
-            `Max tabs (${maxTabs}) reached. Displacing ${rankLabel(worstRank)} ${worstStreamer} (tab ${worstTabKey}) to make room for ${rankLabel(newRank)} ${newStreamer}`
-          );
-          notifyUser(
-            "Stream Monitor",
-            `Closed ${worstStreamer} (${rankLabel(worstRank)}) to open ${newStreamer} (${rankLabel(newRank)}).`
-          );
-        }
+          // Find a displaceable target (not in grace, rank worse than new).
+          // Prefer the worst-ranked displaceable so we free the "least
+          // important" slot.
+          const others = candidates.filter(c => c.tabKey !== tabKey);
+          const displaceable = others
+            .filter(c => !c.inGrace && c.rank > newRank)
+            .sort((a, b) => b.rank - a.rank);
 
-        delete trackedTabs[worstTabKey];
-        await saveTrackedTabs(trackedTabs);
-        try {
-          await browser.tabs.remove(Number(worstTabKey));
-        } catch (e) {
-          await log("warn", `Failed to close tab ${worstTabKey}:`, e.message);
+          if (displaceable.length > 0) {
+            const target = displaceable[0];
+            await log("info",
+              `Max tabs (${maxTabs}) reached. Displacing ${rankLabel(target.rank)} ${target.streamer} (tab ${target.tabKey}) to make room for ${rankLabel(newRank)} ${newStreamer}`
+            );
+            notifyUser(
+              "Stream Monitor",
+              `Closed ${target.streamer} (${rankLabel(target.rank)}) to open ${newStreamer} (${rankLabel(newRank)}).`
+            );
+            delete trackedTabs[target.tabKey];
+            await saveTrackedTabs(trackedTabs);
+            await cancelPendingSwapsForTab(target.tabKey);
+            try {
+              await browser.tabs.remove(Number(target.tabKey));
+            } catch (e) {
+              await log("warn", `Failed to close tab ${target.tabKey}:`, e.message);
+            }
+          } else {
+            // No displaceable target right now. If there's a grace-protected
+            // tab with worse rank than new, schedule a swap for when its
+            // grace expires. Both tabs stay open until then.
+            const shielded = others
+              .filter(c => c.inGrace && c.rank > newRank)
+              .sort((a, b) => a.graceUntil - b.graceUntil);
+
+            if (shielded.length > 0) {
+              const target = shielded[0];
+              const minutesLeft = Math.max(1, Math.ceil((target.graceUntil - now) / 60000));
+              await log("info",
+                `Max tabs (${maxTabs}) reached but ${rankLabel(target.rank)} ${target.streamer} (tab ${target.tabKey}) is in grace (${minutesLeft}m left). Keeping both tabs open; swap scheduled.`
+              );
+              notifyUser(
+                "Stream Monitor",
+                `Protecting ${target.streamer}'s ${GRACE_MINUTES}-min streak. Will close their tab in ~${minutesLeft}m so ${newStreamer} keeps this slot.`
+              );
+              await schedulePendingSwap({
+                newTabKey: tabKey,
+                newStreamer,
+                targetTabKey: target.tabKey,
+                targetStreamer: target.streamer,
+                scheduledAt: target.graceUntil,
+              });
+            } else {
+              // Defensive fallback: this branch is only reachable if all
+              // non-new tabs have rank <= newRank, which should have been
+              // caught by overallWorst.tabKey === tabKey. Keep a log line
+              // in case our assumptions change.
+              await log("warn",
+                `Max tabs reached but no displaceable or shielded target found; closing new tab ${tabKey} defensively`
+              );
+              delete trackedTabs[tabKey];
+              await saveTrackedTabs(trackedTabs);
+              try {
+                await browser.tabs.remove(Number(tabKey));
+              } catch (e) {
+                await log("warn", `Failed to close tab ${tabKey}:`, e.message);
+              }
+            }
+          }
         }
       }
     }
@@ -442,6 +635,7 @@ async function onTabRemoved(tabId) {
     await saveTrackedTabs(trackedTabs);
     await log("info", `Tab ${tabId} closed, untracking`);
   }
+  await cancelPendingSwapsForTab(tabKey);
 }
 
 async function onAlarm(alarm) {
@@ -461,6 +655,10 @@ async function onAlarm(alarm) {
     for (const tabId of tabIds) {
       sendToContentScript(Number(tabId), { action: "keepalive" });
     }
+  } else if (alarm.name.startsWith(PENDING_SWAP_ALARM_PREFIX)) {
+    const newTabKey = alarm.name.slice(PENDING_SWAP_ALARM_PREFIX.length);
+    await log("info", `Pending swap alarm fired for tab ${newTabKey}`);
+    await executePendingSwap(newTabKey);
   }
 }
 
@@ -510,6 +708,25 @@ browser.runtime.onInstalled.addListener((details) => {
 
   // Reconcile tracked tabs with reality
   await scanExistingTabs();
+
+  // Drop pending swaps whose tabs are gone; the alarms API persists alarms
+  // across restarts but the tab IDs they reference may no longer be valid.
+  const pending = await loadPendingSwaps();
+  if (pending.length > 0) {
+    const tabIds = new Set((await browser.tabs.query({})).map(t => String(t.id)));
+    const alive = pending.filter(s => tabIds.has(s.newTabKey) && tabIds.has(s.targetTabKey));
+    const dropped = pending.length - alive.length;
+    if (dropped > 0) {
+      await savePendingSwaps(alive);
+      // Clear alarms for the dropped swaps.
+      for (const s of pending) {
+        if (!alive.includes(s)) {
+          await browser.alarms.clear(pendingSwapAlarmName(s.newTabKey));
+        }
+      }
+      await log("info", `Dropped ${dropped} stale pending swap(s) on startup`);
+    }
+  }
 
   await log("info", "Event page ready");
 })();
