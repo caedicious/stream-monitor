@@ -409,9 +409,14 @@
         return;
       }
       // Find debug entry with closest timestamp to the activity event.
+      // Activity log records UTC ("...Z"). Python's logging asctime default
+      // is LOCAL time with no timezone marker, so we parse the debug ts
+      // without the Z so JS interprets it in the browser's (== desktop's)
+      // local timezone. Both then convert to the same UTC millisecond and
+      // the delta is meaningful.
       let closest = null, closestDelta = Infinity;
       for (const entry of allDebug) {
-        const debugMs = Date.parse(entry.ts.replace(" ", "T") + "Z");
+        const debugMs = Date.parse(entry.ts.replace(" ", "T"));
         if (isNaN(debugMs)) continue;
         const delta = Math.abs(debugMs - target);
         if (delta < closestDelta) {
