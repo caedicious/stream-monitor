@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Stream Monitor - Logs</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      line-height: 1.4;
+    }
+    h1 {
+      color: #faa0d7;
+      font-size: 22px;
+      margin: 0 0 6px 0;
+    }
+    .subtitle {
+      color: #999;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+    .tabs {
+      display: flex;
+      gap: 4px;
+      border-bottom: 2px solid #2a3754;
+      margin-bottom: 14px;
+    }
+    .tab {
+      background: transparent;
+      color: #888;
+      border: none;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -2px;
+      padding: 10px 18px;
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      letter-spacing: 0.3px;
+    }
+    .tab:hover { color: #ccc; }
+    .tab.active {
+      color: #faa0d7;
+      border-bottom-color: #faa0d7;
+    }
+    .pane { display: none; }
+    .pane.active { display: block; }
+    .controls {
+      background: #16213e;
+      padding: 14px 16px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 13px;
+    }
+    .controls label {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      color: #ccc;
+    }
+    .controls select, .controls input[type="search"] {
+      background: #0f1729;
+      color: #e0e0e0;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 5px 8px;
+      font-family: inherit;
+      font-size: 13px;
+    }
+    .controls input[type="search"] { min-width: 220px; }
+    button {
+      background: #9b59b6;
+      color: white;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+    }
+    button:hover { background: #8e44ad; }
+    button.secondary {
+      background: #2a3754;
+    }
+    button.secondary:hover { background: #354666; }
+    .summary {
+      color: #888;
+      font-size: 12px;
+      margin-bottom: 12px;
+    }
+    .summary-strong { color: #faa0d7; font-weight: 600; }
+    .timeline {
+      background: #0f1729;
+      border-radius: 8px;
+      padding: 8px 0;
+    }
+    .event, .debug-entry {
+      display: grid;
+      gap: 14px;
+      padding: 8px 16px;
+      border-bottom: 1px solid #1f2a44;
+      font-size: 13px;
+    }
+    .event { grid-template-columns: 200px 140px 1fr 50px; }
+    .debug-entry { grid-template-columns: 200px 90px 1fr; }
+    .event:last-child, .debug-entry:last-child { border-bottom: none; }
+    .event:hover, .debug-entry:hover { background: #14203d; }
+    .debug-entry.flash {
+      background: #5d4f1c;
+      animation: flash-fade 2s ease-out forwards;
+    }
+    @keyframes flash-fade {
+      0% { background: #7d6a25; }
+      100% { background: transparent; }
+    }
+    .ts {
+      color: #888;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .event-type {
+      font-weight: 600;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .event-type-stream_live    { color: #2ecc71; }
+    .event-type-stream_offline { color: #95a5a6; }
+    .event-type-tab_open_attempt { color: #3498db; }
+    .event-type-tab_open_skipped { color: #f39c12; }
+    .event-type-api_error      { color: #e74c3c; }
+    .event-type-api_recovered  { color: #2ecc71; }
+    .event-type-app_started    { color: #9b59b6; }
+    .event-type-app_stopped    { color: #9b59b6; }
+    .event-type-config_loaded  { color: #5dade2; }
+    .event-type-auto_paused_started { color: #f39c12; }
+    .event-type-auto_paused_ended { color: #2ecc71; }
+    .event-type-wake_detected  { color: #e67e22; }
+    .level {
+      font-weight: 600;
+      font-size: 11px;
+      letter-spacing: 0.5px;
+    }
+    .level-INFO     { color: #95a5a6; }
+    .level-DEBUG    { color: #5d6d7e; }
+    .level-WARNING  { color: #f39c12; }
+    .level-ERROR    { color: #e74c3c; }
+    .level-CRITICAL { color: #c0392b; }
+    .details, .msg {
+      color: #ddd;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+      word-break: break-word;
+    }
+    .msg { white-space: pre-wrap; }
+    .details .field {
+      display: inline-block;
+      margin-right: 12px;
+    }
+    .details .key { color: #7d8da8; }
+    .details .value { color: #e0e0e0; }
+    .empty {
+      padding: 40px;
+      text-align: center;
+      color: #888;
+    }
+    .jump-debug {
+      background: transparent;
+      color: #5dade2;
+      border: 1px solid #2a3754;
+      padding: 3px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      align-self: center;
+      justify-self: end;
+    }
+    .jump-debug:hover {
+      background: #2a3754;
+      color: #aed6f1;
+    }
+    a { color: #5dade2; }
+  </style>
+</head>
+<body>
+  <h1>Stream Monitor: Logs</h1>
+  <p class="subtitle">
+    Two views into the same monitoring session. Use Stream Activity for cross-checking missed broadcasts.
+    Use Debug Log when something looks broken and you need the full Python output. Each Stream Activity row has a
+    "→ debug" button that jumps to the closest entry in the Debug Log at that timestamp.
+  </p>
+
+  <div class="tabs">
+    <button class="tab active" id="tab-activity" data-pane="pane-activity">Stream Activity</button>
+    <button class="tab" id="tab-debug" data-pane="pane-debug">Debug Log</button>
+  </div>
+
+  <!-- ============ Stream Activity pane ============ -->
+  <div class="pane active" id="pane-activity">
+    <div class="controls">
+      <button id="refresh-activity">Refresh</button>
+      <a href="/activity.jsonl" download><button class="secondary" type="button">Download raw JSONL</button></a>
+      <label>
+        Streamer:
+        <select id="filter-streamer">
+          <option value="">(all)</option>
+        </select>
+      </label>
+      <label>
+        Event type:
+        <select id="filter-event">
+          <option value="">(all)</option>
+        </select>
+      </label>
+      <label>
+        Search:
+        <input type="search" id="filter-text" placeholder="title, game, error...">
+      </label>
+    </div>
+    <div class="summary" id="summary-activity"></div>
+    <div class="timeline" id="timeline-activity">
+      <div class="empty">Loading...</div>
+    </div>
+  </div>
+
+  <!-- ============ Debug Log pane ============ -->
+  <div class="pane" id="pane-debug">
+    <div class="controls">
+      <button id="refresh-debug">Refresh</button>
+      <a href="/debug.log" download><button class="secondary" type="button">Download raw .log</button></a>
+      <label>
+        Min level:
+        <select id="filter-level">
+          <option value="DEBUG">DEBUG and up</option>
+          <option value="INFO" selected>INFO and up</option>
+          <option value="WARNING">WARNING and up</option>
+          <option value="ERROR">ERROR and up</option>
+        </select>
+      </label>
+      <label>
+        Search:
+        <input type="search" id="filter-debug-text" placeholder="message text...">
+      </label>
+    </div>
+    <div class="summary" id="summary-debug"></div>
+    <div class="timeline" id="timeline-debug">
+      <div class="empty">Loading...</div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let allActivity = [];
+    let allDebug = [];
+    const LEVEL_ORDER = { DEBUG: 0, INFO: 1, WARNING: 2, ERROR: 3, CRITICAL: 4 };
+
+    // ---------------- Tab switching ----------------
+    document.querySelectorAll(".tab").forEach(tab => {
+      tab.addEventListener("click", () => switchTab(tab.dataset.pane));
+    });
+    function switchTab(paneId) {
+      document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.pane === paneId));
+      document.querySelectorAll(".pane").forEach(p => p.classList.toggle("active", p.id === paneId));
+    }
+
+    // ---------------- Activity load + render ----------------
+    async function loadActivity() {
+      $("timeline-activity").innerHTML = '<div class="empty">Loading...</div>';
+      try {
+        const res = await fetch("/activity.json");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        allActivity = await res.json();
+        rebuildActivityFilters();
+        renderActivity();
+      } catch (e) {
+        $("timeline-activity").innerHTML = '<div class="empty">Failed to load activity log: ' + e.message + '</div>';
+      }
+    }
+
+    function rebuildActivityFilters() {
+      const streamers = new Set();
+      const eventTypes = new Set();
+      for (const ev of allActivity) {
+        if (ev.streamer) streamers.add(ev.streamer);
+        if (ev.event) eventTypes.add(ev.event);
+      }
+      const sSel = $("filter-streamer");
+      const sCur = sSel.value;
+      sSel.innerHTML = '<option value="">(all)</option>' +
+        [...streamers].sort().map(s => `<option>${escapeHtml(s)}</option>`).join("");
+      sSel.value = sCur;
+      const eSel = $("filter-event");
+      const eCur = eSel.value;
+      eSel.innerHTML = '<option value="">(all)</option>' +
+        [...eventTypes].sort().map(e => `<option>${escapeHtml(e)}</option>`).join("");
+      eSel.value = eCur;
+    }
+
+    function applyActivityFilters() {
+      const sf = $("filter-streamer").value;
+      const ef = $("filter-event").value;
+      const tf = $("filter-text").value.trim().toLowerCase();
+      return allActivity.filter(ev => {
+        if (sf && ev.streamer !== sf) return false;
+        if (ef && ev.event !== ef) return false;
+        if (tf) {
+          const blob = JSON.stringify(ev).toLowerCase();
+          if (!blob.includes(tf)) return false;
+        }
+        return true;
+      });
+    }
+
+    function renderActivity() {
+      const filtered = applyActivityFilters();
+      $("summary-activity").innerHTML = `<span class="summary-strong">${filtered.length}</span> event(s) shown of ${allActivity.length} total.`;
+      const tl = $("timeline-activity");
+      if (filtered.length === 0) {
+        tl.innerHTML = '<div class="empty">No events match the current filters.</div>';
+        return;
+      }
+      tl.innerHTML = filtered.map(renderActivityEvent).join("");
+      tl.querySelectorAll(".jump-debug").forEach(btn => {
+        btn.addEventListener("click", e => {
+          jumpToDebugAt(btn.dataset.ts);
+        });
+      });
+    }
+
+    function renderActivityEvent(ev) {
+      const cls = "event-type-" + (ev.event || "unknown").replace(/[^a-z0-9_]/g, "_");
+      const ts = formatTs(ev.ts);
+      const skip = new Set(["ts", "event"]);
+      const fields = Object.entries(ev)
+        .filter(([k]) => !skip.has(k))
+        .map(([k, v]) => `<span class="field"><span class="key">${escapeHtml(k)}=</span><span class="value">${escapeHtml(formatValue(v))}</span></span>`)
+        .join("");
+      return `<div class="event">
+        <div class="ts">${escapeHtml(ts)}</div>
+        <div class="event-type ${cls}">${escapeHtml(ev.event || "?")}</div>
+        <div class="details">${fields || '<span class="key">(no fields)</span>'}</div>
+        <button class="jump-debug" data-ts="${escapeHtml(ev.ts || '')}" title="Jump to closest debug log entry">→ debug</button>
+      </div>`;
+    }
+
+    // ---------------- Debug load + render ----------------
+    async function loadDebug() {
+      $("timeline-debug").innerHTML = '<div class="empty">Loading...</div>';
+      try {
+        const res = await fetch("/debug.log.json");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        allDebug = await res.json();
+        renderDebug();
+      } catch (e) {
+        $("timeline-debug").innerHTML = '<div class="empty">Failed to load debug log: ' + e.message + '</div>';
+      }
+    }
+
+    function applyDebugFilters() {
+      const minLevel = LEVEL_ORDER[$("filter-level").value] ?? 1;
+      const tf = $("filter-debug-text").value.trim().toLowerCase();
+      return allDebug.filter(entry => {
+        const lvl = LEVEL_ORDER[entry.level] ?? 1;
+        if (lvl < minLevel) return false;
+        if (tf && !entry.msg.toLowerCase().includes(tf)) return false;
+        return true;
+      });
+    }
+
+    function renderDebug() {
+      const filtered = applyDebugFilters();
+      $("summary-debug").innerHTML = `<span class="summary-strong">${filtered.length}</span> entry(s) shown of ${allDebug.length} total.`;
+      const tl = $("timeline-debug");
+      if (filtered.length === 0) {
+        tl.innerHTML = '<div class="empty">No entries match the current filters.</div>';
+        return;
+      }
+      tl.innerHTML = filtered.map(renderDebugEntry).join("");
+    }
+
+    function renderDebugEntry(entry) {
+      const lvlCls = "level-" + entry.level;
+      // Use a data attribute on each row so jumpToDebugAt can find it
+      const tsAttr = entry.ts ? entry.ts.replace(/[^0-9]/g, "") : "";
+      return `<div class="debug-entry" data-ts-key="${tsAttr}">
+        <div class="ts">${escapeHtml(entry.ts || "")}</div>
+        <div class="level ${lvlCls}">${escapeHtml(entry.level || "")}</div>
+        <div class="msg">${escapeHtml(entry.msg || "")}</div>
+      </div>`;
+    }
+
+    // ---------------- Cross-correlation: jump to closest debug entry ----------------
+    function jumpToDebugAt(activityIso) {
+      // activityIso looks like "2026-04-27T08:26:07.234Z"
+      // debug ts looks like "2026-04-27 08:26:04"
+      const target = Date.parse(activityIso);
+      if (isNaN(target)) return;
+      // Make sure debug data is loaded (fire-and-forget if not)
+      if (allDebug.length === 0) {
+        loadDebug().then(() => jumpToDebugAt(activityIso));
+        return;
+      }
+      // Find debug entry with closest timestamp to the activity event.
+      // Activity log records UTC ("...Z"). Python's logging asctime default
+      // is LOCAL time with no timezone marker, so we parse the debug ts
+      // without the Z so JS interprets it in the browser's (== desktop's)
+      // local timezone. Both then convert to the same UTC millisecond and
+      // the delta is meaningful.
+      let closest = null, closestDelta = Infinity;
+      for (const entry of allDebug) {
+        const debugMs = Date.parse(entry.ts.replace(" ", "T"));
+        if (isNaN(debugMs)) continue;
+        const delta = Math.abs(debugMs - target);
+        if (delta < closestDelta) {
+          closestDelta = delta;
+          closest = entry;
+        }
+      }
+      switchTab("pane-debug");
+      if (!closest) return;
+      // Make sure the matching row is visible under current debug filters.
+      // If it's filtered out, lower the min-level to INFO and clear search.
+      const minLevel = LEVEL_ORDER[$("filter-level").value] ?? 1;
+      if ((LEVEL_ORDER[closest.level] ?? 1) < minLevel) {
+        $("filter-level").value = "DEBUG";
+      }
+      $("filter-debug-text").value = "";
+      renderDebug();
+      // Find and scroll to the row
+      const tsKey = closest.ts.replace(/[^0-9]/g, "");
+      requestAnimationFrame(() => {
+        const rows = document.querySelectorAll('#timeline-debug .debug-entry');
+        for (const row of rows) {
+          if (row.dataset.tsKey === tsKey) {
+            row.scrollIntoView({ behavior: "smooth", block: "center" });
+            row.classList.add("flash");
+            setTimeout(() => row.classList.remove("flash"), 2200);
+            return;
+          }
+        }
+      });
+    }
+
+    // ---------------- Helpers ----------------
+    function formatTs(ts) {
+      if (!ts) return "";
+      const d = new Date(ts);
+      if (isNaN(d.getTime())) return ts;
+      return d.toLocaleString(undefined, {
+        year: "numeric", month: "short", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit"
+      });
+    }
+    function formatValue(v) {
+      if (v === null || v === undefined) return "";
+      if (typeof v === "object") return JSON.stringify(v);
+      return String(v);
+    }
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+
+    // ---------------- Wire it up ----------------
+    $("refresh-activity").addEventListener("click", loadActivity);
+    $("filter-streamer").addEventListener("change", renderActivity);
+    $("filter-event").addEventListener("change", renderActivity);
+    $("filter-text").addEventListener("input", renderActivity);
+    $("refresh-debug").addEventListener("click", loadDebug);
+    $("filter-level").addEventListener("change", renderDebug);
+    $("filter-debug-text").addEventListener("input", renderDebug);
+
+    // Load both on first paint so the cross-link works without a delay.
+    loadActivity();
+    loadDebug();
+  </script>
+</body>
+</html>

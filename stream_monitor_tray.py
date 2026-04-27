@@ -43,7 +43,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -150,11 +150,48 @@ def _get_about_html_path() -> Path:
     return Path(__file__).parent / "about.html"
 
 
-def _get_activity_html_path() -> Path:
-    """Return the path to activity.html, works both frozen (exe) and as script."""
+def _get_logs_html_path() -> Path:
+    """Return the path to logs.html, works both frozen (exe) and as script."""
     if getattr(sys, 'frozen', False):
-        return Path(sys.executable).parent / "activity.html"
-    return Path(__file__).parent / "activity.html"
+        return Path(sys.executable).parent / "logs.html"
+    return Path(__file__).parent / "logs.html"
+
+
+# Pattern for parsing a line of stream_monitor.log written by setup_logging().
+# Format: "YYYY-MM-DD HH:MM:SS [LEVEL] message"
+import re as _re
+_DEBUG_LOG_LINE_RE = _re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] (.+)$")
+
+
+def parse_debug_log() -> list:
+    """Read and parse stream_monitor.log into a list of structured entries.
+
+    Multi-line entries (e.g. tracebacks) are folded into the prior entry's
+    msg field. Returns reverse-chronological (newest first) for symmetry with
+    read_activity_log().
+    """
+    if not LOG_FILE.exists():
+        return []
+    entries = []
+    current = None
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                m = _DEBUG_LOG_LINE_RE.match(line)
+                if m:
+                    if current:
+                        entries.append(current)
+                    current = {"ts": m.group(1), "level": m.group(2), "msg": m.group(3)}
+                elif current:
+                    current["msg"] += "\n" + line
+        if current:
+            entries.append(current)
+    except OSError as e:
+        log.warning("Failed to read debug log: %s", e)
+        return []
+    entries.reverse()
+    return entries
 
 
 class ConfigRequestHandler(BaseHTTPRequestHandler):
@@ -181,20 +218,21 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"about.html not found")
-        elif self.path == "/activity":
-            # Serve the viewer HTML page
-            activity_file = _get_activity_html_path()
-            if activity_file.exists():
+        elif self.path == "/logs" or self.path == "/activity":
+            # Serve the unified log viewer HTML page. /activity kept as an
+            # alias so existing bookmarks still work.
+            logs_file = _get_logs_html_path()
+            if logs_file.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(activity_file.read_bytes())
+                self.wfile.write(logs_file.read_bytes())
             else:
                 self.send_response(404)
                 self.end_headers()
-                self.wfile.write(b"activity.html not found")
+                self.wfile.write(b"logs.html not found")
         elif self.path == "/activity.json":
-            # Parsed events as JSON, reverse-chronological
+            # Parsed activity events as JSON, reverse-chronological
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -210,6 +248,23 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if STREAM_ACTIVITY_FILE.exists():
                 self.wfile.write(STREAM_ACTIVITY_FILE.read_bytes())
+        elif self.path == "/debug.log":
+            # Raw debug log file for download
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header(
+                "Content-Disposition", "attachment; filename=stream_monitor.log"
+            )
+            self.end_headers()
+            if LOG_FILE.exists():
+                self.wfile.write(LOG_FILE.read_bytes())
+        elif self.path == "/debug.log.json":
+            # Parsed debug log entries as JSON, reverse-chronological
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(parse_debug_log()).encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
@@ -836,13 +891,6 @@ class StreamMonitorApp:
         except ValueError:
             return False
     
-    def on_view_log(self, icon, item):
-        """Open the log file in the default text editor."""
-        if LOG_FILE.exists():
-            os.startfile(LOG_FILE)
-        else:
-            self.update_status("No log file found")
-
     def on_about(self, icon, item):
         """Open the about page in the browser."""
         webbrowser.open(f"http://127.0.0.1:{CONFIG_SERVER_PORT}/about?v={VERSION}")
@@ -854,9 +902,9 @@ class StreamMonitorApp:
             self.monitor.stop()
         icon.stop()
 
-    def on_view_activity(self, icon, item):
-        """Open the activity log viewer page in the browser."""
-        webbrowser.open(f"http://127.0.0.1:{CONFIG_SERVER_PORT}/activity")
+    def on_view_logs(self, icon, item):
+        """Open the unified log viewer (Stream Activity + Debug Log) in the browser."""
+        webbrowser.open(f"http://127.0.0.1:{CONFIG_SERVER_PORT}/logs")
     
     def _is_running(self):
         return self.monitor and self.monitor.running
@@ -869,8 +917,7 @@ class StreamMonitorApp:
             Item("Start", self.on_start, checked=lambda item: self._is_running()),
             Item("Stop", self.on_stop, checked=lambda item: not self._is_running()),
             pystray.Menu.SEPARATOR,
-            Item("View Log", self.on_view_log),
-            Item("View Activity Log", self.on_view_activity),
+            Item("View Logs", self.on_view_logs),
             Item("About (CaedVT)", self.on_about),
             Item("Exit", self.on_exit)
         )

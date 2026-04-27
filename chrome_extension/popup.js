@@ -4,6 +4,7 @@ const extensionPausedEl = document.getElementById("extension-paused");
 const lowQualityEl = document.getElementById("low-quality");
 const raidFollowEl = document.getElementById("raid-follow");
 const maxTabsEl = document.getElementById("max-tabs");
+const notificationsEl = document.getElementById("notifications-enabled");
 
 async function loadSettings() {
   const result = await chrome.storage.local.get([
@@ -14,6 +15,17 @@ async function loadSettings() {
   lowQualityEl.checked = result.lowQuality || false;
   raidFollowEl.checked = result.raidFollowThrough || false;
   maxTabsEl.value = result.maxTabs || 0;
+
+  // Reflect the actual notifications permission state, not a stored
+  // preference. The user may have revoked the permission via browser
+  // settings, in which case the toggle should be off.
+  try {
+    notificationsEl.checked = await chrome.permissions.contains({
+      permissions: ["notifications"],
+    });
+  } catch (e) {
+    notificationsEl.checked = false;
+  }
 }
 
 autoMuteEl.addEventListener("change", async () => {
@@ -36,6 +48,29 @@ maxTabsEl.addEventListener("change", async () => {
   const val = Math.max(0, Math.min(20, parseInt(maxTabsEl.value) || 0));
   maxTabsEl.value = val;
   await chrome.storage.local.set({ maxTabs: val });
+});
+
+notificationsEl.addEventListener("change", async () => {
+  // permissions.request must be called from a user gesture. The change
+  // event on a clicked checkbox qualifies, so we can request here.
+  if (notificationsEl.checked) {
+    let granted = false;
+    try {
+      granted = await chrome.permissions.request({ permissions: ["notifications"] });
+    } catch (e) {
+      granted = false;
+    }
+    if (!granted) {
+      // User dismissed the permission prompt; revert the toggle.
+      notificationsEl.checked = false;
+    }
+  } else {
+    try {
+      await chrome.permissions.remove({ permissions: ["notifications"] });
+    } catch (e) {
+      // ignore — toggle stays off
+    }
+  }
 });
 
 loadSettings();

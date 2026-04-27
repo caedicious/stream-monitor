@@ -1,13 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Stream Monitor Companion",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "Automatically closes Twitch tabs when the streamer raids someone else. Works with Stream Monitor.",
 
   "permissions": [
     "tabs",
     "storage",
-    "alarms",
+    "alarms"
+  ],
+
+  "optional_permissions": [
     "notifications"
   ],
 
