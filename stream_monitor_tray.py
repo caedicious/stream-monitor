@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional, Callable
@@ -42,7 +43,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.5.1.1"
+VERSION = "1.5.2"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -55,6 +56,10 @@ else:
 
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = CONFIG_DIR / "stream_monitor.log"
+# Activity log: structured JSONL record of stream transitions and tab-open
+# attempts. Intended for cross-checking against streamer broadcast histories
+# to identify cases where Stream Monitor missed a live event.
+STREAM_ACTIVITY_FILE = CONFIG_DIR / "stream_activity.jsonl"
 
 
 def setup_logging():
@@ -81,11 +86,75 @@ def setup_logging():
 log = setup_logging()
 
 
+# ---------------------------------------------------------------------------
+# Activity log (separate from the debug log). Structured, append-only JSONL.
+# ---------------------------------------------------------------------------
+
+_activity_lock = threading.Lock()
+
+
+def _activity_timestamp() -> str:
+    """ISO 8601 UTC with millisecond precision, e.g. 2026-04-17T18:30:05.123Z."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
+        f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+
+
+def log_activity(event: str, **fields):
+    """Append a structured event to the activity log (JSONL, append-only).
+
+    Wrapped in a try/except: a failure here must never crash the monitor.
+    """
+    try:
+        record = {"ts": _activity_timestamp(), "event": event, **fields}
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with _activity_lock:
+            with open(STREAM_ACTIVITY_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception as e:
+        log.warning("Failed to write activity log: %s", e)
+
+
+def read_activity_log(limit: Optional[int] = None) -> list:
+    """Read the activity log into a list of dicts. Reverse-chronological.
+
+    Tolerates partial last lines from concurrent writes.
+    """
+    if not STREAM_ACTIVITY_FILE.exists():
+        return []
+    events = []
+    try:
+        with open(STREAM_ACTIVITY_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Partial line from a concurrent write, skip it.
+                    continue
+    except OSError as e:
+        log.warning("Failed to read activity log: %s", e)
+        return []
+    events.reverse()
+    if limit is not None:
+        events = events[:limit]
+    return events
+
+
 def _get_about_html_path() -> Path:
     """Return the path to about.html, works both frozen (exe) and as script."""
     if getattr(sys, 'frozen', False):
         return Path(sys.executable).parent / "about.html"
     return Path(__file__).parent / "about.html"
+
+
+def _get_activity_html_path() -> Path:
+    """Return the path to activity.html, works both frozen (exe) and as script."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent / "activity.html"
+    return Path(__file__).parent / "activity.html"
 
 
 class ConfigRequestHandler(BaseHTTPRequestHandler):
@@ -112,6 +181,35 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"about.html not found")
+        elif self.path == "/activity":
+            # Serve the viewer HTML page
+            activity_file = _get_activity_html_path()
+            if activity_file.exists():
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(activity_file.read_bytes())
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"activity.html not found")
+        elif self.path == "/activity.json":
+            # Parsed events as JSON, reverse-chronological
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(read_activity_log()).encode("utf-8"))
+        elif self.path == "/activity.jsonl":
+            # Raw JSONL file for download / spreadsheet import
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header(
+                "Content-Disposition", "attachment; filename=stream_activity.jsonl"
+            )
+            self.end_headers()
+            if STREAM_ACTIVITY_FILE.exists():
+                self.wfile.write(STREAM_ACTIVITY_FILE.read_bytes())
         else:
             self.send_response(404)
             self.end_headers()
@@ -216,6 +314,10 @@ class TwitchMonitor:
         self.missed_while_paused: dict[str, str] = {}  # { streamer: went_live_time }
         self.user_ids: dict[str, str] = {}  # { username: user_id } cache
         self.consecutive_errors: int = 0  # Track consecutive API failures
+        # Per-streamer metadata captured on the latest "live" check, used to
+        # enrich the activity log (title, game, viewer count at the moment
+        # the offline->live transition was detected).
+        self.live_stream_meta: dict[str, dict] = {}
         
     def _get_oauth_token(self) -> bool:
         try:
@@ -281,12 +383,20 @@ class TwitchMonitor:
                 return {name: False for name in self.streamers}
 
             live_set = set()
+            new_meta: dict[str, dict] = {}
             for stream in data.get("data", []):
                 login = stream["user_login"].lower()
                 live_set.add(login)
                 # Cache user IDs from stream responses
                 if "user_id" in stream:
                     self.user_ids[login] = stream["user_id"]
+                # Capture per-stream metadata for the activity log
+                new_meta[login] = {
+                    "title": stream.get("title", ""),
+                    "game": stream.get("game_name", ""),
+                    "viewers": stream.get("viewer_count", 0),
+                }
+            self.live_stream_meta = new_meta
 
             if live_set:
                 log.info("Live streamers: %s", live_set)
@@ -301,10 +411,12 @@ class TwitchMonitor:
                     log.info("Auto-paused: own channel '%s' is live", own_channel)
                     self.status_callback("Auto-paused (you're live)")
                     self.notify_callback("Stream Monitor", "Auto-paused because you're live!")
+                    log_activity("auto_paused_started", own_channel=own_channel)
                 elif not self.auto_paused and was_auto_paused:
                     log.info("Auto-pause lifted: own channel '%s' went offline", own_channel)
                     self.status_callback("Resumed (you went offline)")
                     self.notify_callback("Stream Monitor", "You went offline, resuming monitoring!")
+                    log_activity("auto_paused_ended", own_channel=own_channel)
 
             # Update live streamers list for config server
             self.live_streamers = [name for name in self.streamers if name in live_set]
@@ -346,7 +458,18 @@ class TwitchMonitor:
     def open_stream(self, username: str):
         url = f"https://twitch.tv/{username}?sm=1"
         log.info("Opening stream tab: %s", url)
-        webbrowser.open(url)
+        try:
+            success = webbrowser.open(url)
+        except Exception as e:
+            log.error("webbrowser.open raised for %s: %s", url, e)
+            success = False
+        log_activity(
+            "tab_open_attempt",
+            kind="stream",
+            streamer=username,
+            url=url,
+            success=bool(success),
+        )
     
     @property
     def effectively_paused(self) -> bool:
@@ -369,6 +492,10 @@ class TwitchMonitor:
                     log.info("State change: %s went LIVE (was_live=%s, browser_opened=%s, paused=%s, auto_paused=%s)",
                              username, state.was_live, state.browser_opened, self.paused, self.auto_paused)
 
+                    # Activity log: structured record of the live transition
+                    meta = self.live_stream_meta.get(username, {})
+                    log_activity("stream_live", streamer=username, **meta)
+
                     # Desktop notification for all live events
                     self.notify_callback(
                         "Stream Monitor",
@@ -380,6 +507,11 @@ class TwitchMonitor:
                         self.status_callback(f"{username} went LIVE! (paused)")
                         # Track missed streams while paused
                         self.missed_while_paused[username] = time.strftime("%H:%M:%S")
+                        log_activity(
+                            "tab_open_skipped",
+                            streamer=username,
+                            reason="auto_paused" if self.auto_paused else "paused",
+                        )
                     else:
                         self.status_callback(f"{username} went LIVE!")
                         self.open_stream(username)
@@ -392,6 +524,7 @@ class TwitchMonitor:
                 if state.was_live:
                     log.info("State change: %s went OFFLINE", username)
                     self.status_callback(f"{username} went offline")
+                    log_activity("stream_offline", streamer=username)
 
                     # VOD fallback: if stream was missed, open the VOD
                     if not state.browser_opened and self.config.vod_fallback:
@@ -400,7 +533,18 @@ class TwitchMonitor:
                         if vod_url:
                             self.status_callback(f"Opening VOD for {username}")
                             log.info("Opening VOD: %s", vod_url)
-                            webbrowser.open(vod_url)
+                            try:
+                                vod_success = webbrowser.open(vod_url)
+                            except Exception as e:
+                                log.error("webbrowser.open raised for VOD %s: %s", vod_url, e)
+                                vod_success = False
+                            log_activity(
+                                "tab_open_attempt",
+                                kind="vod",
+                                streamer=username,
+                                url=vod_url,
+                                success=bool(vod_success),
+                            )
                         else:
                             log.info("No VOD found for %s", username)
 
@@ -429,7 +573,25 @@ class TwitchMonitor:
     
     def _monitor_loop(self):
         log.info("Monitor loop started (interval: %ds)", self.config.check_interval)
+        last_iteration_mono = time.monotonic()
         while self.running:
+            # Detect long gaps that suggest the system was asleep/hibernating.
+            # Helpful for cross-checking missed streams against power events.
+            now_mono = time.monotonic()
+            gap = now_mono - last_iteration_mono
+            last_iteration_mono = now_mono
+            expected_gap = self.config.check_interval
+            if gap > expected_gap * 2:
+                log.warning(
+                    "Long loop gap: %.1fs (expected ~%ds, system likely slept)",
+                    gap, expected_gap,
+                )
+                log_activity(
+                    "wake_detected",
+                    gap_seconds=round(gap, 1),
+                    expected_seconds=expected_gap,
+                )
+
             try:
                 current_status = self.check_streams()
                 if current_status:
@@ -437,10 +599,19 @@ class TwitchMonitor:
                     if self.consecutive_errors > 0:
                         log.info("API recovered after %d consecutive error(s)", self.consecutive_errors)
                         self.notify_callback("Stream Monitor", "Connection restored! Monitoring is working again.")
+                        log_activity(
+                            "api_recovered",
+                            recovered_after=self.consecutive_errors,
+                        )
                     self.consecutive_errors = 0
             except Exception as e:
                 self.consecutive_errors += 1
                 log.error("Unexpected error in monitor loop (streak: %d): %s", self.consecutive_errors, e, exc_info=True)
+                log_activity(
+                    "api_error",
+                    error=str(e)[:200],
+                    consecutive_errors_streak=self.consecutive_errors,
+                )
                 if self.consecutive_errors == 1:
                     self.status_callback("Error: API connection failed")
                     self.notify_callback(
@@ -581,6 +752,12 @@ class StreamMonitorApp:
                         "streamers": self.config.streamers,
                         "version": VERSION
                     })
+                    log_activity(
+                        "config_loaded",
+                        streamers=list(self.config.streamers),
+                        interval=self.config.check_interval,
+                        reason="settings_changed",
+                    )
                     if self.monitor:
                         self.monitor.config = self.config
                         self.monitor.restart()
@@ -672,9 +849,14 @@ class StreamMonitorApp:
 
     def on_exit(self, icon, item):
         log.info("Exiting Stream Monitor")
+        log_activity("app_stopped", reason="user_exit")
         if self.monitor:
             self.monitor.stop()
         icon.stop()
+
+    def on_view_activity(self, icon, item):
+        """Open the activity log viewer page in the browser."""
+        webbrowser.open(f"http://127.0.0.1:{CONFIG_SERVER_PORT}/activity")
     
     def _is_running(self):
         return self.monitor and self.monitor.running
@@ -688,6 +870,7 @@ class StreamMonitorApp:
             Item("Stop", self.on_stop, checked=lambda item: not self._is_running()),
             pystray.Menu.SEPARATOR,
             Item("View Log", self.on_view_log),
+            Item("View Activity Log", self.on_view_activity),
             Item("About (CaedVT)", self.on_about),
             Item("Exit", self.on_exit)
         )
@@ -830,13 +1013,21 @@ class StreamMonitorApp:
         log.info("Stream Monitor v%s starting", VERSION)
         log.info("Config path: %s", CONFIG_FILE)
         log.info("Log path: %s", LOG_FILE)
+        log_activity("app_started", version=VERSION)
 
         # If config is missing or has no credentials, run first-time setup
         if not self.config.is_valid():
             log.info("Config invalid or missing, launching first-time setup")
             if not self._run_first_time_setup():
                 log.info("First-time setup cancelled, exiting")
+                log_activity("app_stopped", reason="setup_cancelled")
                 return
+
+        log_activity(
+            "config_loaded",
+            streamers=list(self.config.streamers),
+            interval=self.config.check_interval,
+        )
 
         # Start config server for browser extension
         threading.Thread(target=lambda: start_config_server(self.config), daemon=True).start()

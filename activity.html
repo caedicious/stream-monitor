@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Stream Monitor - Activity Log</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      line-height: 1.4;
+    }
+    h1 {
+      color: #faa0d7;
+      font-size: 22px;
+      margin: 0 0 6px 0;
+    }
+    .subtitle {
+      color: #999;
+      font-size: 13px;
+      margin-bottom: 20px;
+    }
+    .controls {
+      background: #16213e;
+      padding: 14px 16px;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      display: flex;
+      gap: 14px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 13px;
+    }
+    .controls label {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      color: #ccc;
+    }
+    .controls select, .controls input[type="search"] {
+      background: #0f1729;
+      color: #e0e0e0;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 5px 8px;
+      font-family: inherit;
+      font-size: 13px;
+    }
+    .controls input[type="search"] { min-width: 220px; }
+    button {
+      background: #9b59b6;
+      color: white;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+    }
+    button:hover { background: #8e44ad; }
+    button.secondary {
+      background: #2a3754;
+    }
+    button.secondary:hover { background: #354666; }
+    .summary {
+      color: #888;
+      font-size: 12px;
+      margin-bottom: 12px;
+    }
+    .timeline {
+      background: #0f1729;
+      border-radius: 8px;
+      padding: 8px 0;
+    }
+    .event {
+      display: grid;
+      grid-template-columns: 200px 140px 1fr;
+      gap: 14px;
+      padding: 8px 16px;
+      border-bottom: 1px solid #1f2a44;
+      font-size: 13px;
+    }
+    .event:last-child { border-bottom: none; }
+    .event:hover { background: #14203d; }
+    .ts {
+      color: #888;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .event-type {
+      font-weight: 600;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .event-type-stream_live    { color: #2ecc71; }
+    .event-type-stream_offline { color: #95a5a6; }
+    .event-type-tab_open_attempt { color: #3498db; }
+    .event-type-tab_open_skipped { color: #f39c12; }
+    .event-type-api_error      { color: #e74c3c; }
+    .event-type-api_recovered  { color: #2ecc71; }
+    .event-type-app_started    { color: #9b59b6; }
+    .event-type-app_stopped    { color: #9b59b6; }
+    .event-type-config_loaded  { color: #5dade2; }
+    .event-type-auto_paused_started { color: #f39c12; }
+    .event-type-auto_paused_ended { color: #2ecc71; }
+    .event-type-wake_detected  { color: #e67e22; }
+    .details {
+      color: #ddd;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+      word-break: break-word;
+    }
+    .details .field {
+      display: inline-block;
+      margin-right: 12px;
+    }
+    .details .key { color: #7d8da8; }
+    .details .value { color: #e0e0e0; }
+    .empty {
+      padding: 40px;
+      text-align: center;
+      color: #888;
+    }
+    .summary-strong { color: #faa0d7; font-weight: 600; }
+    a { color: #5dade2; }
+  </style>
+</head>
+<body>
+  <h1>Stream Monitor: Activity Log</h1>
+  <p class="subtitle">
+    Structured record of stream transitions, tab opens, and app lifecycle events.
+    Use this to cross-check against streamer broadcast histories and identify gaps.
+  </p>
+
+  <div class="controls">
+    <button id="refresh">Refresh</button>
+    <a href="/activity.jsonl" download><button class="secondary" type="button">Download raw JSONL</button></a>
+    <label>
+      Streamer:
+      <select id="filter-streamer">
+        <option value="">(all)</option>
+      </select>
+    </label>
+    <label>
+      Event type:
+      <select id="filter-event">
+        <option value="">(all)</option>
+      </select>
+    </label>
+    <label>
+      Search:
+      <input type="search" id="filter-text" placeholder="title, game, error...">
+    </label>
+  </div>
+
+  <div class="summary" id="summary"></div>
+  <div class="timeline" id="timeline">
+    <div class="empty">Loading...</div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let allEvents = [];
+
+    async function loadEvents() {
+      $("timeline").innerHTML = '<div class="empty">Loading...</div>';
+      try {
+        const res = await fetch("/activity.json");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        allEvents = await res.json();
+        rebuildFilters();
+        render();
+      } catch (e) {
+        $("timeline").innerHTML = '<div class="empty">Failed to load activity log: ' + e.message + '</div>';
+      }
+    }
+
+    function rebuildFilters() {
+      const streamers = new Set();
+      const eventTypes = new Set();
+      for (const ev of allEvents) {
+        if (ev.streamer) streamers.add(ev.streamer);
+        if (ev.event) eventTypes.add(ev.event);
+      }
+      const sSel = $("filter-streamer");
+      const sCur = sSel.value;
+      sSel.innerHTML = '<option value="">(all)</option>' +
+        [...streamers].sort().map(s => `<option>${escapeHtml(s)}</option>`).join("");
+      sSel.value = sCur;
+
+      const eSel = $("filter-event");
+      const eCur = eSel.value;
+      eSel.innerHTML = '<option value="">(all)</option>' +
+        [...eventTypes].sort().map(e => `<option>${escapeHtml(e)}</option>`).join("");
+      eSel.value = eCur;
+    }
+
+    function applyFilters() {
+      const sf = $("filter-streamer").value;
+      const ef = $("filter-event").value;
+      const tf = $("filter-text").value.trim().toLowerCase();
+      return allEvents.filter(ev => {
+        if (sf && ev.streamer !== sf) return false;
+        if (ef && ev.event !== ef) return false;
+        if (tf) {
+          const blob = JSON.stringify(ev).toLowerCase();
+          if (!blob.includes(tf)) return false;
+        }
+        return true;
+      });
+    }
+
+    function render() {
+      const filtered = applyFilters();
+      $("summary").innerHTML = `<span class="summary-strong">${filtered.length}</span> event(s) shown of ${allEvents.length} total.`;
+      const tl = $("timeline");
+      if (filtered.length === 0) {
+        tl.innerHTML = '<div class="empty">No events match the current filters.</div>';
+        return;
+      }
+      const html = filtered.map(renderEvent).join("");
+      tl.innerHTML = html;
+    }
+
+    function renderEvent(ev) {
+      const cls = "event-type-" + (ev.event || "unknown").replace(/[^a-z0-9_]/g, "_");
+      const ts = formatTs(ev.ts);
+      const skip = new Set(["ts", "event"]);
+      const fields = Object.entries(ev)
+        .filter(([k]) => !skip.has(k))
+        .map(([k, v]) => `<span class="field"><span class="key">${escapeHtml(k)}=</span><span class="value">${escapeHtml(formatValue(v))}</span></span>`)
+        .join("");
+      return `<div class="event">
+        <div class="ts">${escapeHtml(ts)}</div>
+        <div class="event-type ${cls}">${escapeHtml(ev.event || "?")}</div>
+        <div class="details">${fields || '<span class="key">(no fields)</span>'}</div>
+      </div>`;
+    }
+
+    function formatTs(ts) {
+      if (!ts) return "";
+      const d = new Date(ts);
+      if (isNaN(d.getTime())) return ts;
+      // Local time, with day, since logs span multiple days
+      return d.toLocaleString(undefined, {
+        year: "numeric", month: "short", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit"
+      });
+    }
+
+    function formatValue(v) {
+      if (v === null || v === undefined) return "";
+      if (typeof v === "object") return JSON.stringify(v);
+      return String(v);
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+
+    $("refresh").addEventListener("click", loadEvents);
+    $("filter-streamer").addEventListener("change", render);
+    $("filter-event").addEventListener("change", render);
+    $("filter-text").addEventListener("input", render);
+    loadEvents();
+  </script>
+</body>
+</html>
