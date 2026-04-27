@@ -1,8 +1,8 @@
 # Stream Monitor v1.5.3 release artifacts
-# Generated: 2026-04-27T08:37:17.471866Z
+# Generated: 2026-04-27T08:44:49.793333+00:00
 # Verify a download with: Get-FileHash <file> -Algorithm SHA256
 #
-f0628645c0911c1573e8894558afba24221beac5a063fadf20675ffd857f692c  StreamMonitorInstaller.exe
+91bb6e489b2bc26d8b30a06754fd4fd3bc1e57f23232813a4f6cee3b0ac2200f  StreamMonitorInstaller.exe
 f8d008be76d90d8b71d5ecf5aa48c835d3ea74e7cba1b96db30b42d46c6f1c41  StreamMonitor.exe
 ec32a56d09835de8a419b1093857c5636c7f89764fc01b5929377c1798517fbc  StreamMonitorSetup.exe
 5aa6339260ff4909ed43a850c07b44dca98664b0c673f27024e4145e600e3cb0  StreamMonitorSettings.exe
