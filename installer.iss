@@ -2,7 +2,7 @@
 ; Download Inno Setup from: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "Stream Monitor"
-#define MyAppVersion "1.5.1.1"
+#define MyAppVersion "1.5.2"
 #define MyAppPublisher "Stream Monitor"
 #define MyAppExeName "StreamMonitor.exe"
 #define MyAppSetupExeName "StreamMonitorSetup.exe"
@@ -38,6 +38,7 @@ Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\{#MyAppSetupExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\{#MyAppSettingsExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "about.html"; DestDir: "{app}"; Flags: ignoreversion
+Source: "activity.html"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
