@@ -97,6 +97,18 @@ function rankLabel(rank) {
 }
 
 async function notifyUser(title, message) {
+  // notifications is an optional permission. If the user hasn't granted it
+  // (which is the default for fresh installs and for users who auto-updated
+  // from 1.4.x), silently skip — no error, no nag. The user can opt in via
+  // the popup's "Desktop notifications" toggle.
+  let granted = false;
+  try {
+    granted = await chrome.permissions.contains({ permissions: ["notifications"] });
+  } catch (e) {
+    await log("warn", "permissions.contains failed:", e?.message || String(e));
+    return;
+  }
+  if (!granted) return;
   try {
     await chrome.notifications.create({
       type: "basic",
@@ -638,7 +650,7 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
           );
           notifyUser(
             "Stream Monitor",
-            `Closed ${target.streamer} (${rankLabel(target.rank)}) to open ${newStreamer} (${rankLabel(newRank)}).`
+            `Max tabs (${maxTabs}) reached. Closed ${target.streamer} to open ${newStreamer}.`
           );
           delete trackedTabs[target.tabKey];
           await saveTrackedTabs(trackedTabs);
@@ -676,7 +688,7 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
           );
           notifyUser(
             "Stream Monitor",
-            `${newStreamer} is your lowest-priority live streamer. Keeping their tab open for ${GRACE_MINUTES} minutes to preserve streak, then closing.`
+            `Max tabs (${maxTabs}) reached. Keeping ${newStreamer}'s tab open for ${GRACE_MINUTES} minutes to preserve their streak, then closing to free the slot.`
           );
           await schedulePendingExpiration(tabKey, newStreamer, now + GRACE_MS);
         }

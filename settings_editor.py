@@ -11,7 +11,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-VERSION = "1.5.2"
+VERSION = "1.5.2.1"
 
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
