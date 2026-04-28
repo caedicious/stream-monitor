@@ -43,7 +43,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -282,21 +282,48 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_config_server(config: "Config"):
-    """Start a localhost HTTP server to serve config to the browser extension."""
+class _SingletonHTTPServer(HTTPServer):
+    """HTTPServer subclass with SO_REUSEADDR disabled.
+
+    Python's stock HTTPServer sets allow_reuse_address = 1, which on Windows
+    has SO_REUSEADDR semantics that *permit two processes to bind the same
+    port simultaneously*. We rely on the bind failing when another instance
+    holds the port to enforce single-instance startup, so we have to
+    explicitly opt out of address reuse here.
+    """
+    allow_reuse_address = False
+
+
+def create_config_server(config: "Config") -> Optional[HTTPServer]:
+    """Bind the config server port and prepare the handler. Returns the
+    server if the bind succeeded, or None if the port is already in use
+    (which means another Stream Monitor instance is already running and
+    this process should exit).
+    """
     ConfigRequestHandler.config_data = {
         "streamers": config.streamers,
+        "pinned_streamers": config.pinned_streamers,
         "version": VERSION,
         "live_streamers": [],
         "paused": config.paused,
         "auto_paused": False
     }
-    
     try:
-        server = HTTPServer(("127.0.0.1", CONFIG_SERVER_PORT), ConfigRequestHandler)
-        server.serve_forever()
+        return _SingletonHTTPServer(("127.0.0.1", CONFIG_SERVER_PORT), ConfigRequestHandler)
     except OSError as e:
-        log.error("Config server failed to start: %s", e)
+        log.error(
+            "Config server bind failed on port %d (likely another instance running): %s",
+            CONFIG_SERVER_PORT, e,
+        )
+        return None
+
+
+def run_config_server(server: HTTPServer):
+    """Drive the already-bound HTTPServer until it stops."""
+    try:
+        server.serve_forever()
+    except Exception as e:
+        log.error("Config server stopped unexpectedly: %s", e)
 
 
 @dataclass
@@ -304,16 +331,22 @@ class Config:
     client_id: str = ""
     client_secret: str = ""
     streamers: list = None
+    # Subset of `streamers` marked as "Keep Open" by the user. Tabs for these
+    # streamers are protected from being closed when max_tabs is hit; they
+    # only close on user action, raid, or navigate-away.
+    pinned_streamers: list = None
     check_interval: int = 60
     last_run_version: str = ""
     paused: bool = False
     own_channel: str = ""
     im_live_pause: bool = False
     vod_fallback: bool = False
-    
+
     def __post_init__(self):
         if self.streamers is None:
             self.streamers = []
+        if self.pinned_streamers is None:
+            self.pinned_streamers = []
     
     @classmethod
     def load(cls) -> "Config":
@@ -805,11 +838,13 @@ class StreamMonitorApp:
                     # Update config server for browser extension
                     ConfigRequestHandler.config_data.update({
                         "streamers": self.config.streamers,
+                        "pinned_streamers": self.config.pinned_streamers,
                         "version": VERSION
                     })
                     log_activity(
                         "config_loaded",
                         streamers=list(self.config.streamers),
+                        pinned_streamers=list(self.config.pinned_streamers),
                         interval=self.config.check_interval,
                         reason="settings_changed",
                     )
@@ -1073,11 +1108,23 @@ class StreamMonitorApp:
         log_activity(
             "config_loaded",
             streamers=list(self.config.streamers),
+            pinned_streamers=list(self.config.pinned_streamers),
             interval=self.config.check_interval,
         )
 
-        # Start config server for browser extension
-        threading.Thread(target=lambda: start_config_server(self.config), daemon=True).start()
+        # Single-instance enforcement: try to bind the config server port
+        # synchronously. If another Stream Monitor instance is already
+        # running (e.g. the installer's CloseApplications missed a
+        # PyInstaller runtime, or the user double-launched the tray app),
+        # the bind fails and we exit silently to avoid duplicate monitor
+        # loops, duplicate tab opens, and duplicate notifications.
+        config_server = create_config_server(self.config)
+        if config_server is None:
+            log.error("Another instance is already running on port %d. Exiting.", CONFIG_SERVER_PORT)
+            log_activity("app_stopped", reason="port_in_use")
+            return
+
+        threading.Thread(target=lambda: run_config_server(config_server), daemon=True).start()
 
         # Create monitor with notification callback
         self.monitor = TwitchMonitor(self.config, self.update_status, self.send_notification)

@@ -60,16 +60,14 @@ async function log(level, ...args) {
 // ---------------------------------------------------------------------------
 
 async function loadState() {
-  const { trackedTabs = {}, monitoredStreamers = [] } =
-    await browser.storage.local.get(["trackedTabs", "monitoredStreamers"]);
-  // monitoredStreamers is stored as an ordered array. The array position
-  // encodes priority: index 0 = rank #1, index 1 = rank #2, etc. This drives
-  // the max-tabs displacement logic below.
-  const ordered = Array.isArray(monitoredStreamers) ? monitoredStreamers : [];
+  const { trackedTabs = {}, monitoredStreamers = [], pinnedStreamers = [] } =
+    await browser.storage.local.get(["trackedTabs", "monitoredStreamers", "pinnedStreamers"]);
+  const monitored = Array.isArray(monitoredStreamers) ? monitoredStreamers : [];
+  const pinned = Array.isArray(pinnedStreamers) ? pinnedStreamers : [];
   return {
-    trackedTabs,                          // { [tabId]: { originalStreamer } }
-    monitoredStreamers: new Set(ordered), // fast membership check
-    orderedStreamers: ordered,            // priority order (index 0 = rank #1)
+    trackedTabs,                          // { [tabId]: { originalStreamer, openedAt, ... } }
+    monitoredStreamers: new Set(monitored), // fast membership check
+    pinnedStreamers: new Set(pinned),     // streamers user marked "Keep Open"
   };
 }
 
@@ -77,20 +75,12 @@ async function saveTrackedTabs(trackedTabs) {
   await browser.storage.local.set({ trackedTabs });
 }
 
-async function saveMonitoredStreamers(orderedList) {
-  await browser.storage.local.set({ monitoredStreamers: orderedList });
+async function saveMonitoredStreamers(list) {
+  await browser.storage.local.set({ monitoredStreamers: list });
 }
 
-// Rank helpers. A lower rank number = higher priority. Streamers no longer
-// in the monitored list (e.g. user removed them but their tab is still open)
-// sort last.
-function rankOf(name, orderedStreamers) {
-  const idx = orderedStreamers.indexOf(name);
-  return idx === -1 ? Infinity : idx;
-}
-
-function rankLabel(rank) {
-  return rank === Infinity ? "unranked" : `#${rank + 1}`;
+async function savePinnedStreamers(list) {
+  await browser.storage.local.set({ pinnedStreamers: list });
 }
 
 async function notifyUser(title, message) {
@@ -324,6 +314,26 @@ async function muteTabIfEnabled(tabId) {
   return false;
 }
 
+async function shouldAutoFocus() {
+  const { autoFocusTabs = false } = await browser.storage.local.get("autoFocusTabs");
+  return autoFocusTabs;
+}
+
+async function focusTabIfEnabled(tab) {
+  if (!tab || tab.id === undefined) return false;
+  if (!(await shouldAutoFocus())) return false;
+  try {
+    await browser.tabs.update(tab.id, { active: true });
+    if (tab.windowId !== undefined) {
+      await browser.windows.update(tab.windowId, { focused: true });
+    }
+    return true;
+  } catch (e) {
+    await log("warn", `Failed to focus tab ${tab.id}:`, e?.message || String(e));
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Content script messaging — send commands to Twitch tabs
 // ---------------------------------------------------------------------------
@@ -463,17 +473,24 @@ async function fetchConfig() {
     });
 
     if (data?.streamers && Array.isArray(data.streamers)) {
-      // Preserve list order from the desktop app: position = priority rank.
-      const ordered = data.streamers.map(s => s.toLowerCase());
-      await saveMonitoredStreamers(ordered);
+      const monitored = data.streamers.map(s => s.toLowerCase());
+      await saveMonitoredStreamers(monitored);
+
+      // pinned_streamers is new in v1.5.4. Old desktops won't include it;
+      // treat missing/non-array as "nothing pinned" (= same default behavior
+      // as 1.4.x).
+      const pinned = Array.isArray(data.pinned_streamers)
+        ? data.pinned_streamers.map(s => s.toLowerCase())
+        : [];
+      await savePinnedStreamers(pinned);
 
       // Save live status from desktop app for popup display
       if (Array.isArray(data.live_streamers)) {
         await browser.storage.local.set({ liveStreamers: data.live_streamers });
       }
 
-      await log("info", "Config loaded, streamers:", ordered);
-      return new Set(ordered);
+      await log("info", `Config loaded: ${monitored.length} monitored, ${pinned.length} pinned`);
+      return new Set(monitored);
     }
   } catch (e) {
     await log("warn", "Config fetch failed:", e?.message || String(e));
@@ -534,13 +551,14 @@ async function onTabCreated(tab) {
     trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0, openedAt: Date.now() };
     await saveTrackedTabs(trackedTabs);
     const muted = await muteTabIfEnabled(tab.id);
+    const focused = await focusTabIfEnabled(tab);
     // Delay slightly so the page has time to load the video player
     setTimeout(() => activatePlayerControl(tab.id), 3000);
-    await log("info", `Tab ${tab.id} created for monitored streamer: ${streamer}${muted ? " (muted)" : ""}`);
+    await log("info", `Tab ${tab.id} created for monitored streamer: ${streamer}${muted ? " (muted)" : ""}${focused ? " (focused)" : ""}`);
   }
 }
 
-async function onTabUpdated(tabId, changeInfo, _tab) {
+async function onTabUpdated(tabId, changeInfo, tab) {
   // Re-activate player control when a tracked tab finishes loading
   // (e.g. after a reload triggered by keepalive or error recovery)
   if (changeInfo.status === "complete") {
@@ -552,7 +570,7 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
 
   if (!changeInfo.url) return;
 
-  const { trackedTabs, monitoredStreamers, orderedStreamers } = await loadState();
+  const { trackedTabs, monitoredStreamers, pinnedStreamers } = await loadState();
   const tabKey = String(tabId);
   const newStreamer = getStreamerFromUrl(changeInfo.url);
   const tracked = trackedTabs[tabKey];
@@ -608,36 +626,32 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
     trackedTabs[tabKey] = { originalStreamer: newStreamer, raidHopCount: 0, openedAt: now };
     await saveTrackedTabs(trackedTabs);
     const muted = await muteTabIfEnabled(tabId);
+    const focused = await focusTabIfEnabled(tab);
     setTimeout(() => activatePlayerControl(tabId), 3000);
-    await log("info", `Tab ${tabId} navigated to monitored streamer: ${newStreamer}${muted ? " (muted)" : ""}`);
+    await log("info", `Tab ${tabId} navigated to monitored streamer: ${newStreamer}${muted ? " (muted)" : ""}${focused ? " (focused)" : ""}`);
 
-    // Enforce max tabs: when at capacity, try to displace the lowest-
-    // priority open tab. Priority comes from the order of the streamer
-    // list in the desktop app's config; the first streamer is rank #1
-    // and so on. Core invariant (v1.5.1.1): every newly-opened monitored
-    // tab is guaranteed at least GRACE_MINUTES of viewing time so the
-    // viewer can build a Twitch view streak. That means we never close
-    // the new tab immediately here; the only options are:
-    //   - displace an existing tab with strictly-worse rank (new tab
-    //     keeps its slot indefinitely);
-    //   - all worse-ranked tabs are in grace → schedule a pending swap
-    //     for the earliest expiring one (new tab keeps its slot, target
-    //     closes when its grace ends);
-    //   - no existing tab has strictly-worse rank than new (new is the
-    //     lowest or tied-lowest priority) → schedule a pending
-    //     expiration for new at now + GRACE_MS so it gets a full
-    //     10-minute viewing window, then auto-closes.
+    // Enforce max tabs: when at capacity, try to displace an unpinned
+    // open tab. Pinned tabs (streamers the user marked "Keep Open" in
+    // settings) are protected from displacement. Core invariant: every
+    // newly-opened tab is guaranteed at least GRACE_MINUTES of viewing
+    // time so the viewer builds a Twitch view streak. The new tab is
+    // never closed immediately by max-tabs; the three options are:
+    //   - an unpinned tab is past its grace window → close it
+    //     immediately, new tab keeps the slot;
+    //   - the only unpinned tabs are still in grace → schedule a pending
+    //     swap for the earliest grace expiry (both tabs stay open until);
+    //   - all open tabs are pinned → schedule a pending expiration on
+    //     the new tab at now + GRACE_MS so it still gets its 10 minutes
+    //     before closing to respect the user's pinned set.
     if (maxTabs > 0) {
       const tabCount = Object.keys(trackedTabs).length;
       if (tabCount > maxTabs) {
-        const newRank = rankOf(newStreamer, orderedStreamers);
-
         const candidates = Object.entries(trackedTabs).map(([k, info]) => {
           const openedAt = info.openedAt || 0;
           return {
             tabKey: k,
             streamer: info.originalStreamer,
-            rank: rankOf(info.originalStreamer, orderedStreamers),
+            pinned: pinnedStreamers.has(info.originalStreamer),
             openedAt,
             graceUntil: openedAt + GRACE_MS,
             inGrace: now - openedAt < GRACE_MS,
@@ -645,19 +659,21 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
         });
 
         const others = candidates.filter(c => c.tabKey !== tabKey);
-        // Displaceable: past grace AND worse-ranked than new. Worst-first.
+        // Unpinned tabs past their grace window are the first to close.
+        // FIFO eviction (oldest first) so the longest-running tab cycles
+        // out and newer ones get more time to build streak.
         const displaceable = others
-          .filter(c => !c.inGrace && c.rank > newRank)
-          .sort((a, b) => b.rank - a.rank);
-        // Shielded: in grace AND worse-ranked than new. Earliest-grace-first.
+          .filter(c => !c.pinned && !c.inGrace)
+          .sort((a, b) => a.openedAt - b.openedAt);
+        // Unpinned but in grace: schedule a swap for the earliest expiry.
         const shielded = others
-          .filter(c => c.inGrace && c.rank > newRank)
+          .filter(c => !c.pinned && c.inGrace)
           .sort((a, b) => a.graceUntil - b.graceUntil);
 
         if (displaceable.length > 0) {
           const target = displaceable[0];
           await log("info",
-            `Max tabs (${maxTabs}) reached. Displacing ${rankLabel(target.rank)} ${target.streamer} (tab ${target.tabKey}) to make room for ${rankLabel(newRank)} ${newStreamer}`
+            `Max tabs (${maxTabs}) reached. Closing unpinned tab ${target.tabKey} (${target.streamer}) to make room for ${newStreamer}`
           );
           notifyUser(
             "Stream Monitor",
@@ -676,7 +692,7 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
           const target = shielded[0];
           const minutesLeft = Math.max(1, Math.ceil((target.graceUntil - now) / 60000));
           await log("info",
-            `Max tabs (${maxTabs}) reached but ${rankLabel(target.rank)} ${target.streamer} (tab ${target.tabKey}) is in grace (${minutesLeft}m left). Keeping both tabs open; swap scheduled.`
+            `Max tabs (${maxTabs}) reached but unpinned ${target.streamer} (tab ${target.tabKey}) is in grace (${minutesLeft}m left). Keeping both tabs open; swap scheduled.`
           );
           notifyUser(
             "Stream Monitor",
@@ -690,16 +706,16 @@ async function onTabUpdated(tabId, changeInfo, _tab) {
             scheduledAt: target.graceUntil,
           });
         } else {
-          // No existing tab has strictly-worse rank than new. New is the
-          // lowest-priority live streamer (or tied-lowest, e.g. duplicate
-          // streamer tabs or multiple unranked tabs). Give new its
-          // guaranteed 10-minute viewing window, then auto-close.
+          // All open tabs are pinned (Keep Open). The user's explicit
+          // intent is "always keep these open", so we don't displace
+          // any of them. The new tab still gets its 10-minute streak
+          // window before closing.
           await log("info",
-            `Max tabs (${maxTabs}) reached. ${rankLabel(newRank)} ${newStreamer} is the lowest priority; keeping tab open for ${GRACE_MINUTES}m to preserve streak, then closing.`
+            `Max tabs (${maxTabs}) reached and all open tabs are pinned. Keeping ${newStreamer}'s tab open for ${GRACE_MINUTES}m to preserve streak, then closing.`
           );
           notifyUser(
             "Stream Monitor",
-            `Max tabs (${maxTabs}) reached. Keeping ${newStreamer}'s tab open for ${GRACE_MINUTES} minutes to preserve their streak, then closing to free the slot.`
+            `Max tabs (${maxTabs}) reached. All open streams are pinned, so ${newStreamer}'s tab will close in ${GRACE_MINUTES} minutes after their streak is preserved.`
           );
           await schedulePendingExpiration(tabKey, newStreamer, now + GRACE_MS);
         }

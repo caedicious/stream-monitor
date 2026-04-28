@@ -1,5 +1,6 @@
 // --- Settings ---
 const autoMuteEl = document.getElementById("auto-mute");
+const autoFocusEl = document.getElementById("auto-focus");
 const extensionPausedEl = document.getElementById("extension-paused");
 const lowQualityEl = document.getElementById("low-quality");
 const raidFollowEl = document.getElementById("raid-follow");
@@ -8,9 +9,10 @@ const notificationsEl = document.getElementById("notifications-enabled");
 
 async function loadSettings() {
   const result = await browser.storage.local.get([
-    "autoMute", "extensionPaused", "lowQuality", "raidFollowThrough", "maxTabs"
+    "autoMute", "autoFocusTabs", "extensionPaused", "lowQuality", "raidFollowThrough", "maxTabs"
   ]);
   autoMuteEl.checked = result.autoMute || false;
+  autoFocusEl.checked = result.autoFocusTabs || false;
   extensionPausedEl.checked = result.extensionPaused || false;
   lowQualityEl.checked = result.lowQuality || false;
   raidFollowEl.checked = result.raidFollowThrough || false;
@@ -30,6 +32,10 @@ async function loadSettings() {
 
 autoMuteEl.addEventListener("change", async () => {
   await browser.storage.local.set({ autoMute: autoMuteEl.checked });
+});
+
+autoFocusEl.addEventListener("change", async () => {
+  await browser.storage.local.set({ autoFocusTabs: autoFocusEl.checked });
 });
 
 extensionPausedEl.addEventListener("change", async () => {
