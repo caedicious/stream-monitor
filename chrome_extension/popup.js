@@ -98,11 +98,33 @@ async function loadStreamerList() {
   for (const streamer of monitoredStreamers) {
     const isLive = liveSet.has(streamer.toLowerCase());
     const item = document.createElement("div");
-    item.className = "streamer-item";
-    item.innerHTML =
-      `<span class="status-dot ${isLive ? "live" : "offline"}"></span>` +
-      `<span>${streamer}${isLive ? " (LIVE)" : ""}</span>`;
+    item.className = "streamer-item clickable";
+    item.title = isLive
+      ? `Open ${streamer}'s stream (or focus the existing tab)`
+      : `Open ${streamer}'s channel page`;
+    const dot = document.createElement("span");
+    dot.className = `status-dot ${isLive ? "live" : "offline"}`;
+    item.appendChild(dot);
+    const label = document.createElement("span");
+    label.textContent = isLive ? `${streamer} (LIVE)` : streamer;
+    item.appendChild(label);
+    item.addEventListener("click", () => openOrFocusStreamer(streamer.toLowerCase()));
     listEl.appendChild(item);
+  }
+}
+
+// Click handler for the streamer list. Always opens a plain Twitch URL
+// (no ?sm=1) so the extension's auto-mute, low-quality, max-tabs, and
+// raid-close behaviors don't apply — the user clicked because they want
+// to actually watch this streamer, not background-monitor them. Existing
+// tracked tabs are deliberately not reused for the same reason; their
+// player has already been muted/lowered for background viewing.
+async function openOrFocusStreamer(name) {
+  try {
+    await chrome.tabs.create({ url: `https://www.twitch.tv/${name}`, active: true });
+    window.close();
+  } catch (e) {
+    console.error("Failed to open streamer:", e);
   }
 }
 
