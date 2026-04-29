@@ -155,6 +155,49 @@
   // Low quality mode — interact with Twitch's settings menu via DOM
   // -----------------------------------------------------------------------
 
+  // Read the human-readable label of a quality option, regardless of
+  // whether it's a role="menuitemradio" element (textContent works
+  // directly) or an <input type="radio"> wrapped in a <label> (textContent
+  // of the closest label).
+  function getQualityLabel(opt) {
+    if (opt.getAttribute && opt.getAttribute("role") === "menuitemradio") {
+      return (opt.textContent || "").trim();
+    }
+    const lbl = opt.closest && opt.closest("label");
+    if (lbl) return (lbl.textContent || "").trim();
+    return (opt.getAttribute && opt.getAttribute("aria-label")) || (opt.textContent || "").trim();
+  }
+
+  // Parse a quality label (e.g. "720p60", "480p", "1080p60 (Source)") into
+  // a numeric resolution. Lower number = lower quality. Auto and Source are
+  // never the "lowest" pick (Source is full quality regardless of where it
+  // sits in the list, and Auto adapts to bandwidth). Anything we can't
+  // parse returns Infinity so it sorts to the back.
+  function parseQualityRank(label) {
+    const lower = label.toLowerCase();
+    if (lower.includes("auto")) return Infinity;
+    if (lower.includes("source")) return Infinity;
+    const m = label.match(/(\d+)\s*p/i);
+    return m ? parseInt(m[1], 10) : Infinity;
+  }
+
+  // Pick the option with the smallest parsed resolution. The Twitch quality
+  // menu is not always sorted; "Source" is sometimes pinned to the bottom,
+  // which is why "last item in the list" is unreliable.
+  function pickLowestQualityOption(opts) {
+    let best = null;
+    let bestRank = Infinity;
+    for (const opt of opts) {
+      const label = getQualityLabel(opt);
+      const rank = parseQualityRank(label);
+      if (rank < bestRank) {
+        bestRank = rank;
+        best = opt;
+      }
+    }
+    return { option: best, label: best ? getQualityLabel(best) : null };
+  }
+
   function applyLowQuality() {
     if (lowQualityApplied) return;
 
@@ -182,31 +225,33 @@
 
       // Wait for quality options to appear
       setTimeout(() => {
-        // Look for quality options — try to find the lowest available
-        const qualityOptions = document.querySelectorAll('[data-a-target="player-settings-menu"] input[type="radio"]');
-        if (qualityOptions.length === 0) {
-          // Try alternate selector for quality list items
-          const qualityLabels = document.querySelectorAll('[data-a-target="player-settings-menu"] [role="menuitemradio"]');
-          if (qualityLabels.length > 0) {
-            // Pick the last option (lowest quality)
-            const lowest = qualityLabels[qualityLabels.length - 1];
-            lowest.click();
+        const radios = document.querySelectorAll('[data-a-target="player-settings-menu"] input[type="radio"]');
+        if (radios.length > 0) {
+          const { option, label } = pickLowestQualityOption(radios);
+          if (option) {
+            option.click();
             lowQualityApplied = true;
-            console.log(LOG_PREFIX, "Set to lowest quality via menuitemradio");
+            console.log(LOG_PREFIX, `Set to lowest quality: ${label}`);
             return;
           }
-
-          // Close the menu if we can't find options
-          settingsBtn.click();
-          console.log(LOG_PREFIX, "Quality options not found, will retry");
-          return;
         }
 
-        // Select the last radio button (lowest quality)
-        const lowest = qualityOptions[qualityOptions.length - 1];
-        lowest.click();
-        lowQualityApplied = true;
-        console.log(LOG_PREFIX, "Set to lowest quality via radio button");
+        // Fallback selector: role="menuitemradio" items
+        const items = document.querySelectorAll('[data-a-target="player-settings-menu"] [role="menuitemradio"]');
+        if (items.length > 0) {
+          const { option, label } = pickLowestQualityOption(items);
+          if (option) {
+            option.click();
+            lowQualityApplied = true;
+            console.log(LOG_PREFIX, `Set to lowest quality (menuitemradio): ${label}`);
+            return;
+          }
+        }
+
+        // Close the menu if we couldn't parse any options. Will retry on
+        // the next poll iteration.
+        settingsBtn.click();
+        console.log(LOG_PREFIX, "Quality options not found or unparseable, will retry");
       }, 300);
     }, 300);
   }
