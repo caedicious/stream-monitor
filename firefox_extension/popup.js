@@ -12,7 +12,8 @@ async function loadSettings() {
     "autoMute", "autoFocusTabs", "extensionPaused", "lowQuality", "raidFollowThrough", "maxTabs"
   ]);
   autoMuteEl.checked = result.autoMute || false;
-  autoFocusEl.checked = result.autoFocusTabs || false;
+  // Default ON for autoFocus — see shouldAutoFocus in background.js
+  autoFocusEl.checked = result.autoFocusTabs ?? true;
   extensionPausedEl.checked = result.extensionPaused || false;
   lowQualityEl.checked = result.lowQuality || false;
   raidFollowEl.checked = result.raidFollowThrough || false;

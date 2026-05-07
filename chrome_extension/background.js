@@ -319,8 +319,14 @@ async function muteTabIfEnabled(tabId) {
 }
 
 async function shouldAutoFocus() {
+  // Default ON: if a user has Firefox/Chrome configured to open external
+  // tabs in background, the new stream tab can fail to start playing
+  // properly and Twitch may not count the viewer, costing the user a
+  // streak. Auto-focusing via the extension API works around the
+  // browser-level setting. Users who explicitly toggle OFF in the popup
+  // get stored false and that's respected.
   const result = await chrome.storage.local.get("autoFocusTabs");
-  return result.autoFocusTabs || false;
+  return result.autoFocusTabs ?? true;
 }
 
 async function focusTabIfEnabled(tab) {

@@ -328,6 +328,45 @@
       contentGateBtn.click();
       console.log(LOG_PREFIX, "Keepalive: dismissed content gate");
     }
+
+    // "Network error (Error #2000)" / generic player error overlay with a
+    // "Click Here to Reload Player" button. Twitch's data-a-target for
+    // this button has changed over time, so we match by visible text.
+    //
+    // Two-tier search: prefer scoped to the player container (no risk of
+    // picking up an unrelated reload button elsewhere on the page), then
+    // fall back to a document-wide search if Twitch renders the overlay
+    // outside that container. The fallback adds a visibility check so we
+    // never click a hidden button somewhere in the SPA.
+    const matchesReload = (btn) => {
+      const text = (btn.textContent || "").toLowerCase().trim();
+      return text.includes("reload player") || text.includes("reload stream");
+    };
+
+    let reloadBtn = null;
+    const playerContainer = document.querySelector(
+      '.video-player__container, [data-a-target="video-player"]'
+    );
+    if (playerContainer) {
+      for (const btn of playerContainer.querySelectorAll('button')) {
+        if (matchesReload(btn)) { reloadBtn = btn; break; }
+      }
+    }
+    if (!reloadBtn) {
+      for (const btn of document.querySelectorAll('button')) {
+        if (!matchesReload(btn)) continue;
+        if (btn.offsetParent === null) continue; // hidden
+        reloadBtn = btn;
+        break;
+      }
+    }
+    if (reloadBtn) {
+      reloadBtn.click();
+      console.log(
+        LOG_PREFIX,
+        `Keepalive: clicked reload-player button ("${(reloadBtn.textContent || "").trim()}")`
+      );
+    }
   }
 
   function keepalive() {
