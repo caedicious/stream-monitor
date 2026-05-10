@@ -2,7 +2,7 @@
 ; Download Inno Setup from: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "Stream Monitor"
-#define MyAppVersion "1.5.6"
+#define MyAppVersion "1.5.7"
 #define MyAppPublisher "Stream Monitor"
 #define MyAppExeName "StreamMonitor.exe"
 #define MyAppSetupExeName "StreamMonitorSetup.exe"
