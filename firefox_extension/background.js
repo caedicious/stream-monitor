@@ -12,7 +12,13 @@ const CONFIG_ALARM = "refresh-config";
 const KEEPALIVE_ALARM = "keepalive";
 const CONFIG_INTERVAL_MINUTES = 1;
 const KEEPALIVE_INTERVAL_MINUTES = 2;
-const MAX_LOG_ENTRIES = 200;
+// 2000 entries at ~150 bytes each = ~300 KB stored in browser.storage.local,
+// well within the per-extension quota. At ~10 entries/min idle activity that
+// covers ~3.5 hours; with bursts of activity (config changes, tab events),
+// realistic retention is closer to 30+ hours of meaningful events. Increased
+// from 200 because diagnosing a missed-stream event from earlier in the same
+// day requires entries from many hours ago to still be present.
+const MAX_LOG_ENTRIES = 2000;
 
 // Grace period: a tab that has been open for less than this duration is
 // "in grace" and should not be closed by max-tabs displacement. This
@@ -33,26 +39,44 @@ const IGNORED_PATHS = new Set([
 // ---------------------------------------------------------------------------
 // Debug logging — writes to console AND a circular buffer in storage
 // ---------------------------------------------------------------------------
+//
+// Concurrent log() calls used to race on the read-modify-write of
+// debugLog: two callers could both read the same N-entry baseline,
+// each push their own entry, and write back N+1 entries — losing
+// one entry permanently. We saw this drop the IIFE's "Event page
+// starting (init)" entry frequently.
+//
+// Fix: serialize storage writes through a Promise queue. All log()
+// calls within the same event-page lifetime go through _logQueue in
+// order, so the read-modify-write is atomic from each caller's
+// perspective. Cross-suspension races are still possible if the
+// page suspends mid-write, but those are rare and drop at most one
+// entry per suspension instead of dropping continuously under load.
+
+let _logQueue = Promise.resolve();
 
 async function log(level, ...args) {
   const msg = args.map(a => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
   const prefix = `[Stream Monitor]`;
+  const ts = new Date().toISOString();
 
   if (level === "error") console.error(prefix, ...args);
   else if (level === "warn") console.warn(prefix, ...args);
   else console.log(prefix, ...args);
 
-  try {
-    const { debugLog = [] } = await browser.storage.local.get("debugLog");
-    debugLog.push({ ts: new Date().toISOString(), level, msg });
-    // Keep only the most recent entries
-    if (debugLog.length > MAX_LOG_ENTRIES) {
-      debugLog.splice(0, debugLog.length - MAX_LOG_ENTRIES);
+  _logQueue = _logQueue.then(async () => {
+    try {
+      const { debugLog = [] } = await browser.storage.local.get("debugLog");
+      debugLog.push({ ts, level, msg });
+      if (debugLog.length > MAX_LOG_ENTRIES) {
+        debugLog.splice(0, debugLog.length - MAX_LOG_ENTRIES);
+      }
+      await browser.storage.local.set({ debugLog });
+    } catch (e) {
+      console.error(prefix, "Failed to write debug log:", e);
     }
-    await browser.storage.local.set({ debugLog });
-  } catch (e) {
-    console.error(prefix, "Failed to write debug log:", e);
-  }
+  });
+  return _logQueue;
 }
 
 // ---------------------------------------------------------------------------
