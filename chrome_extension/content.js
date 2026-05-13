@@ -329,44 +329,120 @@
       console.log(LOG_PREFIX, "Keepalive: dismissed content gate");
     }
 
-    // "Network error (Error #2000)" / generic player error overlay with a
-    // "Click Here to Reload Player" button. Twitch's data-a-target for
-    // this button has changed over time, so we match by visible text.
-    //
-    // Two-tier search: prefer scoped to the player container (no risk of
-    // picking up an unrelated reload button elsewhere on the page), then
-    // fall back to a document-wide search if Twitch renders the overlay
-    // outside that container. The fallback adds a visibility check so we
-    // never click a hidden button somewhere in the SPA.
+    // Player-error recovery (handles "Error #2000" overlay and similar).
+    // Two-tier: first click the reload button if found, then if the error
+    // is still present 30s later, hard-reload the page. Both layers fire
+    // regardless of tab focus.
+    attemptPlayerRecovery();
+  }
+
+  // -----------------------------------------------------------------------
+  // Player-error recovery
+  // -----------------------------------------------------------------------
+  //
+  // Detects Twitch player-error overlays ("(Error #2000)", "Click Here to
+  // Reload Player", etc.) and tries two layers of recovery:
+  //
+  //   1. Click the reload-player button if found. This is the gentle path
+  //      and usually works.
+  //   2. If the error is STILL detectable after ERROR_RELOAD_GRACE_MS, do a
+  //      hard window.location.reload(). This catches cases where Twitch's
+  //      React state is wedged or the button click was registered but had
+  //      no visible effect.
+  //
+  // Both layers fire on background tabs because content scripts run
+  // independently of focus, and chrome.alarms (which drives the keepalive)
+  // is not focus-gated either. setTimeout in background tabs may be
+  // throttled slightly, so the 30s grace may stretch to ~60s on a
+  // backgrounded tab — still acceptable for recovery.
+
+  const ERROR_RELOAD_GRACE_MS = 30000;       // wait this long after click before hard-reload
+  const ERROR_RELOAD_COOLDOWN_MS = 5 * 60 * 1000; // never hard-reload more than once per 5 min
+  let _errorRecoveryTimeoutId = null;
+  let _lastReloadAt = 0;
+
+  // Look for unambiguous error markers, not just generic words. Avoids
+  // false positives if a stream title or chat message contains "error".
+  function detectPlayerError() {
+    const playerArea = document.querySelector(
+      '.video-player__container, [data-a-target="video-player"]'
+    );
+    if (!playerArea) return false;
+    const text = (playerArea.textContent || "").toLowerCase();
+    return (
+      /\(error #\d+\)/.test(text) ||
+      text.includes("click here to reload player") ||
+      text.includes("click here to reload stream")
+    );
+  }
+
+  function findReloadButton() {
     const matchesReload = (btn) => {
       const text = (btn.textContent || "").toLowerCase().trim();
       return text.includes("reload player") || text.includes("reload stream");
     };
-
-    let reloadBtn = null;
     const playerContainer = document.querySelector(
       '.video-player__container, [data-a-target="video-player"]'
     );
     if (playerContainer) {
       for (const btn of playerContainer.querySelectorAll('button')) {
-        if (matchesReload(btn)) { reloadBtn = btn; break; }
+        if (matchesReload(btn)) return btn;
       }
     }
-    if (!reloadBtn) {
-      for (const btn of document.querySelectorAll('button')) {
-        if (!matchesReload(btn)) continue;
-        if (btn.offsetParent === null) continue; // hidden
-        reloadBtn = btn;
-        break;
-      }
+    for (const btn of document.querySelectorAll('button')) {
+      if (!matchesReload(btn)) continue;
+      if (btn.offsetParent === null) continue; // hidden
+      return btn;
     }
+    return null;
+  }
+
+  function attemptPlayerRecovery() {
+    if (!detectPlayerError()) {
+      // Clean state — cancel any pending hard-reload check.
+      if (_errorRecoveryTimeoutId) {
+        clearTimeout(_errorRecoveryTimeoutId);
+        _errorRecoveryTimeoutId = null;
+      }
+      return;
+    }
+
+    // Error is present. Try the gentle fix if a button is available.
+    const reloadBtn = findReloadButton();
     if (reloadBtn) {
       reloadBtn.click();
       console.log(
         LOG_PREFIX,
-        `Keepalive: clicked reload-player button ("${(reloadBtn.textContent || "").trim()}")`
+        `Recovery: clicked reload-player button ("${(reloadBtn.textContent || "").trim()}")`
       );
+    } else {
+      console.log(LOG_PREFIX, "Recovery: error overlay detected but no reload button found");
     }
+
+    // Schedule (or extend) the hard-reload check.
+    if (_errorRecoveryTimeoutId) clearTimeout(_errorRecoveryTimeoutId);
+    _errorRecoveryTimeoutId = setTimeout(() => {
+      _errorRecoveryTimeoutId = null;
+      if (!detectPlayerError()) {
+        console.log(LOG_PREFIX, "Recovery: error overlay cleared, no hard-reload needed");
+        return;
+      }
+      const now = Date.now();
+      if (now - _lastReloadAt < ERROR_RELOAD_COOLDOWN_MS) {
+        const remainSec = Math.ceil((ERROR_RELOAD_COOLDOWN_MS - (now - _lastReloadAt)) / 1000);
+        console.warn(
+          LOG_PREFIX,
+          `Recovery: error overlay still present but hard-reload on cooldown (${remainSec}s remaining)`
+        );
+        return;
+      }
+      _lastReloadAt = now;
+      console.warn(
+        LOG_PREFIX,
+        "Recovery: error overlay still present after grace window, hard-reloading page"
+      );
+      window.location.reload();
+    }, ERROR_RELOAD_GRACE_MS);
   }
 
   function keepalive() {
