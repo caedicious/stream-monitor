@@ -43,7 +43,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.5.8"
+VERSION = "1.5.9"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
