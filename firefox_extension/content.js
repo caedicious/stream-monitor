@@ -369,8 +369,34 @@
         LOG_PREFIX,
         "Recovery: error overlay still present after grace window, hard-reloading page"
       );
-      window.location.reload();
+      hardReload();
     }, ERROR_RELOAD_GRACE_MS);
+  }
+
+  // Reload the current page while ensuring ?sm=1 is in the URL.
+  // Twitch's SPA strips the query param via history.replaceState shortly
+  // after the page loads, so a plain window.location.reload() would
+  // reload the sm-less URL. We re-add it so the extension's tab-tracking
+  // logic continues to identify this tab as a Stream-Monitor tab on the
+  // next navigation event, and so restoring a closed tab via the
+  // browser's session history keeps it tracked.
+  function hardReload() {
+    try {
+      const url = new URL(window.location.href);
+      if (url.searchParams.get("sm") === "1") {
+        window.location.reload();
+        return;
+      }
+      url.searchParams.set("sm", "1");
+      window.location.href = url.toString();
+    } catch (e) {
+      console.warn(
+        LOG_PREFIX,
+        "Failed to construct sm=1 URL, falling back to plain reload:",
+        e && e.message
+      );
+      window.location.reload();
+    }
   }
 
   function keepalive() {
