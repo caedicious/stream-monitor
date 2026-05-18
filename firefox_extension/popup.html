@@ -134,6 +134,58 @@
       border-radius: 4px;
       margin-bottom: 8px;
     }
+    .at-risk-list {
+      background: #16213e;
+      padding: 4px;
+      border-radius: 4px;
+      margin-bottom: 8px;
+    }
+    .at-risk-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      margin: 2px 0;
+      border-radius: 3px;
+      cursor: pointer;
+      background: #3a1418;
+      border-left: 3px solid #dc3545;
+      transition: background 0.15s;
+    }
+    .at-risk-item:hover { background: #4d1a1f; }
+    .at-risk-item.acknowledged {
+      background: #1f2a3a;
+      border-left-color: #555;
+      color: #888;
+      cursor: pointer;
+    }
+    .at-risk-item.acknowledged:hover { background: #25334a; }
+    .at-risk-name {
+      font-weight: bold;
+      flex-shrink: 0;
+    }
+    .at-risk-status {
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 8px;
+      background: #dc3545;
+      color: white;
+      flex-shrink: 0;
+      letter-spacing: 0.5px;
+    }
+    .at-risk-status.in_danger { background: #f39c12; }
+    .at-risk-item.acknowledged .at-risk-status { background: #555; }
+    .at-risk-deadline {
+      font-size: 10px;
+      color: #aaa;
+      margin-left: auto;
+      flex-shrink: 0;
+    }
+    .at-risk-empty {
+      padding: 6px 8px;
+      color: #666;
+      font-size: 10px;
+    }
     .streamer-item {
       display: flex;
       align-items: center;
@@ -177,6 +229,11 @@
     <button id="clear">Clear Log</button>
     <a href="#" id="open-full">Open in full tab</a>
   </div>
+  <div id="at-risk-section" style="display:none">
+    <div class="section-title" style="color:#dc3545">— Streaks at Risk —</div>
+    <div id="at-risk-list" class="at-risk-list"></div>
+  </div>
+
   <div class="section-title">— Streamers —</div>
   <div id="streamer-list" class="streamer-list">(loading...)</div>
 

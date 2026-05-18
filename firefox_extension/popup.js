@@ -154,7 +154,107 @@ async function loadDebugInfo() {
   }
 }
 
+// --- At-risk streaks ---
+function sortAtRiskStreaks(entries, now) {
+  // Three priority tiers, smaller score = higher in the list:
+  //   BROKE (unacked)     : score = detected_at ms (range ~1.7e12 in 2026)
+  //   IN_DANGER (unacked) : score = 2e15 + ms-remaining (always > any broke)
+  //   acknowledged        : score = 3e15 (sinks to the bottom)
+  const score = (e) => {
+    if (e.acknowledged_at) return 3e15;
+    if (e.status === "broke") {
+      return Date.parse(e.detected_at) || 0;
+    }
+    const detected = Date.parse(e.detected_at) || 0;
+    const deadlineMs = detected + (e.deadline_hours || 24) * 3600 * 1000;
+    return 2e15 + Math.max(0, deadlineMs - now);
+  };
+  return entries.slice().sort((a, b) => score(a) - score(b));
+}
+
+function formatDeadline(entry, now) {
+  if (entry.status === "broke") {
+    const detected = Date.parse(entry.detected_at) || now;
+    const hoursLeft = Math.max(
+      0,
+      Math.round((detected + 24 * 3600 * 1000 - now) / (3600 * 1000))
+    );
+    return hoursLeft > 0 ? `${hoursLeft}h to save` : "expired";
+  }
+  const detected = Date.parse(entry.detected_at) || now;
+  const hoursLeft = Math.max(
+    0,
+    Math.round(
+      (detected + (entry.deadline_hours || 24) * 3600 * 1000 - now) /
+        (3600 * 1000)
+    )
+  );
+  return hoursLeft > 0 ? `${hoursLeft}h left` : "expiring";
+}
+
+async function loadAtRiskStreaks() {
+  const r = await browser.storage.local.get("atRiskStreaks");
+  return r.atRiskStreaks || {};
+}
+
+async function renderAtRiskStreaks() {
+  const map = await loadAtRiskStreaks();
+  const section = document.getElementById("at-risk-section");
+  const list = document.getElementById("at-risk-list");
+  const entries = Object.values(map);
+  if (entries.length === 0) {
+    section.style.display = "none";
+    list.innerHTML = "";
+    return;
+  }
+  section.style.display = "block";
+  const now = Date.now();
+  const sorted = sortAtRiskStreaks(entries, now);
+  list.innerHTML = "";
+  for (const entry of sorted) {
+    const item = document.createElement("div");
+    item.className = "at-risk-item" + (entry.acknowledged_at ? " acknowledged" : "");
+    item.title = entry.acknowledged_at
+      ? `Re-open ${entry.streamer} in a new tab`
+      : `Open ${entry.streamer} and acknowledge the streak alert`;
+
+    const name = document.createElement("span");
+    name.className = "at-risk-name";
+    name.textContent = `${entry.streamer} (${entry.count})`;
+    item.appendChild(name);
+
+    const status = document.createElement("span");
+    status.className = `at-risk-status ${entry.status}`;
+    status.textContent = entry.status === "broke" ? "BROKE" : "IN DANGER";
+    item.appendChild(status);
+
+    const deadline = document.createElement("span");
+    deadline.className = "at-risk-deadline";
+    deadline.textContent = formatDeadline(entry, now);
+    item.appendChild(deadline);
+
+    item.addEventListener("click", () => openAtRiskStreak(entry));
+    list.appendChild(item);
+  }
+}
+
+async function openAtRiskStreak(entry) {
+  const url = entry.save_url || `https://www.twitch.tv/${entry.streamer}`;
+  try {
+    await browser.tabs.create({ url, active: true });
+  } catch (e) {
+    console.error("Failed to open at-risk streak URL:", e);
+  }
+  try {
+    browser.runtime.sendMessage({ type: "ack_streak", streamer: entry.streamer });
+  } catch (_) {
+    // ignore
+  }
+  window.close();
+}
+
 function refreshAll() {
+  renderAtRiskStreaks();
   loadStreamerList();
   loadDebugInfo();
 }

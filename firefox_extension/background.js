@@ -423,6 +423,10 @@ browser.runtime.onMessage.addListener((message, sender) => {
     reloadTrackedTab(sender.tab.id);
   } else if (message.type === "streak_event" && message.event) {
     forwardStreakEvent(message.event);
+    persistAtRiskStreak(message.event);
+  } else if (message.type === "ack_streak" && message.streamer) {
+    acknowledgeAtRiskStreak(message.streamer).then(() => sendResponse({ ok: true }));
+    return true; // async response
   }
 });
 
@@ -462,6 +466,100 @@ async function forwardStreakEvent(event) {
     await log("info", "Streak event POST failed (desktop app likely not running):", e.message);
   }
 }
+
+// ---------------------------------------------------------------------------
+// At-risk streak state — persisted across extension restarts so the toolbar
+// badge and the popup's "Streaks at Risk" section survive a background
+// page suspend/resume cycle. Cleared when the user clicks the row
+// (acknowledges) or when the entry expires (deadline + 4h buffer).
+// ---------------------------------------------------------------------------
+
+const ACK_EXPIRY_BUFFER_MS = 4 * 60 * 60 * 1000;
+const STREAK_BADGE_COLOR = "#dc3545";
+
+async function loadAtRiskStreaks() {
+  const r = await browser.storage.local.get("atRiskStreaks");
+  return r.atRiskStreaks || {};
+}
+
+async function saveAtRiskStreaks(map) {
+  await browser.storage.local.set({ atRiskStreaks: map });
+}
+
+function _entryExpired(entry, now) {
+  if (!entry || !entry.detected_at) return false;
+  const detected = Date.parse(entry.detected_at);
+  if (isNaN(detected)) return false;
+  const deadlineHours = entry.deadline_hours || 24;
+  return now - detected > deadlineHours * 3600 * 1000 + ACK_EXPIRY_BUFFER_MS;
+}
+
+async function pruneExpiredAtRiskStreaks() {
+  const map = await loadAtRiskStreaks();
+  const now = Date.now();
+  let changed = false;
+  for (const key of Object.keys(map)) {
+    if (_entryExpired(map[key], now)) {
+      delete map[key];
+      changed = true;
+    }
+  }
+  if (changed) await saveAtRiskStreaks(map);
+  return map;
+}
+
+async function persistAtRiskStreak(event) {
+  if (!event || !event.streamer || !event.status) return;
+  const map = await pruneExpiredAtRiskStreaks();
+  const key = event.streamer.toLowerCase();
+  const existing = map[key];
+  map[key] = {
+    streamer: key,
+    status: event.status === "broke" ? "broke" : "in_danger",
+    count: typeof event.count === "number" ? event.count : (existing?.count ?? 0),
+    detected_at: event.detected_at || new Date().toISOString(),
+    deadline_hours: typeof event.deadline_hours === "number"
+      ? event.deadline_hours
+      : (existing?.deadline_hours ?? 24),
+    save_url: event.save_url || existing?.save_url || `https://www.twitch.tv/${key}`,
+    acknowledged_at: null,
+  };
+  await saveAtRiskStreaks(map);
+  await refreshStreakBadge(map);
+}
+
+async function acknowledgeAtRiskStreak(streamer) {
+  if (!streamer) return;
+  const key = streamer.toLowerCase();
+  const map = await loadAtRiskStreaks();
+  if (!map[key]) return;
+  map[key].acknowledged_at = new Date().toISOString();
+  await saveAtRiskStreaks(map);
+  await refreshStreakBadge(map);
+}
+
+async function refreshStreakBadge(mapOpt) {
+  const map = mapOpt || await loadAtRiskStreaks();
+  const unack = Object.values(map).filter((e) => !e.acknowledged_at).length;
+  try {
+    await browser.action.setBadgeBackgroundColor({ color: STREAK_BADGE_COLOR });
+    await browser.action.setBadgeText({
+      text: unack === 0 ? "" : unack > 9 ? "9+" : String(unack),
+    });
+  } catch (e) {
+    // browser.action not available; non-fatal.
+  }
+}
+
+browser.runtime.onStartup.addListener(async () => {
+  await pruneExpiredAtRiskStreaks();
+  await refreshStreakBadge();
+});
+browser.runtime.onInstalled.addListener(async () => {
+  await pruneExpiredAtRiskStreaks();
+  await refreshStreakBadge();
+});
+refreshStreakBadge().catch(() => {});
 
 // ---------------------------------------------------------------------------
 // Reload tracked tab — preserves sm=1 and re-activates player after load
