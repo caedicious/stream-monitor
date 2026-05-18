@@ -2,7 +2,7 @@
 ; Download Inno Setup from: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "Stream Monitor"
-#define MyAppVersion "1.6.4"
+#define MyAppVersion "1.6.4.1"
 #define MyAppPublisher "Stream Monitor"
 #define MyAppExeName "StreamMonitor.exe"
 #define MyAppSetupExeName "StreamMonitorSetup.exe"
@@ -61,6 +61,27 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Launch Stream Monitor"; Flags: 
 ; Config is preserved during upgrade since we're not explicitly deleting it during install
 
 [Code]
+// Kill any running StreamMonitor.exe before RestartManager negotiates
+// with it. PyInstaller --onefile spawns a bootloader plus an extracted
+// runtime that RestartManager cannot shut down cleanly, which under
+// /VERYSILENT manifests as a hung installer (the Abort/Retry/Ignore
+// dialog never paints but blocks progress).
+function InitializeSetup(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := True;
+  Exec(ExpandConstant('{cmd}'),
+       '/C taskkill /F /IM {#MyAppExeName} /T',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{cmd}'),
+       '/C taskkill /F /IM {#MyAppSetupExeName} /T',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{cmd}'),
+       '/C taskkill /F /IM {#MyAppSettingsExeName} /T',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 // Remove startup shortcut on uninstall
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var

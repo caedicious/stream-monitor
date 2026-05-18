@@ -214,17 +214,21 @@ async function renderAtRiskStreaks() {
   const map = await loadAtRiskStreaks();
   const section = document.getElementById("at-risk-section");
   const list = document.getElementById("at-risk-list");
+  const clearAckedEl = document.getElementById("at-risk-clear-acked");
   const entries = Object.values(map);
   if (entries.length === 0) {
     section.style.display = "none";
     list.innerHTML = "";
+    if (clearAckedEl) clearAckedEl.style.display = "none";
     return;
   }
   section.style.display = "block";
   const now = Date.now();
   const sorted = sortAtRiskStreaks(entries, now);
   list.innerHTML = "";
+  let anyAcked = false;
   for (const entry of sorted) {
+    if (entry.acknowledged_at) anyAcked = true;
     const item = document.createElement("div");
     item.className = "at-risk-item" + (entry.acknowledged_at ? " acknowledged" : "");
     item.title = entry.acknowledged_at
@@ -246,9 +250,44 @@ async function renderAtRiskStreaks() {
     deadline.textContent = formatDeadline(entry, now);
     item.appendChild(deadline);
 
+    // Dismiss button. stopPropagation so the row's click handler doesn't
+    // also fire (which would open the URL the user is trying to dismiss).
+    const dismiss = document.createElement("button");
+    dismiss.className = "at-risk-dismiss";
+    dismiss.textContent = "×";
+    dismiss.title = `Dismiss ${entry.streamer} from this list`;
+    dismiss.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      dismissAtRiskStreak(entry.streamer);
+    });
+    item.appendChild(dismiss);
+
     item.addEventListener("click", () => openAtRiskStreak(entry));
     list.appendChild(item);
   }
+  if (clearAckedEl) {
+    clearAckedEl.style.display = anyAcked ? "block" : "none";
+  }
+}
+
+async function dismissAtRiskStreak(streamer) {
+  try {
+    await chrome.runtime.sendMessage({ type: "dismiss_streak", streamer });
+  } catch (_) {
+    // ignore — background may be napping; the storage write goes
+    // through regardless via the message handler waking the SW.
+  }
+  renderAtRiskStreaks();
+}
+
+async function clearAcknowledgedStreaks() {
+  try {
+    await chrome.runtime.sendMessage({ type: "clear_acknowledged_streaks" });
+  } catch (_) {
+    // ignore
+  }
+  renderAtRiskStreaks();
 }
 
 async function openAtRiskStreak(entry) {
@@ -291,6 +330,11 @@ document.getElementById("credit-link").addEventListener("click", (e) => {
   e.preventDefault();
   chrome.tabs.create({ url: "http://127.0.0.1:52832/about" });
   window.close();
+});
+
+document.getElementById("at-risk-clear-acked-link").addEventListener("click", (e) => {
+  e.preventDefault();
+  clearAcknowledgedStreaks();
 });
 
 refreshAll();
