@@ -729,10 +729,153 @@
     }
   }
 
+  // -----------------------------------------------------------------------
+  // Bell surveillance — Twitch only renders notification cards into the DOM
+  // when the bell dropdown is open. On hidden tabs (visibilityState ===
+  // "hidden"), we programmatically click the bell to surface the cards,
+  // run the existing scanner, then click again to close. This catches
+  // streak warnings without requiring the user to ever open the bell
+  // themselves. Foreground tabs are never auto-clicked — the user would
+  // see the dropdown flicker, and they can open it themselves.
+  // -----------------------------------------------------------------------
+
+  const BELL_AUTO_CLICK_MIN_INTERVAL_MS = 60 * 1000;
+  const BELL_OPEN_RENDER_DELAY_MS = 2000;
+  let _lastBellAutoClickAt = 0;
+  let _lastBellBadgeCount = null;
+
+  function findBellButton() {
+    // Twitch's data-a-target is the most stable selector. Fall back to a
+    // generic aria-label match if the attribute changes.
+    return document.querySelector(
+      '[data-a-target="onsite-notifications-toggle__button"], ' +
+      '[data-a-target="onsite-notifications-toggle"], ' +
+      'button[aria-label*="otification" i]'
+    );
+  }
+
+  function parseBellBadgeCount(bellEl) {
+    if (!bellEl) return null;
+    // Aria-label commonly reads "Notifications: 3 unread" or
+    // "3 unread Notifications" depending on locale. Both end up matching
+    // the same digit-before-"unread" pattern.
+    const label = bellEl.getAttribute("aria-label") || "";
+    const m = label.match(/(\d+)\s*unread/i);
+    if (m) return parseInt(m[1], 10);
+    // Some builds render a small numeric badge as a child span instead
+    // of (or in addition to) the aria-label.
+    for (const child of bellEl.querySelectorAll("span, div")) {
+      const t = (child.textContent || "").trim();
+      if (/^\d{1,3}$/.test(t)) return parseInt(t, 10);
+    }
+    return 0;
+  }
+
+  function getBellBadgeCount() {
+    return parseBellBadgeCount(findBellButton());
+  }
+
+  function isBellDropdownOpen() {
+    // The dropdown lives in a portaled overlay. Twitch labels it with
+    // role=dialog and an aria-label that mentions notifications. We also
+    // accept the data-a-target attribute if it's present.
+    return !!document.querySelector(
+      '[data-a-target="onsite-notifications-popover"], ' +
+      '[role="dialog"][aria-label*="otification" i]'
+    );
+  }
+
+  async function maybeAutoOpenBell() {
+    if (document.visibilityState !== "hidden") return;
+    const now = Date.now();
+    if (now - _lastBellAutoClickAt < BELL_AUTO_CLICK_MIN_INTERVAL_MS) return;
+    const bell = findBellButton();
+    if (!bell) return;
+    const count = parseBellBadgeCount(bell);
+    if (!count || count <= 0) {
+      // Nothing unread, nothing to surface. Update baseline so the next
+      // real increase fires a click.
+      _lastBellBadgeCount = count || 0;
+      return;
+    }
+    _lastBellAutoClickAt = now;
+    const alreadyOpen = isBellDropdownOpen();
+    try {
+      if (!alreadyOpen) bell.click();
+      await new Promise((r) => setTimeout(r, BELL_OPEN_RENDER_DELAY_MS));
+      scanAndReport();
+      // Close the dropdown only if we opened it ourselves. If the user
+      // had it open before tabbing away we leave it alone.
+      if (!alreadyOpen && isBellDropdownOpen()) {
+        bell.click();
+      }
+      _lastBellBadgeCount = parseBellBadgeCount(findBellButton()) || 0;
+      console.log(
+        LOG_PREFIX,
+        `Bell auto-surveillance fired (${count} unread before, ${_lastBellBadgeCount} after)`
+      );
+    } catch (e) {
+      console.warn(LOG_PREFIX, "Bell auto-click failed:", e && e.message);
+    }
+  }
+
+  function startBellSurveillance() {
+    // Establish a baseline once the bell exists, then fire if the tab is
+    // already hidden with unread notifications waiting (catches the case
+    // where Stream Monitor opens a stream tab in the background and the
+    // user never sees the bell at all).
+    const baseline = () => {
+      const bell = findBellButton();
+      if (!bell) {
+        setTimeout(baseline, 5000);
+        return;
+      }
+      _lastBellBadgeCount = parseBellBadgeCount(bell) || 0;
+      if (document.visibilityState === "hidden" && _lastBellBadgeCount > 0) {
+        maybeAutoOpenBell();
+      }
+      attachBellBadgeObserver(bell);
+    };
+    setTimeout(baseline, 10000);
+
+    // Periodic backstop: every minute, retry on hidden tabs. The internal
+    // throttle inside maybeAutoOpenBell prevents this from spamming.
+    setInterval(maybeAutoOpenBell, 60 * 1000);
+
+    // React the moment the tab transitions to hidden. Most often, the
+    // user has just alt-tabbed away from a Twitch stream and any unread
+    // notifications can now be surfaced silently.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        setTimeout(maybeAutoOpenBell, 3000);
+      }
+    });
+  }
+
+  function attachBellBadgeObserver(bell) {
+    if (typeof MutationObserver !== "function") return;
+    const obs = new MutationObserver(() => {
+      const count = parseBellBadgeCount(bell);
+      if (count === null) return;
+      if (_lastBellBadgeCount !== null && count > _lastBellBadgeCount) {
+        // Badge bumped, almost always a new notification arrived via WS.
+        maybeAutoOpenBell();
+      }
+      _lastBellBadgeCount = count;
+    });
+    obs.observe(bell, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["aria-label"],
+    });
+  }
+
   // Expose parser for jsdom tests when running outside the browser. Guarded
   // so production browser execution is unaffected.
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { parseStreakText };
+    module.exports = { parseStreakText, parseBellBadgeCount };
   }
 
   // -----------------------------------------------------------------------
@@ -742,4 +885,5 @@
   console.log(LOG_PREFIX, "Content script loaded on", window.location.href);
   startErrorChecking();
   startStreakMonitor();
+  startBellSurveillance();
 })();
