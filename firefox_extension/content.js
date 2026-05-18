@@ -539,9 +539,130 @@
   });
 
   // -----------------------------------------------------------------------
+  // Streak monitor — detect Twitch's "your N-stream streak on X broke /
+  // ends in Yh" notifications anywhere on the page (bell dropdown, the
+  // notifications panel, the inventory page) and relay them to the desktop
+  // app so it can log + notify the user. Twitch exposes no public API for
+  // viewing streaks, so we DOM-scrape with text-based regexes that don't
+  // depend on Twitch's React class names.
+  // -----------------------------------------------------------------------
+
+  const STREAK_BROKE_RE =
+    /Your\s+(\d+)[- ](?:stream|live)\s+streak\s+on\s+([^\s!.,]+)\s+broke/i;
+  const STREAK_IN_DANGER_RE =
+    /Your\s+(\d+)[- ](?:stream|live)\s+streak\s+on\s+([^\s!.,]+)\s+(?:ends|expires)\s+in\s+(\d+)\s*(h|hours?|d|days?|m|mins?|minutes?)/i;
+
+  function parseStreakText(text) {
+    if (!text || text.length > 600) return null;
+    let m = STREAK_BROKE_RE.exec(text);
+    if (m) {
+      return {
+        status: "broke",
+        streamer: m[2].toLowerCase(),
+        count: parseInt(m[1], 10),
+        deadline_hours: 24,
+      };
+    }
+    m = STREAK_IN_DANGER_RE.exec(text);
+    if (m) {
+      const n = parseInt(m[3], 10);
+      const unit = m[4].toLowerCase();
+      let hours = n;
+      if (unit.startsWith("d")) hours = n * 24;
+      else if (unit.startsWith("m")) hours = Math.max(1, Math.round(n / 60));
+      return {
+        status: "in_danger",
+        streamer: m[2].toLowerCase(),
+        count: parseInt(m[1], 10),
+        deadline_hours: hours,
+      };
+    }
+    return null;
+  }
+
+  const _seenStreakEvents = new Set();
+
+  function _streakKey(ev) {
+    return `${ev.status}:${ev.streamer}:${ev.count}`;
+  }
+
+  function scanForStreakEvents() {
+    const candidates = document.body
+      ? document.body.querySelectorAll("a, p, span, div, article, li")
+      : [];
+    const found = [];
+    for (const el of candidates) {
+      if (el.children.length > 4) continue;
+      const text = (el.textContent || "").trim();
+      if (text.length < 12 || !/streak/i.test(text)) continue;
+      const ev = parseStreakText(text);
+      if (ev) {
+        const link = el.tagName === "A" ? el : el.querySelector("a[href^='/']");
+        if (link) {
+          const slug = (link.getAttribute("href") || "").replace(/^\/+/, "").split(/[/?#]/)[0];
+          if (slug && /^[a-z0-9_]+$/i.test(slug)) ev.streamer = slug.toLowerCase();
+        }
+        found.push(ev);
+      }
+    }
+    return found;
+  }
+
+  function reportStreakEvent(ev) {
+    const key = _streakKey(ev);
+    if (_seenStreakEvents.has(key)) return;
+    _seenStreakEvents.add(key);
+    try {
+      browser.runtime.sendMessage({
+        type: "streak_event",
+        event: {
+          ...ev,
+          detected_at: new Date().toISOString(),
+          page_url: window.location.href,
+        },
+      }).catch(() => {});
+      console.log(LOG_PREFIX, "Streak event reported:", key);
+    } catch (e) {
+      console.warn(LOG_PREFIX, "Failed to report streak event:", e && e.message);
+    }
+  }
+
+  function scanAndReport() {
+    try {
+      for (const ev of scanForStreakEvents()) reportStreakEvent(ev);
+    } catch (e) {
+      console.warn(LOG_PREFIX, "Streak scan failed:", e && e.message);
+    }
+  }
+
+  let _streakScanTimer = null;
+  function startStreakMonitor() {
+    if (_streakScanTimer) return;
+    setTimeout(scanAndReport, 5000);
+    _streakScanTimer = setInterval(scanAndReport, 60000);
+
+    if (typeof MutationObserver === "function" && document.body) {
+      const obs = new MutationObserver(() => {
+        if (obs._pending) return;
+        obs._pending = true;
+        setTimeout(() => {
+          obs._pending = false;
+          scanAndReport();
+        }, 2000);
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+    }
+  }
+
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = { parseStreakText };
+  }
+
+  // -----------------------------------------------------------------------
   // Init — start error checking immediately, playback control on command
   // -----------------------------------------------------------------------
 
   console.log(LOG_PREFIX, "Content script loaded on", window.location.href);
   startErrorChecking();
+  startStreakMonitor();
 })();

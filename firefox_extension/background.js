@@ -421,8 +421,47 @@ browser.runtime.onMessage.addListener((message, sender) => {
     handleTabError(sender.tab.id);
   } else if (message.action === "reloadTab" && sender.tab) {
     reloadTrackedTab(sender.tab.id);
+  } else if (message.type === "streak_event" && message.event) {
+    forwardStreakEvent(message.event);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Streak event relay — POST to desktop's /streak_event so it can log and
+// raise a tray notification. Best-effort: if the desktop app is not
+// running the post will fail silently, which is the same behavior as the
+// /config fetch on startup.
+// ---------------------------------------------------------------------------
+
+const STREAK_EVENT_URL = "http://127.0.0.1:52832/streak_event";
+
+async function forwardStreakEvent(event) {
+  try {
+    const hasPerm = await browser.permissions.contains({
+      origins: ["http://127.0.0.1/*"],
+    });
+    if (!hasPerm) {
+      await log("info", "Streak event detected but host permission not granted; skipping");
+      return;
+    }
+    const resp = await fetch(STREAK_EVENT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) {
+      await log("warn", `Streak event POST returned HTTP ${resp.status}`);
+    } else {
+      await log(
+        "info",
+        `Streak event reported: ${event.status} on ${event.streamer} (count=${event.count})`
+      );
+    }
+  } catch (e) {
+    await log("info", "Streak event POST failed (desktop app likely not running):", e.message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Reload tracked tab — preserves sm=1 and re-activates player after load

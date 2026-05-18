@@ -15,7 +15,7 @@ from tkinter import ttk, messagebox
 
 import requests
 
-VERSION = "1.5.9"
+VERSION = "1.6.0"
 
 # Configuration
 APP_NAME = "StreamMonitor"
