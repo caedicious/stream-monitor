@@ -586,6 +586,36 @@
     return `${ev.status}:${ev.streamer}:${ev.count}`;
   }
 
+  function parseTimeAgoSeconds(text) {
+    if (!text) return null;
+    if (/just\s*now/i.test(text)) return 0;
+    const m = text.match(
+      /(\d+)\s*(seconds?|secs?|s\b|minutes?|mins?|m\b|hours?|hrs?|h\b|days?|d\b|weeks?|w\b|months?|mo\b|years?|y\b)\s*ago/i
+    );
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    const unit = m[2].toLowerCase();
+    if (/^s(ec|$)/.test(unit)) return n;
+    if (/^m(in|$)/.test(unit)) return n * 60;
+    if (/^h(our|r|$)/.test(unit)) return n * 3600;
+    if (/^d(ay|$)/.test(unit)) return n * 86400;
+    if (/^w(eek|$)/.test(unit)) return n * 604800;
+    if (/^mo(nth)?$/.test(unit)) return n * 2592000;
+    if (/^y(ear|$)/.test(unit)) return n * 31536000;
+    return null;
+  }
+
+  function getCardAgeSeconds(streakEl) {
+    let node = streakEl;
+    for (let i = 0; i < 8 && node; i++) {
+      const text = (node.textContent || "").slice(0, 1500);
+      const age = parseTimeAgoSeconds(text);
+      if (age !== null) return age;
+      node = node.parentElement;
+    }
+    return null;
+  }
+
   function scanForStreakEvents() {
     const candidates = document.body
       ? document.body.querySelectorAll("a, p, span, div, article, li")
@@ -597,6 +627,12 @@
       if (text.length < 12 || !/streak/i.test(text)) continue;
       const ev = parseStreakText(text);
       if (ev) {
+        // Skip stale notification cards. Twitch keeps old "your N-stream
+        // streak broke" cards around in the bell inbox indefinitely.
+        const ageSec = getCardAgeSeconds(el);
+        if (ageSec !== null && ageSec > 24 * 3600) {
+          continue;
+        }
         const link =
           el.tagName === "A"
             ? el
