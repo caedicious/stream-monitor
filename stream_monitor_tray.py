@@ -43,7 +43,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.5.9"
+VERSION = "1.6.0"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -113,6 +113,86 @@ def log_activity(event: str, **fields):
                 f.write(line)
     except Exception as e:
         log.warning("Failed to write activity log: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Streak events — incoming from the browser extension via POST /streak_event
+# ---------------------------------------------------------------------------
+
+# Module-level notifier set by StreamMonitorApp at startup. Allows the HTTP
+# handler (a separate class with no app reference) to raise tray
+# notifications without needing dependency injection through every layer.
+_tray_notifier: Optional[Callable[[str, str], None]] = None
+
+# Per-streak dedup keyed by (status, streamer, count) so a refresh of the
+# notifications page doesn't re-notify the same broken streak twice. Reset
+# on app restart, which is fine: the activity log persists across restarts
+# so the user still has a record.
+_streak_event_seen: set = set()
+_streak_event_lock = threading.Lock()
+
+
+def set_tray_notifier(fn: Callable[[str, str], None]) -> None:
+    """Register the callable used to raise tray notifications."""
+    global _tray_notifier
+    _tray_notifier = fn
+
+
+def _format_streak_message(event: dict) -> tuple:
+    streamer = event.get("streamer", "unknown")
+    count = event.get("count", 0)
+    if event.get("status") == "broke":
+        title = f"{streamer}: {count}-stream streak broke"
+        msg = f"Watch a clip, VOD or stream within 24h to save it."
+    else:
+        hours = event.get("deadline_hours", "?")
+        title = f"{streamer}: {count}-stream streak in danger"
+        msg = f"Ends in ~{hours}h. Watch to keep the streak alive."
+    return title, msg
+
+
+def handle_streak_event(payload: dict) -> None:
+    """Validate, dedup, log, and notify on an incoming streak event."""
+    if not isinstance(payload, dict):
+        raise ValueError("payload not a dict")
+    status = payload.get("status")
+    if status not in ("broke", "in_danger"):
+        raise ValueError(f"unknown status: {status!r}")
+    streamer = payload.get("streamer")
+    if not isinstance(streamer, str) or not streamer:
+        raise ValueError("missing streamer")
+    count = payload.get("count")
+    if not isinstance(count, int) or count < 0 or count > 100000:
+        raise ValueError(f"bad count: {count!r}")
+    deadline_hours = payload.get("deadline_hours")
+    if deadline_hours is not None and (
+        not isinstance(deadline_hours, int) or deadline_hours < 0 or deadline_hours > 24 * 365
+    ):
+        raise ValueError(f"bad deadline_hours: {deadline_hours!r}")
+
+    key = (status, streamer.lower(), int(count))
+    with _streak_event_lock:
+        if key in _streak_event_seen:
+            log.debug("Streak event %s already seen this session, skipping", key)
+            return
+        _streak_event_seen.add(key)
+
+    event_name = "streak_broke" if status == "broke" else "streak_in_danger"
+    log_activity(
+        event_name,
+        streamer=streamer.lower(),
+        count=int(count),
+        deadline_hours=int(deadline_hours) if deadline_hours is not None else None,
+        detected_at=payload.get("detected_at"),
+        page_url=payload.get("page_url"),
+    )
+    title, msg = _format_streak_message(payload)
+    log.info("Streak event: %s - %s", title, msg)
+    if _tray_notifier:
+        try:
+            _tray_notifier(title, msg)
+        except Exception as e:
+            log.warning("Tray notifier raised on streak event: %s", e)
 
 
 def read_activity_log(limit: Optional[int] = None) -> list:
@@ -269,14 +349,54 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
     
+    def do_POST(self):
+        """Handle inbound events from the browser extension.
+
+        Currently the only POST endpoint is /streak_event, which the
+        extension calls when it detects a Twitch "your N-stream streak on
+        X broke / ends in Yh" notification card in the page DOM. Twitch
+        does not expose a public API for viewing streaks, so the
+        extension scrapes them from the bell-dropdown / notifications
+        page and relays the result here.
+        """
+        if self.path == "/streak_event":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length <= 0 or length > 8192:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"missing or oversize body")
+                return
+            try:
+                raw = self.rfile.read(length).decode("utf-8")
+                payload = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(f"invalid JSON: {e}".encode("utf-8"))
+                return
+            try:
+                handle_streak_event(payload)
+            except Exception as e:
+                log.warning("Streak event handler raised: %s", e)
+                self.send_response(500)
+                self.end_headers()
+                return
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
     def do_OPTIONS(self):
         """Handle CORS preflight."""
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
-    
+
     def log_message(self, format, *args):
         """Suppress logging."""
         pass
@@ -1128,6 +1248,10 @@ class StreamMonitorApp:
 
         # Create monitor with notification callback
         self.monitor = TwitchMonitor(self.config, self.update_status, self.send_notification)
+
+        # Allow the HTTP handler (POST /streak_event) to raise tray
+        # notifications without holding a direct reference to the app.
+        set_tray_notifier(self.send_notification)
 
         # Create system tray icon
         self.icon = pystray.Icon(
