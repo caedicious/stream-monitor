@@ -654,8 +654,126 @@
     }
   }
 
+  // -----------------------------------------------------------------------
+  // Bell surveillance — Twitch only renders notification cards into the DOM
+  // when the bell dropdown is open. On hidden tabs (visibilityState ===
+  // "hidden"), we programmatically click the bell to surface the cards,
+  // run the existing scanner, then click again to close. This catches
+  // streak warnings without requiring the user to ever open the bell
+  // themselves. Foreground tabs are never auto-clicked.
+  // -----------------------------------------------------------------------
+
+  const BELL_AUTO_CLICK_MIN_INTERVAL_MS = 60 * 1000;
+  const BELL_OPEN_RENDER_DELAY_MS = 2000;
+  let _lastBellAutoClickAt = 0;
+  let _lastBellBadgeCount = null;
+
+  function findBellButton() {
+    return document.querySelector(
+      '[data-a-target="onsite-notifications-toggle__button"], ' +
+      '[data-a-target="onsite-notifications-toggle"], ' +
+      'button[aria-label*="otification" i]'
+    );
+  }
+
+  function parseBellBadgeCount(bellEl) {
+    if (!bellEl) return null;
+    const label = bellEl.getAttribute("aria-label") || "";
+    const m = label.match(/(\d+)\s*unread/i);
+    if (m) return parseInt(m[1], 10);
+    for (const child of bellEl.querySelectorAll("span, div")) {
+      const t = (child.textContent || "").trim();
+      if (/^\d{1,3}$/.test(t)) return parseInt(t, 10);
+    }
+    return 0;
+  }
+
+  function getBellBadgeCount() {
+    return parseBellBadgeCount(findBellButton());
+  }
+
+  function isBellDropdownOpen() {
+    return !!document.querySelector(
+      '[data-a-target="onsite-notifications-popover"], ' +
+      '[role="dialog"][aria-label*="otification" i]'
+    );
+  }
+
+  async function maybeAutoOpenBell() {
+    if (document.visibilityState !== "hidden") return;
+    const now = Date.now();
+    if (now - _lastBellAutoClickAt < BELL_AUTO_CLICK_MIN_INTERVAL_MS) return;
+    const bell = findBellButton();
+    if (!bell) return;
+    const count = parseBellBadgeCount(bell);
+    if (!count || count <= 0) {
+      _lastBellBadgeCount = count || 0;
+      return;
+    }
+    _lastBellAutoClickAt = now;
+    const alreadyOpen = isBellDropdownOpen();
+    try {
+      if (!alreadyOpen) bell.click();
+      await new Promise((r) => setTimeout(r, BELL_OPEN_RENDER_DELAY_MS));
+      scanAndReport();
+      if (!alreadyOpen && isBellDropdownOpen()) {
+        bell.click();
+      }
+      _lastBellBadgeCount = parseBellBadgeCount(findBellButton()) || 0;
+      console.log(
+        LOG_PREFIX,
+        `Bell auto-surveillance fired (${count} unread before, ${_lastBellBadgeCount} after)`
+      );
+    } catch (e) {
+      console.warn(LOG_PREFIX, "Bell auto-click failed:", e && e.message);
+    }
+  }
+
+  function startBellSurveillance() {
+    const baseline = () => {
+      const bell = findBellButton();
+      if (!bell) {
+        setTimeout(baseline, 5000);
+        return;
+      }
+      _lastBellBadgeCount = parseBellBadgeCount(bell) || 0;
+      if (document.visibilityState === "hidden" && _lastBellBadgeCount > 0) {
+        maybeAutoOpenBell();
+      }
+      attachBellBadgeObserver(bell);
+    };
+    setTimeout(baseline, 10000);
+
+    setInterval(maybeAutoOpenBell, 60 * 1000);
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        setTimeout(maybeAutoOpenBell, 3000);
+      }
+    });
+  }
+
+  function attachBellBadgeObserver(bell) {
+    if (typeof MutationObserver !== "function") return;
+    const obs = new MutationObserver(() => {
+      const count = parseBellBadgeCount(bell);
+      if (count === null) return;
+      if (_lastBellBadgeCount !== null && count > _lastBellBadgeCount) {
+        maybeAutoOpenBell();
+      }
+      _lastBellBadgeCount = count;
+    });
+    obs.observe(bell, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["aria-label"],
+    });
+  }
+
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { parseStreakText };
+    module.exports = { parseStreakText, parseBellBadgeCount };
   }
 
   // -----------------------------------------------------------------------
@@ -665,4 +783,5 @@
   console.log(LOG_PREFIX, "Content script loaded on", window.location.href);
   startErrorChecking();
   startStreakMonitor();
+  startBellSurveillance();
 })();
