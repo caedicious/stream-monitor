@@ -426,7 +426,13 @@ browser.runtime.onMessage.addListener((message, sender) => {
     persistAtRiskStreak(message.event);
   } else if (message.type === "ack_streak" && message.streamer) {
     acknowledgeAtRiskStreak(message.streamer).then(() => sendResponse({ ok: true }));
-    return true; // async response
+    return true;
+  } else if (message.type === "dismiss_streak" && message.streamer) {
+    dismissAtRiskStreak(message.streamer).then(() => sendResponse({ ok: true }));
+    return true;
+  } else if (message.type === "clear_acknowledged_streaks") {
+    clearAcknowledgedStreaks().then(() => sendResponse({ ok: true }));
+    return true;
   }
 });
 
@@ -536,6 +542,31 @@ async function acknowledgeAtRiskStreak(streamer) {
   map[key].acknowledged_at = new Date().toISOString();
   await saveAtRiskStreaks(map);
   await refreshStreakBadge(map);
+}
+
+async function dismissAtRiskStreak(streamer) {
+  if (!streamer) return;
+  const key = streamer.toLowerCase();
+  const map = await loadAtRiskStreaks();
+  if (!map[key]) return;
+  delete map[key];
+  await saveAtRiskStreaks(map);
+  await refreshStreakBadge(map);
+}
+
+async function clearAcknowledgedStreaks() {
+  const map = await loadAtRiskStreaks();
+  let changed = false;
+  for (const key of Object.keys(map)) {
+    if (map[key].acknowledged_at) {
+      delete map[key];
+      changed = true;
+    }
+  }
+  if (changed) {
+    await saveAtRiskStreaks(map);
+    await refreshStreakBadge(map);
+  }
 }
 
 async function refreshStreakBadge(mapOpt) {
