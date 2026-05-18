@@ -156,7 +156,120 @@ async function loadDebugInfo() {
   }
 }
 
+// --- At-risk streaks ---
+//
+// Sort order:
+//   1. Unacknowledged BROKE first (sorted by detected_at ascending so the
+//      oldest is highest — least save-window remaining).
+//   2. Unacknowledged IN_DANGER next (sorted by remaining deadline ascending
+//      so the most urgent is highest).
+//   3. Acknowledged entries last (they stay visible so the user can re-open
+//      the save URL if they want, but greyed out).
+function sortAtRiskStreaks(entries, now) {
+  // Three priority tiers, smaller score = higher in the list:
+  //   BROKE (unacked)     : score = detected_at ms (range ~1.7e12 in 2026)
+  //   IN_DANGER (unacked) : score = 2e15 + ms-remaining (always > any broke)
+  //   acknowledged        : score = 3e15 (sinks to the bottom)
+  const score = (e) => {
+    if (e.acknowledged_at) return 3e15;
+    if (e.status === "broke") {
+      // Earlier detection -> higher priority (least save-window remaining).
+      return Date.parse(e.detected_at) || 0;
+    }
+    const detected = Date.parse(e.detected_at) || 0;
+    const deadlineMs = detected + (e.deadline_hours || 24) * 3600 * 1000;
+    return 2e15 + Math.max(0, deadlineMs - now);
+  };
+  return entries.slice().sort((a, b) => score(a) - score(b));
+}
+
+function formatDeadline(entry, now) {
+  if (entry.status === "broke") {
+    // Save window: 24h from detected_at
+    const detected = Date.parse(entry.detected_at) || now;
+    const hoursLeft = Math.max(
+      0,
+      Math.round((detected + 24 * 3600 * 1000 - now) / (3600 * 1000))
+    );
+    return hoursLeft > 0 ? `${hoursLeft}h to save` : "expired";
+  }
+  // in_danger: deadline = detected_at + deadline_hours
+  const detected = Date.parse(entry.detected_at) || now;
+  const hoursLeft = Math.max(
+    0,
+    Math.round(
+      (detected + (entry.deadline_hours || 24) * 3600 * 1000 - now) /
+        (3600 * 1000)
+    )
+  );
+  return hoursLeft > 0 ? `${hoursLeft}h left` : "expiring";
+}
+
+async function loadAtRiskStreaks() {
+  const r = await chrome.storage.local.get("atRiskStreaks");
+  return r.atRiskStreaks || {};
+}
+
+async function renderAtRiskStreaks() {
+  const map = await loadAtRiskStreaks();
+  const section = document.getElementById("at-risk-section");
+  const list = document.getElementById("at-risk-list");
+  const entries = Object.values(map);
+  if (entries.length === 0) {
+    section.style.display = "none";
+    list.innerHTML = "";
+    return;
+  }
+  section.style.display = "block";
+  const now = Date.now();
+  const sorted = sortAtRiskStreaks(entries, now);
+  list.innerHTML = "";
+  for (const entry of sorted) {
+    const item = document.createElement("div");
+    item.className = "at-risk-item" + (entry.acknowledged_at ? " acknowledged" : "");
+    item.title = entry.acknowledged_at
+      ? `Re-open ${entry.streamer} in a new tab`
+      : `Open ${entry.streamer} and acknowledge the streak alert`;
+
+    const name = document.createElement("span");
+    name.className = "at-risk-name";
+    name.textContent = `${entry.streamer} (${entry.count})`;
+    item.appendChild(name);
+
+    const status = document.createElement("span");
+    status.className = `at-risk-status ${entry.status}`;
+    status.textContent = entry.status === "broke" ? "BROKE" : "IN DANGER";
+    item.appendChild(status);
+
+    const deadline = document.createElement("span");
+    deadline.className = "at-risk-deadline";
+    deadline.textContent = formatDeadline(entry, now);
+    item.appendChild(deadline);
+
+    item.addEventListener("click", () => openAtRiskStreak(entry));
+    list.appendChild(item);
+  }
+}
+
+async function openAtRiskStreak(entry) {
+  const url = entry.save_url || `https://www.twitch.tv/${entry.streamer}`;
+  try {
+    await chrome.tabs.create({ url, active: true });
+  } catch (e) {
+    console.error("Failed to open at-risk streak URL:", e);
+  }
+  // Tell the background script to mark this one acknowledged. Don't await
+  // the response before closing the popup; the storage write is best-effort.
+  try {
+    chrome.runtime.sendMessage({ type: "ack_streak", streamer: entry.streamer });
+  } catch (_) {
+    // ignore
+  }
+  window.close();
+}
+
 function refreshAll() {
+  renderAtRiskStreaks();
   loadStreamerList();
   loadDebugInfo();
 }
