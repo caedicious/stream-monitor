@@ -663,41 +663,32 @@
       if (text.length < 12 || !/streak/i.test(text)) continue;
       const ev = parseStreakText(text);
       if (ev) {
-        // Try to capture the notification card's href so the popup
-        // "Streaks at Risk" row can deep-link to whatever Twitch
-        // points the user at (typically the streamer's channel, but
-        // sometimes a /save-streak/<slug> URL or similar). Also
-        // upgrade the streamer slug from the href when the parsed
-        // text version is fuzzy.
+        // Refine the streamer slug if a nearby anchor link gives us a
+        // cleaner version than the parsed text (handles display-name
+        // capitalization and the /save-streak/<slug> path pattern).
         const link =
           el.tagName === "A"
             ? el
             : el.querySelector("a[href^='/'], a[href^='https://www.twitch.tv/']");
         if (link) {
           const href = link.getAttribute("href") || "";
-          if (href) {
-            try {
-              ev.save_url = new URL(href, "https://www.twitch.tv/").toString();
-            } catch (_) {
-              // ignore
-            }
-          }
-          // Path slug fallback for the streamer login.
-          const path = href.replace(/^https?:\/\/[^/]+/i, "").replace(/^\/+/, "");
-          const slug = path.split(/[/?#]/)[0];
-          if (slug && /^[a-z0-9_]+$/i.test(slug) && slug !== "save-streak") {
-            ev.streamer = slug.toLowerCase();
-          } else if (slug === "save-streak") {
-            // /save-streak/<streamer> pattern; take the second segment.
-            const parts = path.split("/");
-            if (parts[1] && /^[a-z0-9_]+$/i.test(parts[1])) {
-              ev.streamer = parts[1].toLowerCase();
-            }
+          const path = href
+            .replace(/^https?:\/\/[^/]+/i, "")
+            .replace(/^\/+/, "")
+            .split(/[?#]/)[0];
+          const segments = path.split("/");
+          if (segments[0] === "save-streak" && segments[1] && /^[a-z0-9_]+$/i.test(segments[1])) {
+            ev.streamer = segments[1].toLowerCase();
+          } else if (segments[0] && /^[a-z0-9_]+$/i.test(segments[0])) {
+            ev.streamer = segments[0].toLowerCase();
           }
         }
-        if (!ev.save_url) {
-          ev.save_url = `https://www.twitch.tv/${ev.streamer}`;
-        }
+        // Twitch's notification-cards link to /save-streak/<streamer>,
+        // which lands the user on the streamer's channel with the
+        // "save your streak" UI surfaced. The pattern is stable enough
+        // that we always synthesize it from the slug rather than
+        // round-tripping whatever href the card happened to carry.
+        ev.save_url = `https://www.twitch.tv/save-streak/${ev.streamer}`;
         found.push(ev);
       }
     }
