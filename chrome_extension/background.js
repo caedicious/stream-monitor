@@ -608,16 +608,19 @@ chrome.runtime.onStartup.addListener(async () => {
   await pruneExpiredAtRiskStreaks();
   await refreshStreakBadge();
   await clearExtensionManagedSoundSettings();
+  await checkAndPersistSoundBlockedState();
 });
 chrome.runtime.onInstalled.addListener(async () => {
   await pruneExpiredAtRiskStreaks();
   await refreshStreakBadge();
   await clearExtensionManagedSoundSettings();
+  await checkAndPersistSoundBlockedState();
 });
 // Also prune + refresh once now, in case the SW just started in response
 // to a message and neither onStartup nor onInstalled fired.
 refreshStreakBadge().catch(() => {});
 clearExtensionManagedSoundSettings().catch(() => {});
+checkAndPersistSoundBlockedState().catch(() => {});
 
 // ---------------------------------------------------------------------------
 // Sound permission migration — v1.6.6 set an extension-managed Sound: Allow
@@ -657,6 +660,52 @@ async function clearExtensionManagedSoundSettings() {
       "Failed to clear chrome.contentSettings.sound:",
       e && e.message
     );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Effective Sound permission probe — checks what Chrome actually applies to
+// twitch.tv after the v1.6.7 cleanup. If the user has manually set Sound to
+// Block (their explicit choice, not anything we did), the extension's
+// tab-mute strategy degrades — Twitch audio is suppressed at the site
+// level, breaking the player + viewer-count behavior. We don't try to
+// override (lesson from v1.6.6) but we DO surface a popup warning so the
+// user knows the cure: flip it to Allow in chrome://settings.
+// ---------------------------------------------------------------------------
+
+async function checkAndPersistSoundBlockedState() {
+  if (!chrome.contentSettings || !chrome.contentSettings.sound) {
+    // Firefox or older Chrome — graceful no-op, clear any stale flag.
+    try {
+      await chrome.storage.local.set({ soundBlocked: false });
+    } catch (_) {}
+    return;
+  }
+  try {
+    const result = await chrome.contentSettings.sound.get({
+      primaryUrl: "https://www.twitch.tv/",
+    });
+    const blocked = result && result.setting === "block";
+    await chrome.storage.local.set({ soundBlocked: !!blocked });
+    if (blocked) {
+      await log(
+        "warn",
+        "twitch.tv Sound permission is Block — extension tab-mute will not behave normally. Popup will surface a warning."
+      );
+    } else {
+      await log(
+        "info",
+        `twitch.tv Sound permission is ${result && result.setting} (not blocked)`
+      );
+    }
+  } catch (e) {
+    await log(
+      "warn",
+      "Failed to probe twitch.tv Sound permission:",
+      e && e.message
+    );
+    // Don't change the persisted flag on probe failure; keep last-known
+    // state.
   }
 }
 

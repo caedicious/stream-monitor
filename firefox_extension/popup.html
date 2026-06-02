@@ -210,6 +210,32 @@
       color: #666;
       font-size: 10px;
     }
+    .sound-warning {
+      background: #3a1418;
+      border: 1px solid #dc3545;
+      border-radius: 4px;
+      padding: 8px 10px;
+      margin-bottom: 10px;
+      font-size: 11px;
+      color: #ffb3ba;
+      line-height: 1.4;
+    }
+    .sound-warning-title {
+      color: #dc3545;
+      font-weight: bold;
+      margin-bottom: 4px;
+      font-size: 12px;
+    }
+    .sound-warning a {
+      color: #6ec1ff;
+      font-size: 11px;
+    }
+    .sound-warning code {
+      background: rgba(255,255,255,0.06);
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 10px;
+    }
     .streamer-item {
       display: flex;
       align-items: center;
@@ -272,6 +298,18 @@
     <button id="clear">Clear Log</button>
     <a href="#" id="open-full">Open in full tab</a>
   </div>
+  <div id="sound-warning" class="sound-warning" style="display:none">
+    <div class="sound-warning-title">Twitch audio is blocked</div>
+    The browser's site-level Sound permission for <code>twitch.tv</code> is set to <b>Block</b>.
+    The extension's tab-mute strategy cannot work — Twitch's player runs in a degraded state
+    and viewer counting may not register.
+    <div style="margin-top:6px">
+      <b>Fix:</b> open Firefox's site preferences for twitch.tv (click the padlock icon in the URL
+      bar on any Twitch tab), set <b>Autoplay</b> to allow audio and video, then reload your
+      Twitch tabs.
+    </div>
+  </div>
+
   <div id="at-risk-section" style="display:none">
     <div class="section-title" style="color:#dc3545">— Streaks at Risk —</div>
     <div id="at-risk-list" class="at-risk-list"></div>

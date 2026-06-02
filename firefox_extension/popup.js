@@ -353,7 +353,18 @@ async function openAtRiskStreak(entry) {
   window.close();
 }
 
+async function renderSoundWarning() {
+  // browser.contentSettings doesn't exist in Firefox, so the background
+  // script never sets soundBlocked=true here. Hidden by default; future
+  // Firefox parity will populate this.
+  const { soundBlocked } = await browser.storage.local.get("soundBlocked");
+  const warningEl = document.getElementById("sound-warning");
+  if (!warningEl) return;
+  warningEl.style.display = soundBlocked ? "block" : "none";
+}
+
 function refreshAll() {
+  renderSoundWarning();
   renderAtRiskStreaks();
   loadStreamerList();
   loadDebugInfo();

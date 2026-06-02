@@ -381,7 +381,15 @@ async function openAtRiskStreak(entry) {
   window.close();
 }
 
+async function renderSoundWarning() {
+  const { soundBlocked } = await chrome.storage.local.get("soundBlocked");
+  const warningEl = document.getElementById("sound-warning");
+  if (!warningEl) return;
+  warningEl.style.display = soundBlocked ? "block" : "none";
+}
+
 function refreshAll() {
+  renderSoundWarning();
   renderAtRiskStreaks();
   loadStreamerList();
   loadDebugInfo();
@@ -409,6 +417,22 @@ document.getElementById("credit-link").addEventListener("click", (e) => {
 document.getElementById("at-risk-clear-acked-link").addEventListener("click", (e) => {
   e.preventDefault();
   clearAcknowledgedStreaks();
+});
+
+document.getElementById("sound-warning-link").addEventListener("click", (e) => {
+  e.preventDefault();
+  // Chrome supports the siteDetails deep-link, which lands the user on a
+  // page that shows every per-site permission for twitch.tv with the
+  // Sound dropdown immediately accessible. Falls back to the generic
+  // content/sound page if that URL isn't resolvable.
+  const url =
+    "chrome://settings/content/siteDetails?site=https%3A%2F%2Fwww.twitch.tv";
+  chrome.tabs.create({ url }, () => {
+    if (chrome.runtime.lastError) {
+      chrome.tabs.create({ url: "chrome://settings/content/sound" });
+    }
+  });
+  window.close();
 });
 
 refreshAll();
