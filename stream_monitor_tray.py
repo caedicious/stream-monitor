@@ -43,7 +43,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.6.4.1"
+VERSION = "1.6.5"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -520,6 +520,12 @@ class TwitchMonitor:
         self.notify_callback = notify_callback or (lambda t, m: None)
         self.live_streamers: list[str] = []  # Current live streamers for config server
         self.missed_while_paused: dict[str, str] = {}  # { streamer: went_live_time }
+        # VODs whose live-then-offline transition was detected while we were
+        # paused (manually OR auto-paused for "I'm live"). Held here until
+        # the pause lifts, at which point each queued VOD opens in a new
+        # browser tab so the user can catch up without it interrupting
+        # their own stream. Schema: { streamer: vod_url }.
+        self.queued_vods: dict[str, str] = {}
         self.user_ids: dict[str, str] = {}  # { username: user_id } cache
         self.consecutive_errors: int = 0  # Track consecutive API failures
         # Per-streamer metadata captured on the latest "live" check, used to
@@ -625,6 +631,10 @@ class TwitchMonitor:
                     self.status_callback("Resumed (you went offline)")
                     self.notify_callback("Stream Monitor", "You went offline, resuming monitoring!")
                     log_activity("auto_paused_ended", own_channel=own_channel)
+                    # Only flush queued VODs if no other pause keeps us paused
+                    # (manual `paused` toggle still suppresses).
+                    if not self.paused:
+                        self._flush_queued_vods(reason="auto_paused_ended")
 
             # Update live streamers list for config server
             self.live_streamers = [name for name in self.streamers if name in live_set]
@@ -684,12 +694,54 @@ class TwitchMonitor:
         """True if paused manually or auto-paused because user is live."""
         return self.paused or self.auto_paused
 
+    def _flush_queued_vods(self, reason: str = "unpause") -> int:
+        """Open every queued VOD and clear the queue. Returns the count opened.
+
+        Called when the pause that gated VOD-queueing lifts. Each VOD is
+        opened best-effort via webbrowser.open; failures are logged but
+        don't stop the rest of the queue from draining.
+        """
+        if not self.queued_vods:
+            return 0
+        items = list(self.queued_vods.items())
+        opened = 0
+        for streamer, vod_url in items:
+            try:
+                success = bool(webbrowser.open(vod_url))
+            except Exception as e:
+                log.error("webbrowser.open raised for queued VOD %s: %s", vod_url, e)
+                success = False
+            log_activity(
+                "tab_open_attempt",
+                kind="vod",
+                streamer=streamer,
+                url=vod_url,
+                success=success,
+                from_queue=True,
+                queue_reason=reason,
+            )
+            if success:
+                opened += 1
+        self.queued_vods.clear()
+        if opened:
+            log.info("Flushed %d queued VOD(s) (reason=%s)", opened, reason)
+            self.notify_callback(
+                "Stream Monitor",
+                f"Opening {opened} queued VOD(s)"
+                if opened > 1 else
+                f"Opening queued VOD for {items[0][0]}"
+            )
+        return opened
+
     def process_state_changes(self, current_status: dict[str, bool]):
         live_count = 0
         # Update config server with live status
         ConfigRequestHandler.config_data["live_streamers"] = self.live_streamers
         ConfigRequestHandler.config_data["paused"] = self.paused
         ConfigRequestHandler.config_data["auto_paused"] = self.auto_paused
+        # Surface the queue so the extension popup and any future UI can
+        # show which VODs are waiting for the pause to lift.
+        ConfigRequestHandler.config_data["queued_vods"] = dict(self.queued_vods)
 
         for username, is_live in current_status.items():
             state = self.streamers[username]
@@ -734,25 +786,48 @@ class TwitchMonitor:
                     self.status_callback(f"{username} went offline")
                     log_activity("stream_offline", streamer=username)
 
-                    # VOD fallback: if stream was missed, open the VOD
+                    # VOD fallback: if stream was missed, open the VOD —
+                    # UNLESS we're paused. Opening a VOD on top of the user's
+                    # own active stream is the same disruption that the
+                    # auto-pause feature exists to prevent for live tabs, so
+                    # we queue VODs while paused and flush them when the
+                    # pause lifts (see auto_paused transition handler above).
                     if not state.browser_opened and self.config.vod_fallback:
                         log.info("VOD fallback triggered for %s", username)
                         vod_url = self.get_latest_vod_url(username)
                         if vod_url:
-                            self.status_callback(f"Opening VOD for {username}")
-                            log.info("Opening VOD: %s", vod_url)
-                            try:
-                                vod_success = webbrowser.open(vod_url)
-                            except Exception as e:
-                                log.error("webbrowser.open raised for VOD %s: %s", vod_url, e)
-                                vod_success = False
-                            log_activity(
-                                "tab_open_attempt",
-                                kind="vod",
-                                streamer=username,
-                                url=vod_url,
-                                success=bool(vod_success),
-                            )
+                            if self.effectively_paused:
+                                self.queued_vods[username] = vod_url
+                                reason = "auto_paused" if self.auto_paused else "paused"
+                                log.info(
+                                    "VOD for %s queued (reason=%s, queue size now %d)",
+                                    username, reason, len(self.queued_vods),
+                                )
+                                log_activity(
+                                    "vod_queued",
+                                    streamer=username,
+                                    url=vod_url,
+                                    reason=reason,
+                                )
+                                self.notify_callback(
+                                    "Stream Monitor",
+                                    f"VOD for {username} queued — opens when you're no longer paused"
+                                )
+                            else:
+                                self.status_callback(f"Opening VOD for {username}")
+                                log.info("Opening VOD: %s", vod_url)
+                                try:
+                                    vod_success = webbrowser.open(vod_url)
+                                except Exception as e:
+                                    log.error("webbrowser.open raised for VOD %s: %s", vod_url, e)
+                                    vod_success = False
+                                log_activity(
+                                    "tab_open_attempt",
+                                    kind="vod",
+                                    streamer=username,
+                                    url=vod_url,
+                                    success=bool(vod_success),
+                                )
                         else:
                             log.info("No VOD found for %s", username)
 
@@ -1069,6 +1144,11 @@ class StreamMonitorApp:
             Item("Settings", self.on_settings),
             Item("Check for Updates", self.on_check_updates),
             pystray.Menu.SEPARATOR,
+            Item(
+                lambda item: f"Queued VODs ({len(self.monitor.queued_vods) if self.monitor else 0})",
+                pystray.Menu(lambda: tuple(self._iter_queued_vod_menu_items())),
+                visible=lambda item: bool(self.monitor and self.monitor.queued_vods),
+            ),
             Item("Start", self.on_start, checked=lambda item: self._is_running()),
             Item("Stop", self.on_stop, checked=lambda item: not self._is_running()),
             pystray.Menu.SEPARATOR,
@@ -1076,6 +1156,67 @@ class StreamMonitorApp:
             Item("About (CaedVT)", self.on_about),
             Item("Exit", self.on_exit)
         )
+
+    def _iter_queued_vod_menu_items(self):
+        """Yield one menu item per queued VOD, plus a separator and a clear-all
+        item at the bottom. pystray re-evaluates this every time the submenu
+        opens, so we always show the current queue state.
+        """
+        if not self.monitor or not self.monitor.queued_vods:
+            yield Item("(none queued)", None, enabled=False)
+            return
+        # Snapshot to avoid mutation during iteration if a flush fires.
+        for streamer, vod_url in list(self.monitor.queued_vods.items()):
+            yield Item(
+                f"Open {streamer}'s VOD",
+                # Bind streamer and url in default args; closure-over-loop-var
+                # would otherwise capture only the final pair.
+                lambda icon, item, s=streamer, u=vod_url: self._open_queued_vod_now(s, u),
+            )
+        yield pystray.Menu.SEPARATOR
+        yield Item("Clear all queued", self._clear_all_queued_vods)
+
+    def _open_queued_vod_now(self, streamer: str, vod_url: str):
+        """User clicked a queued-VOD row in the tray submenu — open it
+        immediately and remove from the queue."""
+        log.info("User manually opening queued VOD for %s from tray", streamer)
+        try:
+            success = bool(webbrowser.open(vod_url))
+        except Exception as e:
+            log.error("Failed to open queued VOD %s: %s", vod_url, e)
+            success = False
+        log_activity(
+            "tab_open_attempt",
+            kind="vod",
+            streamer=streamer,
+            url=vod_url,
+            success=success,
+            from_queue=True,
+            queue_reason="manual_tray",
+        )
+        if self.monitor:
+            self.monitor.queued_vods.pop(streamer, None)
+        if self.icon:
+            try:
+                self.icon.update_menu()
+            except Exception:
+                pass
+
+    def _clear_all_queued_vods(self, icon, item):
+        """User picked 'Clear all queued' — drop every entry without opening
+        anything."""
+        if not self.monitor:
+            return
+        count = len(self.monitor.queued_vods)
+        for streamer in list(self.monitor.queued_vods.keys()):
+            log_activity("vod_queue_cleared", streamer=streamer)
+        self.monitor.queued_vods.clear()
+        log.info("Cleared %d queued VOD(s) from tray", count)
+        if self.icon:
+            try:
+                self.icon.update_menu()
+            except Exception:
+                pass
     
     def _run_first_time_setup(self):
         """Show in-process first-time setup dialog. Returns True if config is now valid."""
