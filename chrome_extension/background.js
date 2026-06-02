@@ -598,14 +598,58 @@ async function refreshStreakBadge(mapOpt) {
 chrome.runtime.onStartup.addListener(async () => {
   await pruneExpiredAtRiskStreaks();
   await refreshStreakBadge();
+  await ensureTwitchSoundAllowed();
 });
 chrome.runtime.onInstalled.addListener(async () => {
   await pruneExpiredAtRiskStreaks();
   await refreshStreakBadge();
+  await ensureTwitchSoundAllowed();
 });
 // Also prune + refresh once now, in case the SW just started in response
 // to a message and neither onStartup nor onInstalled fired.
 refreshStreakBadge().catch(() => {});
+ensureTwitchSoundAllowed().catch(() => {});
+
+// ---------------------------------------------------------------------------
+// Sound permission — Chrome lets users set per-site Sound permission to
+// Block, which suppresses ALL audio for that site regardless of tab-mute
+// state. When twitch.tv is Block'd, Twitch's player either refuses to
+// start or runs in a degraded state, and the viewer doesn't get counted.
+// Our two-layer mute (player unmuted, tab muted) can't take effect.
+//
+// chrome.contentSettings.sound.set() flips the per-site setting back to
+// Allow on every startup, so the extension's tab-mute is what the user
+// experiences instead of an opaque site-level block. Idempotent; safe
+// to call repeatedly.
+//
+// Firefox does not expose browser.contentSettings — the call is guarded
+// so the rest of init doesn't blow up there.
+// ---------------------------------------------------------------------------
+
+async function ensureTwitchSoundAllowed() {
+  if (!chrome.contentSettings || !chrome.contentSettings.sound) {
+    await log(
+      "info",
+      "contentSettings.sound API unavailable (Firefox?), skipping site-Sound enforcement"
+    );
+    return false;
+  }
+  try {
+    await chrome.contentSettings.sound.set({
+      primaryPattern: "*://*.twitch.tv/*",
+      setting: "allow",
+    });
+    await log("info", "Site-level Sound permission set to allow for *.twitch.tv");
+    return true;
+  } catch (e) {
+    await log(
+      "warn",
+      "Failed to set chrome.contentSettings.sound for twitch.tv:",
+      e && e.message
+    );
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Reload tracked tab — preserves sm=1 and re-activates player after load
