@@ -221,6 +221,25 @@
     }
     .streamer-item.clickable { cursor: pointer; }
     .streamer-item.clickable:hover { background: #1f2a4a; }
+    .streamer-mute-toggle {
+      flex-shrink: 0;
+      background: transparent;
+      border: 0;
+      color: #888;
+      padding: 0 4px;
+      margin-left: auto;
+      font-size: 13px;
+      cursor: pointer;
+      line-height: 1;
+      border-radius: 3px;
+    }
+    .streamer-mute-toggle:hover {
+      color: #fff;
+      background: rgba(255, 255, 255, 0.12);
+    }
+    .streamer-mute-toggle.exempt {
+      color: #2ecc71;
+    }
     .status-dot {
       width: 8px;
       height: 8px;

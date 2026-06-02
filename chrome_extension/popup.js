@@ -84,9 +84,20 @@ loadSettings();
 
 // --- Streamer list with live status ---
 async function loadStreamerList() {
-  const result = await chrome.storage.local.get(["monitoredStreamers", "liveStreamers"]);
+  const result = await chrome.storage.local.get([
+    "monitoredStreamers",
+    "liveStreamers",
+    "muteExemptStreamers",
+    "autoMute",
+  ]);
   const monitoredStreamers = result.monitoredStreamers || [];
   const liveStreamers = result.liveStreamers || [];
+  const muteExempt = new Set(
+    (Array.isArray(result.muteExemptStreamers) ? result.muteExemptStreamers : []).map(s =>
+      String(s).toLowerCase()
+    )
+  );
+  const autoMute = !!result.autoMute;
 
   const listEl = document.getElementById("streamer-list");
   if (monitoredStreamers.length === 0) {
@@ -97,7 +108,9 @@ async function loadStreamerList() {
   const liveSet = new Set(liveStreamers.map(s => s.toLowerCase()));
   listEl.innerHTML = "";
   for (const streamer of monitoredStreamers) {
-    const isLive = liveSet.has(streamer.toLowerCase());
+    const slug = streamer.toLowerCase();
+    const isLive = liveSet.has(slug);
+    const isExempt = muteExempt.has(slug);
     const item = document.createElement("div");
     item.className = "streamer-item clickable";
     item.title = isLive
@@ -109,9 +122,70 @@ async function loadStreamerList() {
     const label = document.createElement("span");
     label.textContent = isLive ? `${streamer} (LIVE)` : streamer;
     item.appendChild(label);
-    item.addEventListener("click", () => openOrFocusStreamer(streamer.toLowerCase()));
+
+    // Per-streamer mute-exempt toggle. Speaker icon: filled = will be
+    // auto-muted (follows global setting); slashed = exempt (audio
+    // allowed even when global auto-mute is on). Only meaningful when
+    // global autoMute is on; we still show it when it's off so users
+    // can pre-mark streamers before turning auto-mute on.
+    const muteBtn = document.createElement("button");
+    muteBtn.className = "streamer-mute-toggle" + (isExempt ? " exempt" : "");
+    muteBtn.textContent = isExempt ? "\u{1F50A}" : "\u{1F507}"; // 🔊 vs 🔇
+    muteBtn.title = isExempt
+      ? `Currently EXEMPT from auto-mute. Click to mute ${streamer}'s tabs again.`
+      : autoMute
+        ? `Currently auto-muted. Click to exempt ${streamer} (audio allowed).`
+        : `Auto-mute is off globally. Click to mark ${streamer} as always-exempt.`;
+    muteBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      toggleMuteExemption(slug);
+    });
+    item.appendChild(muteBtn);
+
+    item.addEventListener("click", () => openOrFocusStreamer(slug));
     listEl.appendChild(item);
   }
+}
+
+async function toggleMuteExemption(streamer) {
+  const slug = streamer.toLowerCase();
+  const result = await chrome.storage.local.get("muteExemptStreamers");
+  const current = new Set(
+    (Array.isArray(result.muteExemptStreamers) ? result.muteExemptStreamers : []).map(s =>
+      String(s).toLowerCase()
+    )
+  );
+  const nowExempt = !current.has(slug);
+  if (nowExempt) {
+    current.add(slug);
+  } else {
+    current.delete(slug);
+  }
+  await chrome.storage.local.set({ muteExemptStreamers: Array.from(current) });
+
+  // Apply immediately to currently-open tabs for this streamer. Any tab
+  // whose URL matches /<slug>/ on twitch.tv gets unmuted (if newly
+  // exempt) or re-muted (if exemption was removed AND global autoMute
+  // is on).
+  try {
+    const autoMute = (await chrome.storage.local.get("autoMute")).autoMute || false;
+    const tabs = await chrome.tabs.query({ url: "*://*.twitch.tv/*" });
+    const match = new RegExp(`^https?://(?:www\\.)?twitch\\.tv/${slug}(?:[/?#]|$)`, "i");
+    for (const t of tabs) {
+      if (!t.url || !match.test(t.url)) continue;
+      if (nowExempt) {
+        await chrome.tabs.update(t.id, { muted: false });
+      } else if (autoMute) {
+        await chrome.tabs.update(t.id, { muted: true });
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to apply mute exemption to open tabs:", e);
+  }
+
+  // Re-render the list so the toggle reflects the new state.
+  await loadStreamerList();
 }
 
 // Click handler for the streamer list. Always opens a plain Twitch URL

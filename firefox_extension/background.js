@@ -325,13 +325,22 @@ async function executePendingExpiration(tabKey) {
   }
 }
 
-async function shouldAutoMute() {
-  const { autoMute = false } = await browser.storage.local.get("autoMute");
-  return autoMute;
+async function shouldAutoMute(streamer) {
+  const result = await browser.storage.local.get(["autoMute", "muteExemptStreamers"]);
+  if (!result.autoMute) return false;
+  if (streamer) {
+    const exempt = new Set(
+      (Array.isArray(result.muteExemptStreamers) ? result.muteExemptStreamers : []).map(s =>
+        String(s).toLowerCase()
+      )
+    );
+    if (exempt.has(streamer.toLowerCase())) return false;
+  }
+  return true;
 }
 
-async function muteTabIfEnabled(tabId) {
-  if (await shouldAutoMute()) {
+async function muteTabIfEnabled(tabId, streamer) {
+  if (await shouldAutoMute(streamer)) {
     await browser.tabs.update(tabId, { muted: true });
     return true;
   }
@@ -725,7 +734,7 @@ async function scanExistingTabs() {
     const streamer = getStreamerFromUrl(tab.url);
     if (streamer && monitoredStreamers.has(streamer) && isStreamMonitorTab(tab.url) && !trackedTabs[String(tab.id)]) {
       trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0, openedAt: Date.now() };
-      const muted = await muteTabIfEnabled(tab.id);
+      const muted = await muteTabIfEnabled(tab.id, streamer);
       activatePlayerControl(tab.id);
       await log("info", `Scan: tracking tab ${tab.id} for ${streamer}${muted ? " (muted)" : ""}`);
       changed = true;
@@ -749,7 +758,7 @@ async function onTabCreated(tab) {
   if (streamer && monitoredStreamers.has(streamer) && isStreamMonitorTab(tab.url)) {
     trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0, openedAt: Date.now() };
     await saveTrackedTabs(trackedTabs);
-    const muted = await muteTabIfEnabled(tab.id);
+    const muted = await muteTabIfEnabled(tab.id, streamer);
     const focused = await focusTabIfEnabled(tab);
     // Delay slightly so the page has time to load the video player
     setTimeout(() => activatePlayerControl(tab.id), 3000);
@@ -824,7 +833,7 @@ async function onTabUpdated(tabId, changeInfo, tab) {
     const now = Date.now();
     trackedTabs[tabKey] = { originalStreamer: newStreamer, raidHopCount: 0, openedAt: now };
     await saveTrackedTabs(trackedTabs);
-    const muted = await muteTabIfEnabled(tabId);
+    const muted = await muteTabIfEnabled(tabId, newStreamer);
     const focused = await focusTabIfEnabled(tab);
     setTimeout(() => activatePlayerControl(tabId), 3000);
     await log("info", `Tab ${tabId} navigated to monitored streamer: ${newStreamer}${muted ? " (muted)" : ""}${focused ? " (focused)" : ""}`);

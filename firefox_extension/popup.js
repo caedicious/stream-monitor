@@ -99,8 +99,17 @@ async function openOrFocusStreamer(name) {
 
 // --- Streamer list with live status ---
 async function loadStreamerList() {
-  const { monitoredStreamers = [], liveStreamers = [] } =
-    await browser.storage.local.get(["monitoredStreamers", "liveStreamers"]);
+  const {
+    monitoredStreamers = [],
+    liveStreamers = [],
+    muteExemptStreamers = [],
+    autoMute = false,
+  } = await browser.storage.local.get([
+    "monitoredStreamers",
+    "liveStreamers",
+    "muteExemptStreamers",
+    "autoMute",
+  ]);
 
   const listEl = document.getElementById("streamer-list");
   if (monitoredStreamers.length === 0) {
@@ -108,10 +117,17 @@ async function loadStreamerList() {
     return;
   }
 
+  const muteExempt = new Set(
+    (Array.isArray(muteExemptStreamers) ? muteExemptStreamers : []).map(s =>
+      String(s).toLowerCase()
+    )
+  );
   const liveSet = new Set(liveStreamers.map(s => s.toLowerCase()));
   listEl.innerHTML = "";
   for (const streamer of monitoredStreamers) {
-    const isLive = liveSet.has(streamer.toLowerCase());
+    const slug = streamer.toLowerCase();
+    const isLive = liveSet.has(slug);
+    const isExempt = muteExempt.has(slug);
     const item = document.createElement("div");
     item.className = "streamer-item clickable";
     item.title = isLive
@@ -123,9 +139,57 @@ async function loadStreamerList() {
     const label = document.createElement("span");
     label.textContent = isLive ? `${streamer} (LIVE)` : streamer;
     item.appendChild(label);
-    item.addEventListener("click", () => openOrFocusStreamer(streamer.toLowerCase()));
+
+    const muteBtn = document.createElement("button");
+    muteBtn.className = "streamer-mute-toggle" + (isExempt ? " exempt" : "");
+    muteBtn.textContent = isExempt ? "\u{1F50A}" : "\u{1F507}";
+    muteBtn.title = isExempt
+      ? `Currently EXEMPT from auto-mute. Click to mute ${streamer}'s tabs again.`
+      : autoMute
+        ? `Currently auto-muted. Click to exempt ${streamer} (audio allowed).`
+        : `Auto-mute is off globally. Click to mark ${streamer} as always-exempt.`;
+    muteBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      toggleMuteExemption(slug);
+    });
+    item.appendChild(muteBtn);
+
+    item.addEventListener("click", () => openOrFocusStreamer(slug));
     listEl.appendChild(item);
   }
+}
+
+async function toggleMuteExemption(streamer) {
+  const slug = streamer.toLowerCase();
+  const { muteExemptStreamers = [] } = await browser.storage.local.get("muteExemptStreamers");
+  const current = new Set(
+    (Array.isArray(muteExemptStreamers) ? muteExemptStreamers : []).map(s =>
+      String(s).toLowerCase()
+    )
+  );
+  const nowExempt = !current.has(slug);
+  if (nowExempt) current.add(slug);
+  else current.delete(slug);
+  await browser.storage.local.set({ muteExemptStreamers: Array.from(current) });
+
+  try {
+    const { autoMute = false } = await browser.storage.local.get("autoMute");
+    const tabs = await browser.tabs.query({ url: "*://*.twitch.tv/*" });
+    const match = new RegExp(`^https?://(?:www\\.)?twitch\\.tv/${slug}(?:[/?#]|$)`, "i");
+    for (const t of tabs) {
+      if (!t.url || !match.test(t.url)) continue;
+      if (nowExempt) {
+        await browser.tabs.update(t.id, { muted: false });
+      } else if (autoMute) {
+        await browser.tabs.update(t.id, { muted: true });
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to apply mute exemption to open tabs:", e);
+  }
+
+  await loadStreamerList();
 }
 
 // --- Debug info ---
