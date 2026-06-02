@@ -598,56 +598,56 @@ async function refreshStreakBadge(mapOpt) {
 chrome.runtime.onStartup.addListener(async () => {
   await pruneExpiredAtRiskStreaks();
   await refreshStreakBadge();
-  await ensureTwitchSoundAllowed();
+  await clearExtensionManagedSoundSettings();
 });
 chrome.runtime.onInstalled.addListener(async () => {
   await pruneExpiredAtRiskStreaks();
   await refreshStreakBadge();
-  await ensureTwitchSoundAllowed();
+  await clearExtensionManagedSoundSettings();
 });
 // Also prune + refresh once now, in case the SW just started in response
 // to a message and neither onStartup nor onInstalled fired.
 refreshStreakBadge().catch(() => {});
-ensureTwitchSoundAllowed().catch(() => {});
+clearExtensionManagedSoundSettings().catch(() => {});
 
 // ---------------------------------------------------------------------------
-// Sound permission — Chrome lets users set per-site Sound permission to
-// Block, which suppresses ALL audio for that site regardless of tab-mute
-// state. When twitch.tv is Block'd, Twitch's player either refuses to
-// start or runs in a degraded state, and the viewer doesn't get counted.
-// Our two-layer mute (player unmuted, tab muted) can't take effect.
+// Sound permission migration — v1.6.6 set an extension-managed Sound: Allow
+// rule for *.twitch.tv via chrome.contentSettings.sound.set(). That was
+// intended to override Sound: Block, but it backfired: Chrome's autoplay
+// enforcer treats extension-managed permissions as weaker than user-set
+// ones, and the result was that even user-set Allow got shadowed by the
+// extension-managed entry. Tabs ended up muted by the autoplay policy
+// regardless of what the user had configured, and the puzzle-piece icon
+// entry in chrome://settings/content/sound couldn't even be removed by
+// the user (Chrome enforces extension-managed rules).
 //
-// chrome.contentSettings.sound.set() flips the per-site setting back to
-// Allow on every startup, so the extension's tab-mute is what the user
-// experiences instead of an opaque site-level block. Idempotent; safe
-// to call repeatedly.
+// v1.6.7 reverses course: we call clear({}) on every startup, which
+// removes ANY extension-managed entries we (or any prior version) created.
+// Chrome falls back to user-set permissions, which the autoplay enforcer
+// fully trusts. If the user has Sound: Block manually, they need to flip
+// it to Allow themselves — the auto-fix attempt caused more problems than
+// the original Block ever did.
 //
-// Firefox does not expose browser.contentSettings — the call is guarded
-// so the rest of init doesn't blow up there.
+// Firefox does not expose browser.contentSettings — guarded so the rest
+// of init doesn't blow up.
 // ---------------------------------------------------------------------------
 
-async function ensureTwitchSoundAllowed() {
+async function clearExtensionManagedSoundSettings() {
   if (!chrome.contentSettings || !chrome.contentSettings.sound) {
-    await log(
-      "info",
-      "contentSettings.sound API unavailable (Firefox?), skipping site-Sound enforcement"
-    );
-    return false;
+    return;
   }
   try {
-    await chrome.contentSettings.sound.set({
-      primaryPattern: "*://*.twitch.tv/*",
-      setting: "allow",
-    });
-    await log("info", "Site-level Sound permission set to allow for *.twitch.tv");
-    return true;
+    await chrome.contentSettings.sound.clear({});
+    await log(
+      "info",
+      "Cleared extension-managed sound content settings (v1.6.6 -> v1.6.7 migration)"
+    );
   } catch (e) {
     await log(
       "warn",
-      "Failed to set chrome.contentSettings.sound for twitch.tv:",
+      "Failed to clear chrome.contentSettings.sound:",
       e && e.message
     );
-    return false;
   }
 }
 
