@@ -33,8 +33,14 @@ const PENDING_EXPIRE_ALARM_PREFIX = "pending-expire-";
 
 const IGNORED_PATHS = new Set([
   "directory", "videos", "settings", "subscriptions",
-  "inventory", "drops", "wallet",
+  "inventory", "drops", "wallet", "save-streak",
 ]);
+
+// Special-case path: Twitch's "save your streak" deep link lives at
+// /save-streak/<streamer>. Extract the streamer from the SECOND path
+// segment so the tab is tracked as the streamer's tab.
+const SAVE_STREAK_URL_PATTERN =
+  /^https?:\/\/(?:www\.)?twitch\.tv\/save-streak\/([a-zA-Z0-9_]+)/;
 
 // ---------------------------------------------------------------------------
 // Debug logging — writes to console AND a circular buffer in storage
@@ -635,7 +641,14 @@ async function reloadTrackedTab(tabId) {
 // ---------------------------------------------------------------------------
 
 function getStreamerFromUrl(url) {
-  const match = url?.match(TWITCH_URL_PATTERN);
+  if (!url) return null;
+  // /save-streak/<streamer> deep link first — these tabs should be
+  // treated identically to a normal channel tab for the streamer.
+  const saveStreakMatch = url.match(SAVE_STREAK_URL_PATTERN);
+  if (saveStreakMatch && saveStreakMatch[1]) {
+    return saveStreakMatch[1].toLowerCase();
+  }
+  const match = url.match(TWITCH_URL_PATTERN);
   if (match && match[1]) {
     const username = match[1].toLowerCase();
     if (IGNORED_PATHS.has(username)) return null;
