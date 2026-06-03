@@ -43,7 +43,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.6.9"
+VERSION = "1.6.10"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -786,55 +786,57 @@ class TwitchMonitor:
                     self.status_callback(f"{username} went offline")
                     log_activity("stream_offline", streamer=username)
 
-                    # VOD fallback: if stream was missed, open the VOD —
-                    # UNLESS we're paused. Opening a VOD on top of the user's
-                    # own active stream is the same disruption that the
-                    # auto-pause feature exists to prevent for live tabs, so
-                    # we queue VODs while paused and flush them when the
-                    # pause lifts (see auto_paused transition handler above).
-                    if not state.browser_opened and self.config.vod_fallback:
-                        log.info("VOD fallback triggered for %s", username)
-                        vod_url = self.get_latest_vod_url(username)
-                        if vod_url:
-                            if self.effectively_paused:
-                                self.queued_vods[username] = vod_url
-                                reason = "auto_paused" if self.auto_paused else "paused"
-                                log.info(
-                                    "VOD for %s queued (reason=%s, queue size now %d)",
-                                    username, reason, len(self.queued_vods),
-                                )
-                                log_activity(
-                                    "vod_queued",
-                                    streamer=username,
-                                    url=vod_url,
-                                    reason=reason,
-                                )
-                                self.notify_callback(
-                                    "Stream Monitor",
-                                    f"VOD for {username} queued — opens when you're no longer paused"
-                                )
-                            else:
-                                self.status_callback(f"Opening VOD for {username}")
-                                log.info("Opening VOD: %s", vod_url)
-                                try:
-                                    vod_success = webbrowser.open(vod_url)
-                                except Exception as e:
-                                    log.error("webbrowser.open raised for VOD %s: %s", vod_url, e)
-                                    vod_success = False
-                                log_activity(
-                                    "tab_open_attempt",
-                                    kind="vod",
-                                    streamer=username,
-                                    url=vod_url,
-                                    success=bool(vod_success),
-                                )
+                    # VOD fallback now fires ONLY when this exact stream was
+                    # skipped earlier because Stream Monitor was paused or
+                    # auto-paused (im_live_pause for "I'm live"). Previously
+                    # it fired whenever browser_opened was false, which
+                    # included unrelated cases (Stream Monitor downtime,
+                    # webbrowser.open failure, etc.) and opened VODs the
+                    # user never wanted.
+                    #
+                    # The opened URL is the canonical Twitch save-streak
+                    # deep link with ?sm=1 so the extension tracks the tab
+                    # and applies the same auto-mute / low-quality /
+                    # player-keepalive treatment as a normal stream tab.
+                    was_skipped_due_to_pause = username in self.missed_while_paused
+                    if was_skipped_due_to_pause and self.config.vod_fallback:
+                        save_streak_url = f"https://www.twitch.tv/save-streak/{username}?sm=1"
+                        # Whether it fires immediately or gets queued, the
+                        # streamer leaves the missed-while-paused list so we
+                        # don't double-fire on subsequent live/offline cycles.
+                        self.missed_while_paused.pop(username, None)
+                        if self.effectively_paused:
+                            self.queued_vods[username] = save_streak_url
+                            reason = "auto_paused" if self.auto_paused else "paused"
+                            log.info(
+                                "Save-streak URL for %s queued (reason=%s, queue size now %d)",
+                                username, reason, len(self.queued_vods),
+                            )
+                            log_activity(
+                                "vod_queued",
+                                streamer=username,
+                                url=save_streak_url,
+                                reason=reason,
+                            )
+                            self.notify_callback(
+                                "Stream Monitor",
+                                f"Save-streak link for {username} queued — opens when you're no longer paused"
+                            )
                         else:
-                            log.info("No VOD found for %s", username)
-
-                    # Track missed streaks: went live + offline while paused
-                    if username in self.missed_while_paused:
-                        # Will be shown when user unpauses
-                        pass  # Keep in missed_while_paused for alert
+                            self.status_callback(f"Opening save-streak page for {username}")
+                            log.info("Opening save-streak URL: %s", save_streak_url)
+                            try:
+                                vod_success = webbrowser.open(save_streak_url)
+                            except Exception as e:
+                                log.error("webbrowser.open raised for save-streak URL %s: %s", save_streak_url, e)
+                                vod_success = False
+                            log_activity(
+                                "tab_open_attempt",
+                                kind="vod",
+                                streamer=username,
+                                url=save_streak_url,
+                                success=bool(vod_success),
+                            )
 
                     state.was_live = False
                     state.browser_opened = False
