@@ -23,21 +23,21 @@ def _mock_response(json_data=None, status=200):
 # ---------------------------------------------------------------------------
 
 def test_get_oauth_token_success(monitor):
-    with patch("stream_monitor_tray.requests.post") as mock_post:
+    with patch.object(monitor._http, "post") as mock_post:
         mock_post.return_value = _mock_response({"access_token": "tok123"})
         assert monitor._get_oauth_token() is True
         assert monitor.oauth_token == "tok123"
 
 
 def test_get_oauth_token_network_failure(monitor):
-    with patch("stream_monitor_tray.requests.post") as mock_post:
+    with patch.object(monitor._http, "post") as mock_post:
         mock_post.side_effect = requests.ConnectionError("no net")
         assert monitor._get_oauth_token() is False
         assert monitor.oauth_token is None
 
 
 def test_get_oauth_token_missing_access_token(monitor):
-    with patch("stream_monitor_tray.requests.post") as mock_post:
+    with patch.object(monitor._http, "post") as mock_post:
         mock_post.return_value = _mock_response({"error": "invalid_client"})
         assert monitor._get_oauth_token() is False
 
@@ -52,7 +52,7 @@ def test_api_get_401_refreshes_token_and_retries(monitor):
     unauthorized.raise_for_status.side_effect = None  # don't raise on 401, we handle it
     success = _mock_response({"data": []})
 
-    with patch("stream_monitor_tray.requests.get", side_effect=[unauthorized, success]) as mget, \
+    with patch.object(monitor._http, "get", side_effect=[unauthorized, success]) as mget, \
          patch.object(monitor, "_get_oauth_token", return_value=True) as mrefresh:
         result = monitor._api_get("http://x/api", {})
         assert result == {"data": []}
@@ -65,7 +65,7 @@ def test_api_get_401_refresh_fails_returns_none(monitor):
     unauthorized = _mock_response({}, status=401)
     unauthorized.raise_for_status.side_effect = None
 
-    with patch("stream_monitor_tray.requests.get", return_value=unauthorized), \
+    with patch.object(monitor._http, "get", return_value=unauthorized), \
          patch.object(monitor, "_get_oauth_token", return_value=False):
         assert monitor._api_get("http://x/api", {}) is None
 

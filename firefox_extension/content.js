@@ -696,8 +696,25 @@
     _streakScanTimer = setInterval(scanAndReport, 60000);
 
     if (typeof MutationObserver === "function" && document.body) {
-      const obs = new MutationObserver(() => {
+      const obs = new MutationObserver((mutations) => {
         if (obs._pending) return;
+        // Relevance gate: Twitch chat churns the DOM constantly, and a
+        // full-document sweep every debounce window burns CPU for hours
+        // on a live chat page. Only schedule a sweep when some ADDED
+        // node's text actually mentions "streak". The 60s interval scan
+        // above remains the correctness backstop.
+        let relevant = false;
+        for (const m of mutations) {
+          for (const node of m.addedNodes) {
+            const text = node.textContent;
+            if (text && text.length >= 12 && /streak/i.test(text)) {
+              relevant = true;
+              break;
+            }
+          }
+          if (relevant) break;
+        }
+        if (!relevant) return;
         obs._pending = true;
         setTimeout(() => {
           obs._pending = false;

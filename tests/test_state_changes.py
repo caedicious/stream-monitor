@@ -65,6 +65,7 @@ def test_vod_fallback_opens_when_missed_due_to_pause(monitor):
 
     with patch("stream_monitor_tray.webbrowser.open") as mopen:
         monitor.process_state_changes({"alice": False, "bob": False})
+        assert monitor.wait_for_pending_opens(timeout=5)
 
     mopen.assert_called_once_with("https://www.twitch.tv/save-streak/alice?sm=1")
     # The streamer is removed from missed_while_paused so we don't
@@ -182,6 +183,7 @@ def test_vod_opens_immediately_when_not_paused(monitor):
 
     with patch("stream_monitor_tray.webbrowser.open") as mopen:
         monitor.process_state_changes({"alice": False, "bob": False})
+        assert monitor.wait_for_pending_opens(timeout=5)
 
     mopen.assert_called_once_with("https://www.twitch.tv/save-streak/alice?sm=1")
     assert monitor.queued_vods == {}
@@ -204,6 +206,7 @@ def test_queue_flushes_when_auto_pause_lifts(monitor):
          patch("stream_monitor_tray.webbrowser.open") as mopen:
         mapi.return_value = {"data": []}  # own channel offline -> lifts pause
         monitor.check_streams()
+        assert monitor.wait_for_pending_opens(timeout=5)
 
     assert monitor.auto_paused is False
     assert monitor.queued_vods == {}
@@ -241,5 +244,90 @@ def test_flush_returns_zero_when_queue_empty(monitor):
     """_flush_queued_vods is a no-op when there's nothing to flush."""
     with patch("stream_monitor_tray.webbrowser.open") as mopen:
         n = monitor._flush_queued_vods(reason="test")
+        assert monitor.wait_for_pending_opens(timeout=5)
     assert n == 0
     mopen.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Paced tab-open queue (new in v1.6.11) — simultaneous go-lives, queue
+# flushes, and startup must not slam the browser with parallel tabs.
+# ---------------------------------------------------------------------------
+
+
+def test_simultaneous_go_lives_open_through_queue_in_order(monitor):
+    """Two streamers going live in the same poll pass both open, in order,
+    via the paced queue (spacing zeroed by the fixture)."""
+    with patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
+        monitor.process_state_changes({"alice": True, "bob": True})
+        assert monitor.wait_for_pending_opens(timeout=5)
+
+    assert mopen.call_count == 2
+    opened_urls = [c.args[0] for c in mopen.call_args_list]
+    assert opened_urls == [
+        "https://twitch.tv/alice?sm=1",
+        "https://twitch.tv/bob?sm=1",
+    ]
+    assert monitor.streamers["alice"].browser_opened is True
+    assert monitor.streamers["bob"].browser_opened is True
+
+
+def test_tab_opens_are_spaced_apart(monitor):
+    """With a real (small) spacing, consecutive opens are separated by at
+    least the configured interval."""
+    import time as _time
+
+    monitor.tab_open_spacing = 0.25
+    open_times = []
+
+    def record_open(url):
+        open_times.append(_time.monotonic())
+        return True
+
+    with patch("stream_monitor_tray.webbrowser.open", side_effect=record_open):
+        monitor.open_stream("alice")
+        monitor.open_stream("bob")
+        assert monitor.wait_for_pending_opens(timeout=5)
+
+    assert len(open_times) == 2
+    gap = open_times[1] - open_times[0]
+    assert gap >= 0.2, f"opens only {gap:.3f}s apart, expected >= ~0.25s"
+
+
+def test_queue_flush_routes_through_paced_queue(monitor):
+    """A multi-VOD flush enqueues every entry; the worker opens them all."""
+    monitor.queued_vods = {
+        "alice": "https://www.twitch.tv/save-streak/alice?sm=1",
+        "bob": "https://www.twitch.tv/save-streak/bob?sm=1",
+        "carol": "https://www.twitch.tv/save-streak/carol?sm=1",
+    }
+
+    with patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
+        n = monitor._flush_queued_vods(reason="test")
+        assert monitor.wait_for_pending_opens(timeout=5)
+
+    assert n == 3
+    assert mopen.call_count == 3
+    assert monitor.queued_vods == {}
+
+
+def test_worker_survives_open_failure(monitor):
+    """A webbrowser.open exception on one entry must not kill the worker —
+    subsequent entries still open."""
+    calls = []
+
+    def flaky_open(url):
+        calls.append(url)
+        if "alice" in url:
+            raise RuntimeError("simulated browser failure")
+        return True
+
+    with patch("stream_monitor_tray.webbrowser.open", side_effect=flaky_open):
+        monitor.open_stream("alice")
+        monitor.open_stream("bob")
+        assert monitor.wait_for_pending_opens(timeout=5)
+
+    assert calls == [
+        "https://twitch.tv/alice?sm=1",
+        "https://twitch.tv/bob?sm=1",
+    ]
