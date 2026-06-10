@@ -8,15 +8,17 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import sys
 import threading
 import time
 import webbrowser
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional, Callable
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import certifi
 import shutil
@@ -43,9 +45,18 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.6.10"
+VERSION = "1.6.11"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
+
+# Minimum spacing between consecutive browser-tab opens. Opening many tabs
+# simultaneously (several streamers going live in one poll, the queued-VOD
+# flush after un-pausing, or startup with multiple streamers already live)
+# starves the browser: video players never start, and the extension's
+# content scripts don't get a chance to apply low-quality / mute / keepalive
+# before the next tab lands. All stream/VOD tab opens flow through a single
+# paced queue with this many seconds between opens.
+TAB_OPEN_SPACING_SECONDS = 10
 
 # Configuration paths
 APP_NAME = "StreamMonitor"
@@ -195,31 +206,42 @@ def handle_streak_event(payload: dict) -> None:
             log.warning("Tray notifier raised on streak event: %s", e)
 
 
+# Cap on entries served by /activity.json. The activity file is append-only
+# and never rotates, so without a bound every request would JSON-parse the
+# entire history (months of events). The raw /activity.jsonl download still
+# returns the complete file for anyone who needs full history.
+MAX_ACTIVITY_EVENTS_SERVED = 10000
+
+
 def read_activity_log(limit: Optional[int] = None) -> list:
     """Read the activity log into a list of dicts. Reverse-chronological.
 
-    Tolerates partial last lines from concurrent writes.
+    Tolerates partial last lines from concurrent writes. Only the newest
+    MAX_ACTIVITY_EVENTS_SERVED lines are parsed — older history stays on
+    disk and is available via the raw .jsonl download.
     """
     if not STREAM_ACTIVITY_FILE.exists():
         return []
-    events = []
+    cap = limit if limit is not None else MAX_ACTIVITY_EVENTS_SERVED
     try:
         with open(STREAM_ACTIVITY_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    # Partial line from a concurrent write, skip it.
-                    continue
+            # deque(maxlen) keeps only the newest `cap` lines; we then
+            # JSON-parse just that tail instead of the whole file.
+            tail = deque(f, maxlen=cap)
     except OSError as e:
         log.warning("Failed to read activity log: %s", e)
         return []
+    events = []
+    for line in tail:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            # Partial line from a concurrent write, skip it.
+            continue
     events.reverse()
-    if limit is not None:
-        events = events[:limit]
     return events
 
 
@@ -402,16 +424,23 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
         pass
 
 
-class _SingletonHTTPServer(HTTPServer):
-    """HTTPServer subclass with SO_REUSEADDR disabled.
+class _SingletonHTTPServer(ThreadingHTTPServer):
+    """Threaded HTTP server with SO_REUSEADDR disabled.
 
     Python's stock HTTPServer sets allow_reuse_address = 1, which on Windows
     has SO_REUSEADDR semantics that *permit two processes to bind the same
     port simultaneously*. We rely on the bind failing when another instance
     holds the port to enforce single-instance startup, so we have to
     explicitly opt out of address reuse here.
+
+    ThreadingHTTPServer (one daemon thread per request) keeps a slow
+    request — a large /activity.json read, a wedged client — from blocking
+    every other endpoint behind it. The handlers are safe for this: the
+    activity log writes go through _activity_lock, streak events through
+    _streak_event_lock, and config_data reads are GIL-atomic dict lookups.
     """
     allow_reuse_address = False
+    daemon_threads = True
 
 
 def create_config_server(config: "Config") -> Optional[HTTPServer]:
@@ -510,6 +539,11 @@ class TwitchMonitor:
     def __init__(self, config: Config, status_callback: Callable[[str], None] = None,
                  notify_callback: Callable[[str, str], None] = None):
         self.config = config
+        # Reused HTTP session: keeps the TLS connection to Twitch's API
+        # alive across polls instead of paying a fresh TCP + TLS handshake
+        # every check_interval. requests.Session also pools connections,
+        # so the 401-refresh retry reuses the same socket.
+        self._http = requests.Session()
         self.oauth_token: Optional[str] = None
         self.streamers: dict[str, StreamerState] = {}
         self.running = False
@@ -532,11 +566,103 @@ class TwitchMonitor:
         # enrich the activity log (title, game, viewer count at the moment
         # the offline->live transition was detected).
         self.live_stream_meta: dict[str, dict] = {}
+
+        # Paced tab-open queue. Every stream/VOD tab open goes through this
+        # queue so consecutive opens are spaced tab_open_spacing seconds
+        # apart, giving the browser time to start each video player and the
+        # extension's content scripts time to apply mute / low-quality /
+        # keepalive before the next tab arrives. The worker is a daemon
+        # thread: it dies with the process, and any queued-but-unopened
+        # entries are simply lost on exit (acceptable — the next poll
+        # cycle re-detects still-live streamers).
+        self.tab_open_spacing: float = TAB_OPEN_SPACING_SECONDS
+        self._open_queue: queue.Queue = queue.Queue()
+        self._last_open_monotonic: float = float("-inf")
+        self._open_worker_thread = threading.Thread(
+            target=self._tab_open_worker, daemon=True, name="tab-open-worker"
+        )
+        self._open_worker_thread.start()
+
+    def _enqueue_tab_open(self, kind: str, streamer: str, url: str, **extra) -> int:
+        """Queue a browser-tab open. Returns the queue position (0 = will
+        open immediately, subject only to spacing from the previous open).
+
+        The actual webbrowser.open and its tab_open_attempt activity-log
+        entry happen on the worker thread when this entry's turn comes.
+        """
+        position = self._open_queue.qsize()
+        if position > 0:
+            # Only log the queued event when the open will actually wait
+            # behind others — the common single-open case stays one log line.
+            log_activity(
+                "tab_open_queued",
+                kind=kind,
+                streamer=streamer,
+                url=url,
+                queue_position=position,
+                **extra,
+            )
+            log.info(
+                "Tab open for %s queued at position %d (paced %ss apart)",
+                streamer, position, self.tab_open_spacing,
+            )
+        self._open_queue.put({"kind": kind, "streamer": streamer, "url": url, "extra": extra})
+        return position
+
+    def _tab_open_worker(self):
+        """Daemon worker: drains the open queue one entry at a time with
+        tab_open_spacing seconds between consecutive opens. The first open
+        after an idle period fires immediately."""
+        while True:
+            item = self._open_queue.get()
+            try:
+                wait = self.tab_open_spacing - (time.monotonic() - self._last_open_monotonic)
+                if wait > 0:
+                    log.info(
+                        "Pacing: waiting %.1fs before opening %s",
+                        wait, item["streamer"],
+                    )
+                    time.sleep(wait)
+                url = item["url"]
+                log.info("Opening tab (%s) for %s: %s", item["kind"], item["streamer"], url)
+                try:
+                    success = bool(webbrowser.open(url))
+                except Exception as e:
+                    log.error("webbrowser.open raised for %s: %s", url, e)
+                    success = False
+                self._last_open_monotonic = time.monotonic()
+                log_activity(
+                    "tab_open_attempt",
+                    kind=item["kind"],
+                    streamer=item["streamer"],
+                    url=url,
+                    success=success,
+                    **item["extra"],
+                )
+            except Exception as e:
+                # The worker must never die — a dead worker would silently
+                # strand every future tab open.
+                log.error("Tab-open worker iteration failed: %s", e)
+            finally:
+                self._open_queue.task_done()
+
+    def wait_for_pending_opens(self, timeout: float = 30.0) -> bool:
+        """Block until every queued tab open has been processed, or the
+        timeout elapses. Returns True if the queue fully drained. Used by
+        tests; also handy for debugging."""
+        deadline = time.monotonic() + timeout
+        with self._open_queue.all_tasks_done:
+            while self._open_queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._open_queue.all_tasks_done.wait(remaining)
+        return True
         
     def _get_oauth_token(self) -> bool:
         try:
             log.info("Requesting OAuth token")
-            response = requests.post(
+            response = self._http.post(
                 self.TOKEN_URL,
                 params={
                     "client_id": self.config.client_id,
@@ -565,12 +691,12 @@ class TwitchMonitor:
     
     def _api_get(self, url, params):
         """Make a GET request with automatic token refresh on 401."""
-        response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
+        response = self._http.get(url, headers=self._get_headers(), params=params, timeout=10)
         if response.status_code == 401:
             log.warning("API returned 401, token expired. Re-authenticating...")
             self.status_callback("Token expired, re-authenticating...")
             if self._get_oauth_token():
-                response = requests.get(url, headers=self._get_headers(), params=params, timeout=10)
+                response = self._http.get(url, headers=self._get_headers(), params=params, timeout=10)
             else:
                 log.error("Re-authentication failed after 401")
                 self.status_callback("Re-authentication failed")
@@ -648,46 +774,13 @@ class TwitchMonitor:
             self.status_callback(f"API error: {err_short}")
             raise  # Let _monitor_loop handle error counting and notifications
 
-    def get_latest_vod_url(self, username: str) -> Optional[str]:
-        """Fetch the most recent VOD URL for a user."""
-        user_id = self.user_ids.get(username.lower())
-        if not user_id:
-            # Need to look up user ID first
-            try:
-                data = self._api_get(self.USERS_API_URL, {"login": username})
-                if data and data.get("data"):
-                    user_id = data["data"][0]["id"]
-                    self.user_ids[username.lower()] = user_id
-                else:
-                    return None
-            except requests.RequestException:
-                return None
-
-        try:
-            data = self._api_get(self.VIDEOS_API_URL, {
-                "user_id": user_id, "type": "archive", "first": "1"
-            })
-            if data and data.get("data"):
-                return data["data"][0].get("url")
-        except requests.RequestException:
-            pass
-        return None
-    
     def open_stream(self, username: str):
         url = f"https://twitch.tv/{username}?sm=1"
-        log.info("Opening stream tab: %s", url)
-        try:
-            success = webbrowser.open(url)
-        except Exception as e:
-            log.error("webbrowser.open raised for %s: %s", url, e)
-            success = False
-        log_activity(
-            "tab_open_attempt",
-            kind="stream",
-            streamer=username,
-            url=url,
-            success=bool(success),
-        )
+        position = self._enqueue_tab_open("stream", username, url)
+        if position > 0:
+            self.status_callback(
+                f"{username} queued to open (~{int(position * self.tab_open_spacing)}s)"
+            )
     
     @property
     def effectively_paused(self) -> bool:
@@ -695,43 +788,32 @@ class TwitchMonitor:
         return self.paused or self.auto_paused
 
     def _flush_queued_vods(self, reason: str = "unpause") -> int:
-        """Open every queued VOD and clear the queue. Returns the count opened.
+        """Hand every queued VOD to the paced open queue and clear the
+        VOD queue. Returns the count enqueued.
 
-        Called when the pause that gated VOD-queueing lifts. Each VOD is
-        opened best-effort via webbrowser.open; failures are logged but
-        don't stop the rest of the queue from draining.
+        Called when the pause that gated VOD-queueing lifts. The actual
+        opens happen on the tab-open worker, spaced tab_open_spacing
+        seconds apart, so a multi-VOD flush doesn't slam the browser
+        with simultaneous tabs.
         """
         if not self.queued_vods:
             return 0
         items = list(self.queued_vods.items())
-        opened = 0
         for streamer, vod_url in items:
-            try:
-                success = bool(webbrowser.open(vod_url))
-            except Exception as e:
-                log.error("webbrowser.open raised for queued VOD %s: %s", vod_url, e)
-                success = False
-            log_activity(
-                "tab_open_attempt",
-                kind="vod",
-                streamer=streamer,
-                url=vod_url,
-                success=success,
-                from_queue=True,
-                queue_reason=reason,
+            self._enqueue_tab_open(
+                "vod", streamer, vod_url,
+                from_queue=True, queue_reason=reason,
             )
-            if success:
-                opened += 1
         self.queued_vods.clear()
-        if opened:
-            log.info("Flushed %d queued VOD(s) (reason=%s)", opened, reason)
-            self.notify_callback(
-                "Stream Monitor",
-                f"Opening {opened} queued VOD(s)"
-                if opened > 1 else
-                f"Opening queued VOD for {items[0][0]}"
-            )
-        return opened
+        count = len(items)
+        log.info("Flushed %d queued VOD(s) into the paced open queue (reason=%s)", count, reason)
+        self.notify_callback(
+            "Stream Monitor",
+            f"Opening {count} queued VOD(s), {int(self.tab_open_spacing)}s apart"
+            if count > 1 else
+            f"Opening queued VOD for {items[0][0]}"
+        )
+        return count
 
     def process_state_changes(self, current_status: dict[str, bool]):
         live_count = 0
@@ -824,19 +906,7 @@ class TwitchMonitor:
                             )
                         else:
                             self.status_callback(f"Opening save-streak page for {username}")
-                            log.info("Opening save-streak URL: %s", save_streak_url)
-                            try:
-                                vod_success = webbrowser.open(save_streak_url)
-                            except Exception as e:
-                                log.error("webbrowser.open raised for save-streak URL %s: %s", save_streak_url, e)
-                                vod_success = False
-                            log_activity(
-                                "tab_open_attempt",
-                                kind="vod",
-                                streamer=username,
-                                url=save_streak_url,
-                                success=bool(vod_success),
-                            )
+                            self._enqueue_tab_open("vod", username, save_streak_url)
 
                     state.was_live = False
                     state.browser_opened = False
@@ -1179,24 +1249,17 @@ class StreamMonitorApp:
         yield Item("Clear all queued", self._clear_all_queued_vods)
 
     def _open_queued_vod_now(self, streamer: str, vod_url: str):
-        """User clicked a queued-VOD row in the tray submenu — open it
-        immediately and remove from the queue."""
+        """User clicked a queued-VOD row in the tray submenu — hand it to
+        the paced open queue and remove it from the VOD queue. (Still
+        paced: if another tab opened within the last few seconds, this one
+        waits out the remainder of the spacing window so the browser isn't
+        slammed.)"""
         log.info("User manually opening queued VOD for %s from tray", streamer)
-        try:
-            success = bool(webbrowser.open(vod_url))
-        except Exception as e:
-            log.error("Failed to open queued VOD %s: %s", vod_url, e)
-            success = False
-        log_activity(
-            "tab_open_attempt",
-            kind="vod",
-            streamer=streamer,
-            url=vod_url,
-            success=success,
-            from_queue=True,
-            queue_reason="manual_tray",
-        )
         if self.monitor:
+            self.monitor._enqueue_tab_open(
+                "vod", streamer, vod_url,
+                from_queue=True, queue_reason="manual_tray",
+            )
             self.monitor.queued_vods.pop(streamer, None)
         if self.icon:
             try:

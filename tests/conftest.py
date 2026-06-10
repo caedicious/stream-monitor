@@ -69,6 +69,11 @@ def monitor(fresh_config):
     # Populate streamer state map (normally done in start())
     mon.streamers = {name: sm.StreamerState(name=name) for name in fresh_config.streamers}
 
+    # Tab opens go through a paced queue (10s apart in production). Zero
+    # the spacing in tests so the worker drains instantly; tests call
+    # mon.wait_for_pending_opens() before asserting on webbrowser.open.
+    mon.tab_open_spacing = 0
+
     # Expose captured calls on the monitor for convenience
     mon._status_calls = status_calls
     mon._notify_calls = notify_calls

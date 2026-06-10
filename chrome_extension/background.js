@@ -64,6 +64,12 @@ const SAVE_STREAK_URL_PATTERN =
 // continuously under load.
 
 let _logQueue = Promise.resolve();
+// Entries waiting to be persisted. Bursts of log() calls coalesce into a
+// single storage read-modify-write: the first queued flush drains the
+// whole buffer, and the flushes queued behind it become no-ops. Same
+// entries persisted in the same order — just one ~300KB array write per
+// burst instead of one per entry.
+let _pendingLogEntries = [];
 
 async function log(level, ...args) {
   const msg = args.map(a => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
@@ -74,11 +80,15 @@ async function log(level, ...args) {
   else if (level === "warn") console.warn(prefix, ...args);
   else console.log(prefix, ...args);
 
+  _pendingLogEntries.push({ ts, level, msg });
   _logQueue = _logQueue.then(async () => {
+    if (_pendingLogEntries.length === 0) return; // drained by an earlier flush
+    const batch = _pendingLogEntries;
+    _pendingLogEntries = [];
     try {
       const result = await chrome.storage.local.get("debugLog");
       const debugLog = result.debugLog || [];
-      debugLog.push({ ts, level, msg });
+      debugLog.push(...batch);
       if (debugLog.length > MAX_LOG_ENTRIES) {
         debugLog.splice(0, debugLog.length - MAX_LOG_ENTRIES);
       }
@@ -859,10 +869,15 @@ async function scanExistingTabs() {
 async function onTabCreated(tab) {
   if (!tab.url) return;
 
-  const { trackedTabs, monitoredStreamers } = await loadState();
+  // Cheap URL checks first — this fires for every tab the user opens
+  // anywhere in the browser, and the storage read below is only needed
+  // for Stream-Monitor-opened Twitch tabs (sm=1).
   const streamer = getStreamerFromUrl(tab.url);
+  if (!streamer || !isStreamMonitorTab(tab.url)) return;
 
-  if (streamer && monitoredStreamers.has(streamer) && isStreamMonitorTab(tab.url)) {
+  const { trackedTabs, monitoredStreamers } = await loadState();
+
+  if (monitoredStreamers.has(streamer)) {
     trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0, openedAt: Date.now() };
     await saveTrackedTabs(trackedTabs);
     const muted = await muteTabIfEnabled(tab.id, streamer);
@@ -873,6 +888,15 @@ async function onTabCreated(tab) {
 }
 
 async function onTabUpdated(tabId, changeInfo, tab) {
+  // Fast path: this fires for every tab in the browser on every load /
+  // favicon / title change. Skip the storage reads entirely when the
+  // event can't concern us: no URL change AND the tab isn't on Twitch.
+  // (URL-change events always proceed, because a tracked tab navigating
+  // AWAY from Twitch needs untracking.)
+  if (!changeInfo.url && !(tab && tab.url && tab.url.includes("twitch.tv"))) {
+    return;
+  }
+
   // Re-activate player control when a tracked tab finishes loading
   // (e.g. after a reload triggered by keepalive or error recovery)
   if (changeInfo.status === "complete") {

@@ -781,9 +781,28 @@
     // Also react immediately to DOM mutations so freshly-opened notifications
     // are caught without waiting for the next interval tick.
     if (typeof MutationObserver === "function" && document.body) {
-      const obs = new MutationObserver(() => {
-        // Debounce: only one scan per 2s burst.
+      const obs = new MutationObserver((mutations) => {
         if (obs._pending) return;
+        // Relevance gate: Twitch chat churns the DOM constantly, and a
+        // full-document sweep every debounce window burns CPU for hours
+        // on a live chat page. Only schedule a sweep when some ADDED
+        // node's text actually mentions "streak" — checking just the
+        // added subtrees is orders of magnitude cheaper than sweeping
+        // the whole document. The 60s interval scan above remains the
+        // correctness backstop for anything this gate misses.
+        let relevant = false;
+        for (const m of mutations) {
+          for (const node of m.addedNodes) {
+            const text = node.textContent;
+            if (text && text.length >= 12 && /streak/i.test(text)) {
+              relevant = true;
+              break;
+            }
+          }
+          if (relevant) break;
+        }
+        if (!relevant) return;
+        // Debounce: only one scan per 2s burst.
         obs._pending = true;
         setTimeout(() => {
           obs._pending = false;
