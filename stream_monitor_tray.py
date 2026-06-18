@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.6.11"
+VERSION = "1.6.12"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -757,9 +757,14 @@ class TwitchMonitor:
                     self.status_callback("Resumed (you went offline)")
                     self.notify_callback("Stream Monitor", "You went offline, resuming monitoring!")
                     log_activity("auto_paused_ended", own_channel=own_channel)
-                    # Only flush queued VODs if no other pause keeps us paused
+                    # Only resume opening if no other pause keeps us paused
                     # (manual `paused` toggle still suppresses).
                     if not self.paused:
+                        # Streamers still live right now: open their LIVE
+                        # stream. Streamers that ended during the pause:
+                        # flush their queued save-streak VODs. Both route
+                        # through the paced open queue.
+                        self._open_still_live_missed_streams(live_set, reason="auto_paused_ended")
                         self._flush_queued_vods(reason="auto_paused_ended")
 
             # Update live streamers list for config server
@@ -814,6 +819,47 @@ class TwitchMonitor:
             f"Opening queued VOD for {items[0][0]}"
         )
         return count
+
+    def _open_still_live_missed_streams(self, live_set: set, reason: str = "unpause") -> int:
+        """When a pause lifts, open the LIVE stream for every streamer that
+        was skipped while paused and is still live right now.
+
+        Without this, a streamer who went live during the pause and is
+        still broadcasting when the pause ends would never get opened —
+        process_state_changes only opens on the offline->live transition
+        (not state.was_live), and that transition already happened (and was
+        skipped) earlier. They'd otherwise only surface via the VOD
+        fallback once they finally ended their stream.
+
+        Streamers that are no longer live were already handled by the VOD
+        fallback when they went offline during the pause (queued + flushed),
+        so we only act on the still-live ones here. Opens route through the
+        paced queue. Returns the count opened.
+        """
+        if not self.missed_while_paused:
+            return 0
+        still_live = [
+            name for name in list(self.missed_while_paused)
+            if name in live_set
+        ]
+        for name in still_live:
+            self.missed_while_paused.pop(name, None)
+            state = self.streamers.get(name)
+            if state is not None:
+                state.browser_opened = True  # so process_state_changes won't re-open/skip-confuse
+            self.open_stream(name)
+        if still_live:
+            log.info(
+                "Opening %d still-live missed stream(s) on pause lift (reason=%s): %s",
+                len(still_live), reason, still_live,
+            )
+            self.notify_callback(
+                "Stream Monitor",
+                f"Opening {len(still_live)} live stream(s) you missed, {int(self.tab_open_spacing)}s apart"
+                if len(still_live) > 1 else
+                f"Opening {still_live[0]}'s live stream"
+            )
+        return len(still_live)
 
     def process_state_changes(self, current_status: dict[str, bool]):
         live_count = 0
