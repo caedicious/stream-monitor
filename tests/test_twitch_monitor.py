@@ -156,3 +156,53 @@ def test_auto_pause_ignored_when_im_live_pause_disabled(monitor):
         mapi.return_value = {"data": [{"user_login": "me", "user_id": "1"}]}
         monitor.check_streams()
         assert monitor.auto_paused is False
+
+
+def test_pause_lift_opens_still_live_missed_stream(monitor):
+    """The reported bug: a streamer who went live during the pause and is
+    STILL live when the user ends their own stream should have their LIVE
+    stream opened immediately — not wait until the streamer goes offline."""
+    monitor.config.own_channel = "me"
+    monitor.config.im_live_pause = True
+    monitor.auto_paused = True
+    monitor.tab_open_spacing = 0
+    # alice went live while we were paused: skipped, tracked as missed+live.
+    monitor.missed_while_paused["alice"] = "12:00:00"
+    monitor.streamers["alice"].was_live = True
+    monitor.streamers["alice"].browser_opened = False
+
+    with patch.object(monitor, "_api_get") as mapi, \
+         patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
+        # own channel offline now (lifts pause); alice still live.
+        mapi.return_value = {"data": [{"user_login": "alice", "user_id": "2"}]}
+        monitor.check_streams()
+        assert monitor.wait_for_pending_opens(timeout=5)
+
+    assert monitor.auto_paused is False
+    # alice's LIVE stream opened (not the save-streak VOD URL)
+    mopen.assert_called_once_with("https://twitch.tv/alice?sm=1")
+    assert monitor.streamers["alice"].browser_opened is True
+    assert "alice" not in monitor.missed_while_paused
+
+
+def test_pause_lift_does_not_open_missed_stream_that_ended(monitor):
+    """A streamer who went live AND offline during the pause is handled by
+    the VOD fallback (queued + flushed), not the still-live opener — so we
+    don't open a live stream for someone no longer broadcasting."""
+    monitor.config.own_channel = "me"
+    monitor.config.im_live_pause = True
+    monitor.auto_paused = True
+    monitor.tab_open_spacing = 0
+    # bob went live then offline during the pause: VOD got queued, and the
+    # offline handler already removed bob from missed_while_paused.
+    monitor.queued_vods["bob"] = "https://www.twitch.tv/save-streak/bob?sm=1"
+
+    with patch.object(monitor, "_api_get") as mapi, \
+         patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
+        mapi.return_value = {"data": []}  # nobody live now; pause lifts
+        monitor.check_streams()
+        assert monitor.wait_for_pending_opens(timeout=5)
+
+    assert monitor.auto_paused is False
+    # Only the save-streak VOD opened, no phantom live-stream open.
+    mopen.assert_called_once_with("https://www.twitch.tv/save-streak/bob?sm=1")
