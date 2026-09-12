@@ -532,6 +532,20 @@
         });
         break;
 
+      case "scanSaveStreak": {
+        // Rescue sweep: report every /save-streak/<slug> link visible in
+        // this page (sidebar "Save your Streak" entry, bell cards,
+        // notification page rows). The background dedups across tabs.
+        const slugs = new Set();
+        for (const a of document.querySelectorAll('a[href*="/save-streak/"]')) {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/\/save-streak\/([a-zA-Z0-9_]+)/i);
+          if (m) slugs.add(m[1].toLowerCase());
+        }
+        sendResponse({ slugs: Array.from(slugs) });
+        break;
+      }
+
       default:
         sendResponse({ ok: false, error: "unknown action" });
     }

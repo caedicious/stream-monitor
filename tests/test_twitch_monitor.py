@@ -158,10 +158,11 @@ def test_auto_pause_ignored_when_im_live_pause_disabled(monitor):
         assert monitor.auto_paused is False
 
 
-def test_pause_lift_opens_still_live_missed_stream(monitor):
-    """The reported bug: a streamer who went live during the pause and is
-    STILL live when the user ends their own stream should have their LIVE
-    stream opened immediately — not wait until the streamer goes offline."""
+def test_pause_lift_offers_still_live_missed_stream_as_live_candidate(monitor):
+    """A streamer who went live during the pause and is STILL live when the
+    user ends their own stream must appear in the rescue offer as a live
+    candidate (after any ended ones). Nothing opens while the offer is
+    pending; the fallback path covers the no-extension case."""
     monitor.config.own_channel = "me"
     monitor.config.im_live_pause = True
     monitor.auto_paused = True
@@ -179,23 +180,39 @@ def test_pause_lift_opens_still_live_missed_stream(monitor):
         assert monitor.wait_for_pending_opens(timeout=5)
 
     assert monitor.auto_paused is False
-    # alice's LIVE stream opened (not the save-streak VOD URL)
+    mopen.assert_not_called()
+    offer = monitor.rescue_pending
+    assert offer is not None
+    assert offer["candidates"] == [{
+        "streamer": "alice",
+        "url": "https://twitch.tv/alice?sm=1",
+        "kind": "live",
+        "ended_at": None,
+    }]
+    # Fallback (extension never acks) opens alice's LIVE stream, not a VOD.
+    monitor._rescue_deadline_monotonic = 0.0
+    with patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
+        monitor._maybe_fallback_rescue()
+        assert monitor.wait_for_pending_opens(timeout=5)
     mopen.assert_called_once_with("https://twitch.tv/alice?sm=1")
     assert monitor.streamers["alice"].browser_opened is True
     assert "alice" not in monitor.missed_while_paused
 
 
-def test_pause_lift_does_not_open_missed_stream_that_ended(monitor):
-    """A streamer who went live AND offline during the pause is handled by
-    the VOD fallback (queued + flushed), not the still-live opener — so we
-    don't open a live stream for someone no longer broadcasting."""
+def test_pause_lift_offers_ended_stream_as_ended_candidate(monitor):
+    """A streamer who went live AND offline during the pause rides the
+    rescue offer as an ended candidate with the save-streak URL; the
+    fallback opens only that URL, no phantom live-stream open."""
     monitor.config.own_channel = "me"
     monitor.config.im_live_pause = True
     monitor.auto_paused = True
     monitor.tab_open_spacing = 0
     # bob went live then offline during the pause: VOD got queued, and the
     # offline handler already removed bob from missed_while_paused.
-    monitor.queued_vods["bob"] = "https://www.twitch.tv/save-streak/bob?sm=1"
+    monitor.queued_vods["bob"] = {
+        "url": "https://www.twitch.tv/save-streak/bob?sm=1",
+        "ended_at": "2026-09-12T01:00:00.000Z",
+    }
 
     with patch.object(monitor, "_api_get") as mapi, \
          patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
@@ -204,5 +221,13 @@ def test_pause_lift_does_not_open_missed_stream_that_ended(monitor):
         assert monitor.wait_for_pending_opens(timeout=5)
 
     assert monitor.auto_paused is False
-    # Only the save-streak VOD opened, no phantom live-stream open.
+    mopen.assert_not_called()
+    offer = monitor.rescue_pending
+    assert offer is not None
+    assert [c["kind"] for c in offer["candidates"]] == ["ended"]
+    # Fallback opens only the save-streak URL.
+    monitor._rescue_deadline_monotonic = 0.0
+    with patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
+        monitor._maybe_fallback_rescue()
+        assert monitor.wait_for_pending_opens(timeout=5)
     mopen.assert_called_once_with("https://www.twitch.tv/save-streak/bob?sm=1")

@@ -140,7 +140,9 @@ def test_status_callback_monitoring_when_idle(monitor):
 
 def test_vod_queued_when_auto_paused_instead_of_opened(monitor):
     """A missed stream that goes offline while auto-paused should QUEUE the
-    save-streak URL, not open a browser tab on top of the user's live stream."""
+    save-streak URL, not open a browser tab on top of the user's live stream.
+    As of v1.7.0 the queue entry carries the ended_at timestamp used for
+    rescue-rotation priority ordering."""
     monitor.config.vod_fallback = True
     monitor.auto_paused = True
     monitor.streamers["alice"].was_live = True
@@ -151,7 +153,9 @@ def test_vod_queued_when_auto_paused_instead_of_opened(monitor):
         monitor.process_state_changes({"alice": False, "bob": False})
 
     mopen.assert_not_called()
-    assert monitor.queued_vods == {"alice": "https://www.twitch.tv/save-streak/alice?sm=1"}
+    entry = monitor.queued_vods["alice"]
+    assert entry["url"] == "https://www.twitch.tv/save-streak/alice?sm=1"
+    assert entry["ended_at"]  # ISO timestamp recorded for priority sorting
     # User gets a notification about the queue
     assert any("queued" in n[1].lower() for n in monitor._notify_calls)
     # Streamer removed from missed_while_paused once queued
@@ -170,7 +174,25 @@ def test_vod_queued_when_manually_paused(monitor):
         monitor.process_state_changes({"alice": False, "bob": False})
 
     mopen.assert_not_called()
-    assert monitor.queued_vods == {"alice": "https://www.twitch.tv/save-streak/alice?sm=1"}
+    assert monitor.queued_vods["alice"]["url"] == "https://www.twitch.tv/save-streak/alice?sm=1"
+
+
+def test_missed_entry_cleared_on_offline_even_without_vod_fallback(monitor):
+    """Regression: with vod_fallback OFF, a streamer that went live and
+    offline during a pause used to stay in missed_while_paused forever,
+    which could trigger a duplicate open on a much later pause lift."""
+    monitor.config.vod_fallback = False
+    monitor.auto_paused = True
+    monitor.streamers["alice"].was_live = True
+    monitor.streamers["alice"].browser_opened = False
+    monitor.missed_while_paused["alice"] = "12:00:00"
+
+    with patch("stream_monitor_tray.webbrowser.open") as mopen:
+        monitor.process_state_changes({"alice": False, "bob": False})
+
+    mopen.assert_not_called()
+    assert monitor.queued_vods == {}
+    assert "alice" not in monitor.missed_while_paused
 
 
 def test_vod_opens_immediately_when_not_paused(monitor):
@@ -191,15 +213,19 @@ def test_vod_opens_immediately_when_not_paused(monitor):
     assert "alice" not in monitor.missed_while_paused
 
 
-def test_queue_flushes_when_auto_pause_lifts(monitor):
-    """When the user's own stream ends and auto_paused goes True->False,
-    every queued VOD (now save-streak URLs) should open in a browser tab."""
+def test_pause_lift_publishes_rescue_offer_instead_of_flushing(monitor):
+    """v1.7.0: when auto-pause lifts, the desktop publishes a rescue offer
+    for the extension's 3-slot rotation instead of opening everything at
+    once. Nothing opens until either the extension acks (extension opens)
+    or the ack deadline passes (desktop falls back)."""
+    import stream_monitor_tray as sm
+
     monitor.config.own_channel = "me"
     monitor.config.im_live_pause = True
     monitor.auto_paused = True
     monitor.queued_vods = {
-        "alice": "https://www.twitch.tv/save-streak/alice?sm=1",
-        "bob": "https://www.twitch.tv/save-streak/bob?sm=1",
+        "alice": {"url": "https://www.twitch.tv/save-streak/alice?sm=1", "ended_at": "2026-09-12T02:00:00.000Z"},
+        "bob": {"url": "https://www.twitch.tv/save-streak/bob?sm=1", "ended_at": "2026-09-12T01:00:00.000Z"},
     }
 
     with patch.object(monitor, "_api_get") as mapi, \
@@ -209,26 +235,89 @@ def test_queue_flushes_when_auto_pause_lifts(monitor):
         assert monitor.wait_for_pending_opens(timeout=5)
 
     assert monitor.auto_paused is False
+    mopen.assert_not_called()  # nothing opens while the offer is pending
+    offer = monitor.rescue_pending
+    assert offer is not None
+    assert sm.ConfigRequestHandler.config_data["rescue"] == offer
+    # Ownership not transferred yet: queue intact until ack or fallback.
+    assert set(monitor.queued_vods) == {"alice", "bob"}
+    # Priority order: ended entries sorted earliest-ended first.
+    streamers_in_order = [c["streamer"] for c in offer["candidates"]]
+    assert streamers_in_order == ["bob", "alice"]
+    assert all(c["kind"] == "ended" for c in offer["candidates"])
+
+
+def test_rescue_ack_transfers_ownership(monitor):
+    """A matching /rescue_ack clears the offer and the desktop-side queue
+    state; live candidates get browser_opened so nothing reopens them."""
+    import stream_monitor_tray as sm
+
+    monitor.queued_vods = {
+        "bob": {"url": "https://www.twitch.tv/save-streak/bob?sm=1", "ended_at": "2026-09-12T01:00:00.000Z"},
+    }
+    monitor.missed_while_paused["alice"] = "12:00:00"
+    monitor.streamers["alice"].browser_opened = False
+    monitor._offer_rescue_or_flush({"alice"})
+    offer = monitor.rescue_pending
+    assert offer is not None
+
+    with patch("stream_monitor_tray.webbrowser.open") as mopen:
+        assert monitor.acknowledge_rescue(offer["id"]) is True
+
+    mopen.assert_not_called()  # extension owns the opens now
+    assert monitor.rescue_pending is None
     assert monitor.queued_vods == {}
-    assert mopen.call_count == 2
-    opened_urls = {c.args[0] for c in mopen.call_args_list}
-    assert opened_urls == {
-        "https://www.twitch.tv/save-streak/alice?sm=1",
+    assert "alice" not in monitor.missed_while_paused
+    assert monitor.streamers["alice"].browser_opened is True
+    assert sm.ConfigRequestHandler.config_data["rescue"] is None
+    # Replay of the same id is rejected.
+    assert monitor.acknowledge_rescue(offer["id"]) is False
+
+
+def test_rescue_ack_wrong_id_rejected(monitor):
+    monitor.queued_vods = {
+        "bob": {"url": "https://www.twitch.tv/save-streak/bob?sm=1", "ended_at": "x"},
+    }
+    monitor._offer_rescue_or_flush(set())
+    assert monitor.acknowledge_rescue("rescue-nope") is False
+    assert monitor.rescue_pending is not None  # offer still live
+
+
+def test_rescue_fallback_flushes_after_timeout(monitor):
+    """No ack within the deadline: the desktop opens everything itself via
+    the paced queue, exactly like pre-1.7."""
+    monitor.queued_vods = {
+        "bob": {"url": "https://www.twitch.tv/save-streak/bob?sm=1", "ended_at": "x"},
+    }
+    monitor.missed_while_paused["alice"] = "12:00:00"
+    monitor.live_streamers = ["alice"]
+    monitor._offer_rescue_or_flush({"alice"})
+    monitor._rescue_deadline_monotonic = 0.0  # force the deadline into the past
+
+    with patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
+        monitor._maybe_fallback_rescue()
+        assert monitor.wait_for_pending_opens(timeout=5)
+
+    assert monitor.rescue_pending is None
+    opened = {c.args[0] for c in mopen.call_args_list}
+    assert opened == {
+        "https://twitch.tv/alice?sm=1",
         "https://www.twitch.tv/save-streak/bob?sm=1",
     }
-    # Tray notification about the count
-    assert any("queued vod" in n[1].lower() for n in monitor._notify_calls)
+    assert monitor.queued_vods == {}
 
 
 def test_queue_does_not_flush_if_manual_pause_still_active(monitor):
-    """If auto_pause lifts but the manual pause is still on, the queue
-    should stay intact — only opening would break the manual pause's
-    promise."""
+    """If auto_pause lifts but the manual pause is still on, no rescue
+    offer is published and the queue stays intact — only opening would
+    break the manual pause's promise."""
     monitor.config.own_channel = "me"
     monitor.config.im_live_pause = True
     monitor.auto_paused = True
     monitor.paused = True  # manual pause also engaged
-    monitor.queued_vods = {"alice": "https://www.twitch.tv/save-streak/alice?sm=1"}
+    monitor.queued_vods = {
+        "alice": {"url": "https://www.twitch.tv/save-streak/alice?sm=1", "ended_at": "x"},
+    }
 
     with patch.object(monitor, "_api_get") as mapi, \
          patch("stream_monitor_tray.webbrowser.open") as mopen:
@@ -237,7 +326,8 @@ def test_queue_does_not_flush_if_manual_pause_still_active(monitor):
 
     assert monitor.auto_paused is False
     mopen.assert_not_called()
-    assert monitor.queued_vods == {"alice": "https://www.twitch.tv/save-streak/alice?sm=1"}
+    assert monitor.rescue_pending is None
+    assert set(monitor.queued_vods) == {"alice"}  # queue intact, unflushed
 
 
 def test_flush_returns_zero_when_queue_empty(monitor):
@@ -297,9 +387,9 @@ def test_tab_opens_are_spaced_apart(monitor):
 def test_queue_flush_routes_through_paced_queue(monitor):
     """A multi-VOD flush enqueues every entry; the worker opens them all."""
     monitor.queued_vods = {
-        "alice": "https://www.twitch.tv/save-streak/alice?sm=1",
-        "bob": "https://www.twitch.tv/save-streak/bob?sm=1",
-        "carol": "https://www.twitch.tv/save-streak/carol?sm=1",
+        "alice": {"url": "https://www.twitch.tv/save-streak/alice?sm=1", "ended_at": "a"},
+        "bob": {"url": "https://www.twitch.tv/save-streak/bob?sm=1", "ended_at": "b"},
+        "carol": {"url": "https://www.twitch.tv/save-streak/carol?sm=1", "ended_at": "c"},
     }
 
     with patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:

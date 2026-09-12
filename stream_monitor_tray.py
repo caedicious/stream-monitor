@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.6.13"
+VERSION = "1.7.0"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -134,6 +134,24 @@ def log_activity(event: str, **fields):
 # handler (a separate class with no app reference) to raise tray
 # notifications without needing dependency injection through every layer.
 _tray_notifier: Optional[Callable[[str, str], None]] = None
+
+# Streak-rescue handoff (v1.7.0). When auto-pause lifts, the desktop no
+# longer opens every missed stream itself. It publishes a rescue offer in
+# /config and waits for the extension to acknowledge via POST /rescue_ack;
+# the extension then runs a 3-slot rotation (30 minutes per turn) with the
+# tabs it controls. If no acknowledgment arrives within this window (old
+# extension version, extension disabled, browser closed), the monitor loop
+# falls back to the pre-1.7 behavior of opening everything at once through
+# the paced queue.
+RESCUE_ACK_TIMEOUT_SECONDS = 180
+
+_rescue_ack_handler: Optional[Callable[[str], bool]] = None
+
+
+def set_rescue_ack_handler(fn: Callable[[str], bool]) -> None:
+    """Register the callable invoked when the extension POSTs /rescue_ack."""
+    global _rescue_ack_handler
+    _rescue_ack_handler = fn
 
 # Per-streak dedup keyed by (status, streamer, count) so a refresh of the
 # notifications page doesn't re-notify the same broken streak twice. Reset
@@ -408,6 +426,29 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if self.path == "/rescue_ack":
+            # Extension claims ownership of the currently-published rescue
+            # offer. 204 = handed over, the extension runs the rotation.
+            # 409 = no such offer (already acked, already fell back, or a
+            # stale id), the extension must NOT start a session.
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length <= 0 or length > 1024:
+                self.send_response(400)
+                self.end_headers()
+                return
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                offer_id = str(payload.get("id", ""))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.send_response(400)
+                self.end_headers()
+                return
+            handler = _rescue_ack_handler
+            accepted = bool(handler and offer_id and handler(offer_id))
+            self.send_response(204 if accepted else 409)
+            self.end_headers()
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -455,7 +496,8 @@ def create_config_server(config: "Config") -> Optional[HTTPServer]:
         "version": VERSION,
         "live_streamers": [],
         "paused": config.paused,
-        "auto_paused": False
+        "auto_paused": False,
+        "rescue": None,
     }
     try:
         return _SingletonHTTPServer(("127.0.0.1", CONFIG_SERVER_PORT), ConfigRequestHandler)
@@ -562,6 +604,13 @@ class TwitchMonitor:
         self.queued_vods: dict[str, str] = {}
         self.user_ids: dict[str, str] = {}  # { username: user_id } cache
         self.consecutive_errors: int = 0  # Track consecutive API failures
+        # Streak-rescue handoff state (v1.7.0). rescue_pending holds the
+        # offer published in /config while we wait for the extension's
+        # /rescue_ack. The lock guards the offer against the HTTP thread
+        # (ack) and the monitor thread (fallback timeout) racing.
+        self.rescue_pending: Optional[dict] = None
+        self._rescue_deadline_monotonic: float = 0.0
+        self._rescue_lock = threading.Lock()
         # Per-streamer metadata captured on the latest "live" check, used to
         # enrich the activity log (title, game, viewer count at the moment
         # the offline->live transition was detected).
@@ -760,12 +809,11 @@ class TwitchMonitor:
                     # Only resume opening if no other pause keeps us paused
                     # (manual `paused` toggle still suppresses).
                     if not self.paused:
-                        # Streamers still live right now: open their LIVE
-                        # stream. Streamers that ended during the pause:
-                        # flush their queued save-streak VODs. Both route
-                        # through the paced open queue.
-                        self._open_still_live_missed_streams(live_set, reason="auto_paused_ended")
-                        self._flush_queued_vods(reason="auto_paused_ended")
+                        # v1.7.0: instead of opening everything at once,
+                        # publish a rescue offer for the extension's 3-slot
+                        # rotation. Falls back to the open-everything path
+                        # if the extension does not acknowledge in time.
+                        self._offer_rescue_or_flush(live_set)
 
             # Update live streamers list for config server
             self.live_streamers = [name for name in self.streamers if name in live_set]
@@ -804,9 +852,9 @@ class TwitchMonitor:
         if not self.queued_vods:
             return 0
         items = list(self.queued_vods.items())
-        for streamer, vod_url in items:
+        for streamer, entry in items:
             self._enqueue_tab_open(
-                "vod", streamer, vod_url,
+                "vod", streamer, entry["url"],
                 from_queue=True, queue_reason=reason,
             )
         self.queued_vods.clear()
@@ -819,6 +867,106 @@ class TwitchMonitor:
             f"Opening queued VOD for {items[0][0]}"
         )
         return count
+
+    def _build_rescue_candidates(self, live_set: set) -> list:
+        """Assemble the rescue queue in priority order: streams that ended
+        while we were paused first (save-streak URLs, earliest-ended first,
+        because they have burned the most of their 24h save window), then
+        streams that are still live right now."""
+        ended = [
+            {
+                "streamer": streamer,
+                "url": entry["url"],
+                "kind": "ended",
+                "ended_at": entry.get("ended_at"),
+            }
+            for streamer, entry in self.queued_vods.items()
+        ]
+        ended.sort(key=lambda c: c.get("ended_at") or "")
+        live = [
+            {
+                "streamer": name,
+                "url": f"https://twitch.tv/{name}?sm=1",
+                "kind": "live",
+                "ended_at": None,
+            }
+            for name in list(self.missed_while_paused)
+            if name in live_set
+        ]
+        return ended + live
+
+    def _offer_rescue_or_flush(self, live_set: set):
+        """Publish a rescue offer in /config for the extension to claim.
+        Ownership of queued_vods / missed_while_paused entries stays with
+        the desktop until the extension acks; _maybe_fallback_rescue opens
+        everything the old way if no ack arrives in time."""
+        candidates = self._build_rescue_candidates(live_set)
+        if not candidates:
+            return
+        offer = {
+            "id": f"rescue-{int(time.time() * 1000)}",
+            "created_at": _activity_timestamp(),
+            "batch_size": 3,
+            "rotate_minutes": 30,
+            "candidates": candidates,
+        }
+        with self._rescue_lock:
+            self.rescue_pending = offer
+            self._rescue_deadline_monotonic = time.monotonic() + RESCUE_ACK_TIMEOUT_SECONDS
+        ConfigRequestHandler.config_data["rescue"] = offer
+        log.info(
+            "Rescue offer %s published: %d candidate(s), extension has %ds to acknowledge",
+            offer["id"], len(candidates), RESCUE_ACK_TIMEOUT_SECONDS,
+        )
+        log_activity("rescue_offered", offer_id=offer["id"], count=len(candidates))
+
+    def acknowledge_rescue(self, offer_id: str) -> bool:
+        """Called from the HTTP thread when the extension POSTs /rescue_ack.
+        Hands ownership of the offered candidates to the extension so the
+        desktop neither flushes them later nor re-opens the live ones."""
+        with self._rescue_lock:
+            offer = self.rescue_pending
+            if not offer or offer["id"] != offer_id:
+                return False
+            self.rescue_pending = None
+        for cand in offer["candidates"]:
+            name = cand["streamer"]
+            if cand["kind"] == "ended":
+                self.queued_vods.pop(name, None)
+            else:
+                self.missed_while_paused.pop(name, None)
+                state = self.streamers.get(name)
+                if state is not None:
+                    state.browser_opened = True
+        ConfigRequestHandler.config_data["rescue"] = None
+        ConfigRequestHandler.config_data["queued_vods"] = dict(self.queued_vods)
+        log.info(
+            "Rescue offer %s acknowledged; extension is rotating %d stream(s)",
+            offer_id, len(offer["candidates"]),
+        )
+        log_activity("rescue_acked", offer_id=offer_id, count=len(offer["candidates"]))
+        self.notify_callback(
+            "Stream Monitor",
+            f"Streak rescue started: rotating {len(offer['candidates'])} stream(s), 3 at a time, 30 min per turn."
+        )
+        return True
+
+    def _maybe_fallback_rescue(self):
+        """Monitor-loop tick: if a published rescue offer was never acked
+        within the timeout, open everything the pre-1.7 way."""
+        with self._rescue_lock:
+            offer = self.rescue_pending
+            if not offer or time.monotonic() < self._rescue_deadline_monotonic:
+                return
+            self.rescue_pending = None
+        ConfigRequestHandler.config_data["rescue"] = None
+        log.warning(
+            "Rescue offer %s not acknowledged within %ds; falling back to paced open of everything",
+            offer["id"], RESCUE_ACK_TIMEOUT_SECONDS,
+        )
+        log_activity("rescue_fallback_flush", offer_id=offer["id"])
+        self._open_still_live_missed_streams(set(self.live_streamers), reason="rescue_fallback")
+        self._flush_queued_vods(reason="rescue_fallback")
 
     def _open_still_live_missed_streams(self, live_set: set, reason: str = "unpause") -> int:
         """When a pause lifts, open the LIVE stream for every streamer that
@@ -927,14 +1075,22 @@ class TwitchMonitor:
                     # and applies the same auto-mute / low-quality /
                     # player-keepalive treatment as a normal stream tab.
                     was_skipped_due_to_pause = username in self.missed_while_paused
+                    if was_skipped_due_to_pause:
+                        # Always leave the missed-while-paused list on the
+                        # offline transition, even when VOD fallback is off.
+                        # Stale entries used to survive here when the
+                        # fallback was disabled and could trigger a
+                        # duplicate open on a much later pause lift.
+                        self.missed_while_paused.pop(username, None)
                     if was_skipped_due_to_pause and self.config.vod_fallback:
                         save_streak_url = f"https://www.twitch.tv/save-streak/{username}?sm=1"
-                        # Whether it fires immediately or gets queued, the
-                        # streamer leaves the missed-while-paused list so we
-                        # don't double-fire on subsequent live/offline cycles.
-                        self.missed_while_paused.pop(username, None)
                         if self.effectively_paused:
-                            self.queued_vods[username] = save_streak_url
+                            self.queued_vods[username] = {
+                                "url": save_streak_url,
+                                # Rescue-queue priority key: earliest-ended
+                                # streams have the least save window left.
+                                "ended_at": _activity_timestamp(),
+                            }
                             reason = "auto_paused" if self.auto_paused else "paused"
                             log.info(
                                 "Save-streak URL for %s queued (reason=%s, queue size now %d)",
@@ -1025,6 +1181,13 @@ class TwitchMonitor:
                         "Stream Monitor - Error",
                         "API has been failing for 5 minutes. Stream Monitor needs to be restarted."
                     )
+
+            # Rescue-offer watchdog: runs even when the API check above
+            # failed, so a network blip can't strand an unacked offer.
+            try:
+                self._maybe_fallback_rescue()
+            except Exception as e:
+                log.error("Rescue fallback check failed: %s", e)
 
             for _ in range(self.config.check_interval):
                 if not self.running:
@@ -1284,12 +1447,12 @@ class StreamMonitorApp:
             yield Item("(none queued)", None, enabled=False)
             return
         # Snapshot to avoid mutation during iteration if a flush fires.
-        for streamer, vod_url in list(self.monitor.queued_vods.items()):
+        for streamer, entry in list(self.monitor.queued_vods.items()):
             yield Item(
                 f"Open {streamer}'s VOD",
                 # Bind streamer and url in default args; closure-over-loop-var
                 # would otherwise capture only the final pair.
-                lambda icon, item, s=streamer, u=vod_url: self._open_queued_vod_now(s, u),
+                lambda icon, item, s=streamer, u=entry["url"]: self._open_queued_vod_now(s, u),
             )
         yield pystray.Menu.SEPARATOR
         yield Item("Clear all queued", self._clear_all_queued_vods)
@@ -1504,6 +1667,11 @@ class StreamMonitorApp:
         # Allow the HTTP handler (POST /streak_event) to raise tray
         # notifications without holding a direct reference to the app.
         set_tray_notifier(self.send_notification)
+
+        # Allow POST /rescue_ack to hand rescue ownership to the extension.
+        set_rescue_ack_handler(
+            lambda offer_id: bool(self.monitor and self.monitor.acknowledge_rescue(offer_id))
+        )
 
         # Create system tray icon
         self.icon = pystray.Icon(
