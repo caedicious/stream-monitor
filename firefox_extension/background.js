@@ -31,6 +31,21 @@ const GRACE_MS = GRACE_MINUTES * 60 * 1000;
 const PENDING_SWAP_ALARM_PREFIX = "pending-swap-";
 const PENDING_EXPIRE_ALARM_PREFIX = "pending-expire-";
 
+// Load-failure recovery: a tracked tab whose page never actually loaded
+// (DNS failure, network drop, "Server Not Found") runs no content script,
+// so none of the in-page recovery logic can ever fire. The background
+// detects the dead page by pinging the content script and reloads the tab
+// until it loads, backing off from 1 minute up to a 5 minute cap between
+// attempts. The counter resets as soon as a ping succeeds.
+const LOAD_RECOVERY_BASE_DELAY_MS = 60 * 1000;
+const LOAD_RECOVERY_MAX_DELAY_MS = 5 * 60 * 1000;
+// After a tracked tab reports status "complete", wait this long before
+// verifying the content script is alive. Error pages report "complete"
+// too, so this catches a failed open within seconds instead of waiting
+// for the next keepalive tick. The delay gives document_idle injection
+// time to happen on genuinely loading pages.
+const LOAD_VERIFY_AFTER_COMPLETE_MS = 8000;
+
 const IGNORED_PATHS = new Set([
   "directory", "videos", "settings", "subscriptions",
   "inventory", "drops", "wallet", "save-streak",
@@ -645,6 +660,127 @@ async function reloadTrackedTab(tabId) {
 }
 
 // ---------------------------------------------------------------------------
+// Load-failure recovery: reload tracked tabs whose page never loaded
+// ---------------------------------------------------------------------------
+//
+// "Server Not Found" and similar browser error pages run no content
+// scripts, so the in-page recovery (play/unmute clicks, error-overlay
+// reload) never gets a chance. From the background the signature is
+// simple: the tab exists, its load state is settled, and a message to
+// the content script has no receiver. When that happens we reload the
+// tab, backing off from 1 to 5 minutes between attempts, indefinitely:
+// the first reload after the network comes back loads normally, the
+// ping starts answering, and the failure counter resets. Discarded
+// (memory-unloaded) tabs have no content script either, so this also
+// revives stream tabs the browser quietly put to sleep.
+//
+// State lives in storage (loadRecovery: { [tabKey]: { failures,
+// nextRetryAt, loadingStrikes } }) so event-page recycles keep the
+// backoff. Entries are pruned when the tab closes, is untracked, or
+// starts answering pings. Only tracked (sm=1) tabs are ever touched.
+
+async function loadLoadRecovery() {
+  const { loadRecovery } = await browser.storage.local.get("loadRecovery");
+  return loadRecovery && typeof loadRecovery === "object" ? loadRecovery : {};
+}
+
+async function saveLoadRecovery(map) {
+  await browser.storage.local.set({ loadRecovery: map });
+}
+
+async function clearLoadRecoveryForTab(tabKey) {
+  const map = await loadLoadRecovery();
+  if (map[tabKey]) {
+    delete map[tabKey];
+    await saveLoadRecovery(map);
+  }
+}
+
+async function pingContentScript(tabId) {
+  // Quiet by design: during a long outage this runs on every keepalive
+  // tick for every tracked tab, and routing through sendToContentScript
+  // would write a warn line each time and flood the debug log.
+  try {
+    const resp = await browser.tabs.sendMessage(tabId, { action: "getStatus" });
+    return resp !== undefined && resp !== null;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Returns true when the tab's content script is alive, false otherwise
+// (dead page, still loading, or tab gone). Reloads the tab when the dead
+// state is confirmed and the backoff window allows it.
+async function checkTrackedTabLoaded(tabKey, streamer) {
+  const tabId = Number(tabKey);
+  let tab;
+  try {
+    tab = await browser.tabs.get(tabId);
+  } catch {
+    return false; // tab is gone; onTabRemoved handles cleanup
+  }
+
+  const alive = await pingContentScript(tabId);
+  const map = await loadLoadRecovery();
+  const rec = map[tabKey] || { failures: 0, nextRetryAt: 0, loadingStrikes: 0 };
+
+  if (alive) {
+    if (rec.failures > 0 || rec.loadingStrikes > 0) {
+      await log("info",
+        `Load recovery: tab ${tabKey} (${streamer}) is answering again after ${rec.failures} reload attempt(s)`
+      );
+      delete map[tabKey];
+      await saveLoadRecovery(map);
+    }
+    return true;
+  }
+
+  // No content script answered. A page that is legitimately still loading
+  // also has no receiver until document_idle, so give an in-flight load
+  // one full keepalive cycle before treating it as wedged.
+  if (tab.status === "loading" && !tab.discarded) {
+    rec.loadingStrikes = (rec.loadingStrikes || 0) + 1;
+    map[tabKey] = rec;
+    await saveLoadRecovery(map);
+    if (rec.loadingStrikes < 2) return false;
+  }
+
+  const now = Date.now();
+  if (now < rec.nextRetryAt) {
+    map[tabKey] = rec;
+    await saveLoadRecovery(map);
+    return false; // backing off; retry on a later tick
+  }
+
+  rec.failures += 1;
+  const backoff = Math.min(
+    LOAD_RECOVERY_BASE_DELAY_MS * Math.pow(2, rec.failures - 1),
+    LOAD_RECOVERY_MAX_DELAY_MS
+  );
+  rec.nextRetryAt = now + backoff;
+  rec.loadingStrikes = 0;
+  map[tabKey] = rec;
+  await saveLoadRecovery(map);
+
+  await log("warn",
+    `Load recovery: tab ${tabKey} (${streamer}) has no content script ` +
+    `(status=${tab.status}, discarded=${!!tab.discarded}), page likely never loaded ` +
+    `(server not found / network drop / discarded). Reloading (attempt ${rec.failures}, ` +
+    `next retry in ${Math.round(backoff / 1000)}s if it fails again).`
+  );
+  try {
+    // Plain reload keeps the tab's own URL (including a save-streak deep
+    // link and its sm=1 param). On a never-loaded page the URL is exactly
+    // what the desktop app opened, so there is no SPA-stripped-param
+    // concern here.
+    await browser.tabs.reload(tabId);
+  } catch (e) {
+    await log("warn", `Load recovery: reload of tab ${tabId} failed:`, e.message);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
 
@@ -806,8 +942,17 @@ async function onTabUpdated(tabId, changeInfo, tab) {
   // (e.g. after a reload triggered by keepalive or error recovery)
   if (changeInfo.status === "complete") {
     const { trackedTabs } = await loadState();
-    if (trackedTabs[String(tabId)]) {
+    const completed = trackedTabs[String(tabId)];
+    if (completed) {
       setTimeout(() => activatePlayerControl(tabId), 3000);
+      // Verify the page actually loaded. Browser error pages ("Server
+      // Not Found") also report status complete but never run the
+      // content script; catching that here gets the first recovery
+      // reload out ~10s after the failed load instead of waiting for
+      // the next keepalive tick.
+      setTimeout(() => {
+        checkTrackedTabLoaded(String(tabId), completed.originalStreamer);
+      }, LOAD_VERIFY_AFTER_COMPLETE_MS);
     }
   }
 
@@ -850,6 +995,7 @@ async function onTabUpdated(tabId, changeInfo, tab) {
       await saveTrackedTabs(trackedTabs);
       await cancelPendingSwapsForTab(tabKey);
       await cancelPendingExpirationForTab(tabKey);
+      await clearLoadRecoveryForTab(tabKey);
       try {
         await browser.tabs.remove(tabId);
       } catch (e) {
@@ -862,6 +1008,7 @@ async function onTabUpdated(tabId, changeInfo, tab) {
       await saveTrackedTabs(trackedTabs);
       await cancelPendingSwapsForTab(tabKey);
       await cancelPendingExpirationForTab(tabKey);
+      await clearLoadRecoveryForTab(tabKey);
     }
   } else if (newStreamer && monitoredStreamers.has(newStreamer) && isStreamMonitorTab(changeInfo.url)) {
     // New navigation to a monitored streamer opened by Stream Monitor (sm=1)
@@ -977,6 +1124,7 @@ async function onTabRemoved(tabId) {
   }
   await cancelPendingSwapsForTab(tabKey);
   await cancelPendingExpirationForTab(tabKey);
+  await clearLoadRecoveryForTab(tabKey);
 }
 
 async function onAlarm(alarm) {
@@ -993,8 +1141,16 @@ async function onAlarm(alarm) {
     const tabIds = Object.keys(trackedTabs);
     if (tabIds.length === 0) return;
     await log("info", `Keepalive alarm: pinging ${tabIds.length} tracked tab(s)`);
-    for (const tabId of tabIds) {
-      sendToContentScript(Number(tabId), { action: "keepalive" });
+    for (const tabKey of tabIds) {
+      // The alive-check doubles as the load-failure probe: a tab whose
+      // page never loaded (browser error page, discarded tab) has no
+      // content script to answer, and checkTrackedTabLoaded reloads it
+      // with backoff. Dead tabs get no keepalive message; there is
+      // nothing in them to keep alive.
+      const alive = await checkTrackedTabLoaded(tabKey, trackedTabs[tabKey].originalStreamer);
+      if (alive) {
+        sendToContentScript(Number(tabKey), { action: "keepalive" });
+      }
     }
   } else if (alarm.name.startsWith(PENDING_SWAP_ALARM_PREFIX)) {
     const newTabKey = alarm.name.slice(PENDING_SWAP_ALARM_PREFIX.length);
@@ -1087,6 +1243,17 @@ browser.runtime.onInstalled.addListener((details) => {
       }
       await log("info", `Dropped ${dropped} stale pending expiration(s) on startup`);
     }
+  }
+
+  // Same cleanup for load-recovery state.
+  const recovery = await loadLoadRecovery();
+  const staleRecovery = Object.keys(recovery).filter(k => !liveTabIds.has(k));
+  if (staleRecovery.length > 0) {
+    for (const k of staleRecovery) {
+      delete recovery[k];
+    }
+    await saveLoadRecovery(recovery);
+    await log("info", `Dropped ${staleRecovery.length} stale load-recovery entries on startup`);
   }
 
   await log("info", "Event page ready");
