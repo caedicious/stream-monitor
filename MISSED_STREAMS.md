@@ -22,6 +22,21 @@ broadcast histories. Open `View Activity Log` from the tray menu, or visit
 These are the most user-visible because the desktop app does its job (asks
 the OS to open a URL) but the browser doesn't actually load the URL.
 
+**Self-healing as of v1.6.13:** the extension now detects tracked tabs
+whose page never loaded and reloads them automatically. Browser error
+pages ("Server Not Found", grey page) run no content script, so the
+background pings each tracked tab (piggybacked on the 2-minute
+keepalive, plus a check ~8s after any load reports complete) and
+reloads any tab that does not answer, backing off from 1 to 5 minutes
+between attempts until the page loads. This turns B1/B2/B4-class
+failures on an unattended machine from "dead until manually refreshed"
+into "recovers within minutes of the network coming back". Look for
+"Load recovery:" lines in the extension debug log. Discarded
+(memory-unloaded) tabs are revived by the same path. The round-trip
+confirmation proposal below remains relevant only for DETECTING the
+failure on the desktop side's activity log; the extension now handles
+the actual recovery.
+
 ### B1. Firefox "Restore previous session?" prompt
 
 After Firefox crashes or is force-closed, the next launch shows a modal
