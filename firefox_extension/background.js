@@ -31,6 +31,21 @@ const GRACE_MS = GRACE_MINUTES * 60 * 1000;
 const PENDING_SWAP_ALARM_PREFIX = "pending-swap-";
 const PENDING_EXPIRE_ALARM_PREFIX = "pending-expire-";
 
+// Load-failure recovery: a tracked tab whose page never actually loaded
+// (DNS failure, network drop, "Server Not Found") runs no content script,
+// so none of the in-page recovery logic can ever fire. The background
+// detects the dead page by pinging the content script and reloads the tab
+// until it loads, backing off from 1 minute up to a 5 minute cap between
+// attempts. The counter resets as soon as a ping succeeds.
+const LOAD_RECOVERY_BASE_DELAY_MS = 60 * 1000;
+const LOAD_RECOVERY_MAX_DELAY_MS = 5 * 60 * 1000;
+// After a tracked tab reports status "complete", wait this long before
+// verifying the content script is alive. Error pages report "complete"
+// too, so this catches a failed open within seconds instead of waiting
+// for the next keepalive tick. The delay gives document_idle injection
+// time to happen on genuinely loading pages.
+const LOAD_VERIFY_AFTER_COMPLETE_MS = 8000;
+
 const IGNORED_PATHS = new Set([
   "directory", "videos", "settings", "subscriptions",
   "inventory", "drops", "wallet", "save-streak",
@@ -645,6 +660,447 @@ async function reloadTrackedTab(tabId) {
 }
 
 // ---------------------------------------------------------------------------
+// Load-failure recovery: reload tracked tabs whose page never loaded
+// ---------------------------------------------------------------------------
+//
+// "Server Not Found" and similar browser error pages run no content
+// scripts, so the in-page recovery (play/unmute clicks, error-overlay
+// reload) never gets a chance. From the background the signature is
+// simple: the tab exists, its load state is settled, and a message to
+// the content script has no receiver. When that happens we reload the
+// tab, backing off from 1 to 5 minutes between attempts, indefinitely:
+// the first reload after the network comes back loads normally, the
+// ping starts answering, and the failure counter resets. Discarded
+// (memory-unloaded) tabs have no content script either, so this also
+// revives stream tabs the browser quietly put to sleep.
+//
+// State lives in storage (loadRecovery: { [tabKey]: { failures,
+// nextRetryAt, loadingStrikes } }) so event-page recycles keep the
+// backoff. Entries are pruned when the tab closes, is untracked, or
+// starts answering pings. Only tracked (sm=1) tabs are ever touched.
+
+async function loadLoadRecovery() {
+  const { loadRecovery } = await browser.storage.local.get("loadRecovery");
+  return loadRecovery && typeof loadRecovery === "object" ? loadRecovery : {};
+}
+
+async function saveLoadRecovery(map) {
+  await browser.storage.local.set({ loadRecovery: map });
+}
+
+async function clearLoadRecoveryForTab(tabKey) {
+  const map = await loadLoadRecovery();
+  if (map[tabKey]) {
+    delete map[tabKey];
+    await saveLoadRecovery(map);
+  }
+}
+
+async function pingContentScript(tabId) {
+  // Quiet by design: during a long outage this runs on every keepalive
+  // tick for every tracked tab, and routing through sendToContentScript
+  // would write a warn line each time and flood the debug log.
+  try {
+    const resp = await browser.tabs.sendMessage(tabId, { action: "getStatus" });
+    return resp !== undefined && resp !== null;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Returns true when the tab's content script is alive, false otherwise
+// (dead page, still loading, or tab gone). Reloads the tab when the dead
+// state is confirmed and the backoff window allows it.
+async function checkTrackedTabLoaded(tabKey, streamer) {
+  const tabId = Number(tabKey);
+  let tab;
+  try {
+    tab = await browser.tabs.get(tabId);
+  } catch {
+    return false; // tab is gone; onTabRemoved handles cleanup
+  }
+
+  const alive = await pingContentScript(tabId);
+  const map = await loadLoadRecovery();
+  const rec = map[tabKey] || { failures: 0, nextRetryAt: 0, loadingStrikes: 0 };
+
+  if (alive) {
+    if (rec.failures > 0 || rec.loadingStrikes > 0) {
+      await log("info",
+        `Load recovery: tab ${tabKey} (${streamer}) is answering again after ${rec.failures} reload attempt(s)`
+      );
+      delete map[tabKey];
+      await saveLoadRecovery(map);
+    }
+    return true;
+  }
+
+  // No content script answered. A page that is legitimately still loading
+  // also has no receiver until document_idle, so give an in-flight load
+  // one full keepalive cycle before treating it as wedged.
+  if (tab.status === "loading" && !tab.discarded) {
+    rec.loadingStrikes = (rec.loadingStrikes || 0) + 1;
+    map[tabKey] = rec;
+    await saveLoadRecovery(map);
+    if (rec.loadingStrikes < 2) return false;
+  }
+
+  const now = Date.now();
+  if (now < rec.nextRetryAt) {
+    map[tabKey] = rec;
+    await saveLoadRecovery(map);
+    return false; // backing off; retry on a later tick
+  }
+
+  rec.failures += 1;
+  const backoff = Math.min(
+    LOAD_RECOVERY_BASE_DELAY_MS * Math.pow(2, rec.failures - 1),
+    LOAD_RECOVERY_MAX_DELAY_MS
+  );
+  rec.nextRetryAt = now + backoff;
+  rec.loadingStrikes = 0;
+  map[tabKey] = rec;
+  await saveLoadRecovery(map);
+
+  await log("warn",
+    `Load recovery: tab ${tabKey} (${streamer}) has no content script ` +
+    `(status=${tab.status}, discarded=${!!tab.discarded}), page likely never loaded ` +
+    `(server not found / network drop / discarded). Reloading (attempt ${rec.failures}, ` +
+    `next retry in ${Math.round(backoff / 1000)}s if it fails again).`
+  );
+  try {
+    // Plain reload keeps the tab's own URL (including a save-streak deep
+    // link and its sm=1 param). On a never-loaded page the URL is exactly
+    // what the desktop app opened, so there is no SPA-stripped-param
+    // concern here.
+    await browser.tabs.reload(tabId);
+  } catch (e) {
+    await log("warn", `Load recovery: reload of tab ${tabId} failed:`, e.message);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Streak-rescue rotation
+// ---------------------------------------------------------------------------
+//
+// Session shape (storage key rescueSession):
+//   {
+//     active: true,
+//     sourceIds: [offerId...],      // desktop offers absorbed so far
+//     queue: [{streamer, url, kind}], // pending, in priority order
+//     slots: [{tabKey, streamer, openedAt}], // open now, FIFO, max 3
+//     rescued: [streamer...],       // finished their turn this session
+//     pendingOpens: {url: streamer},// opens in flight (race guard)
+//     sweepDone: false,             // last sweep found nothing new
+//     startedAt: iso,
+//   }
+//
+// The rotation alarm is a one-shot re-armed after every step so a slow
+// step can't pile up ticks. All state lives in storage; event-page
+// recycles re-arm the alarm and reconcile slots on startup.
+
+async function loadRescueSession() {
+  const result = await browser.storage.local.get("rescueSession");
+  const raw = result.rescueSession;
+  return raw && typeof raw === "object" ? raw : null;
+}
+
+async function saveRescueSession(session) {
+  await browser.storage.local.set({ rescueSession: session });
+}
+
+async function clearRescueSession() {
+  await browser.storage.local.remove("rescueSession");
+  await browser.alarms.clear(RESCUE_ROTATE_ALARM);
+}
+
+async function ensureRescueAlarm() {
+  const existing = await browser.alarms.get(RESCUE_ROTATE_ALARM);
+  if (!existing) {
+    await browser.alarms.create(RESCUE_ROTATE_ALARM, { delayInMinutes: RESCUE_ROTATE_MINUTES });
+  }
+}
+
+// Which rescue open (if any) is this URL? Consulted by the tab-tracking
+// paths so a rescue tab is flagged rescue:true even when the tracking
+// event fires before openRescueTab's own trackedTabs write lands.
+async function rescuePendingStreamerFor(url) {
+  if (!url) return null;
+  const session = await loadRescueSession();
+  if (!session || !session.active || !session.pendingOpens) return null;
+  return session.pendingOpens[url] || null;
+}
+
+async function maybeStartRescueFromConfig(rescueOffer) {
+  if (!rescueOffer || !rescueOffer.id || !Array.isArray(rescueOffer.candidates)) return;
+  let session = await loadRescueSession();
+  if (session && Array.isArray(session.sourceIds) && session.sourceIds.includes(rescueOffer.id)) {
+    return; // already absorbed this offer
+  }
+
+  // Acknowledge FIRST: the desktop only hands over ownership on a 204.
+  // A 409 means the offer is stale (desktop already fell back, or another
+  // browser profile claimed it) and we must not open anything.
+  let acked = false;
+  try {
+    const resp = await fetch(RESCUE_ACK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: rescueOffer.id }),
+      signal: AbortSignal.timeout(5000),
+    });
+    acked = resp.ok || resp.status === 204;
+  } catch (e) {
+    await log("warn", "Rescue ack POST failed:", e?.message || String(e));
+  }
+  if (!acked) return;
+
+  const entries = rescueOffer.candidates
+    .map(c => ({
+      streamer: String(c.streamer || "").toLowerCase(),
+      url: c.url,
+      kind: c.kind === "ended" ? "ended" : "live",
+    }))
+    .filter(e => e.streamer && typeof e.url === "string");
+
+  if (!session || !session.active) {
+    session = {
+      active: true,
+      sourceIds: [rescueOffer.id],
+      queue: entries,
+      slots: [],
+      rescued: [],
+      pendingOpens: {},
+      sweepDone: false,
+      startedAt: new Date().toISOString(),
+    };
+  } else {
+    // A second offer arrived mid-session (the user went live again and
+    // ended again). Merge new candidates, dedup against everything the
+    // session already knows about.
+    session.sourceIds.push(rescueOffer.id);
+    const known = new Set([
+      ...session.queue.map(e => e.streamer),
+      ...session.slots.map(s => s.streamer),
+      ...session.rescued,
+    ]);
+    for (const e of entries) {
+      if (!known.has(e.streamer)) session.queue.push(e);
+    }
+    session.sweepDone = false; // new material, sweep again at next drain
+  }
+  await saveRescueSession(session);
+  const total = session.queue.length + session.slots.length;
+  await log("info",
+    `Rescue session: absorbed offer ${rescueOffer.id} (${entries.length} candidate(s)); queue=${session.queue.length}, slots=${session.slots.length}`
+  );
+  notifyUser(
+    "Stream Monitor",
+    `Streak rescue started: rotating ${total} stream(s), ${RESCUE_BATCH_SIZE} at a time, ${RESCUE_ROTATE_MINUTES} min per turn.`
+  );
+  await topUpRescueSlots();
+  await ensureRescueAlarm();
+}
+
+async function openRescueTab(session, entry) {
+  let url = entry.url;
+  try {
+    const u = new URL(url);
+    if (u.searchParams.get("sm") !== "1") {
+      u.searchParams.set("sm", "1");
+      url = u.toString();
+    }
+  } catch {
+    // keep url as-is
+  }
+  session.pendingOpens = session.pendingOpens || {};
+  session.pendingOpens[url] = entry.streamer;
+  await saveRescueSession(session);
+
+  let tab = null;
+  try {
+    // Rescue tabs open in the background on purpose: the rotation fires
+    // every 30 minutes and stealing focus each time would be obnoxious.
+    // The player-control machinery (ensurePlaying button clicks,
+    // keepalive, load recovery) is what makes an unfocused tab count,
+    // same as any other tracked tab.
+    tab = await browser.tabs.create({ url, active: false });
+  } catch (e) {
+    await log("warn", `Rescue: failed to open tab for ${entry.streamer}:`, e?.message || String(e));
+    delete session.pendingOpens[url];
+    await saveRescueSession(session);
+    return false;
+  }
+
+  const tabKey = String(tab.id);
+  // Track directly with the rescue flag. Rescue targets may not be on the
+  // monitored list at all (bell/sidebar finds), so URL-based tracking
+  // would skip them; and the flag exempts the tab from max-tabs
+  // displacement (its lifecycle belongs to the rotation).
+  const { trackedTabs } = await loadState();
+  const existing = trackedTabs[tabKey] || {};
+  trackedTabs[tabKey] = {
+    originalStreamer: entry.streamer,
+    raidHopCount: existing.raidHopCount || 0,
+    openedAt: Date.now(),
+    rescue: true,
+  };
+  await saveTrackedTabs(trackedTabs);
+  delete session.pendingOpens[url];
+  session.slots.push({ tabKey, streamer: entry.streamer, openedAt: Date.now() });
+  await muteTabIfEnabled(tab.id, entry.streamer);
+  setTimeout(() => activatePlayerControl(tab.id), 3000);
+  await log("info",
+    `Rescue: opened ${entry.streamer} (${entry.kind}) in tab ${tabKey} (slot ${session.slots.length}/${RESCUE_BATCH_SIZE})`
+  );
+  return true;
+}
+
+async function topUpRescueSlots() {
+  let session = await loadRescueSession();
+  if (!session || !session.active) return;
+  while (session.slots.length < RESCUE_BATCH_SIZE && session.queue.length > 0) {
+    const entry = session.queue.shift();
+    await openRescueTab(session, entry);
+    await saveRescueSession(session);
+    if (session.slots.length < RESCUE_BATCH_SIZE && session.queue.length > 0) {
+      // Stagger consecutive opens so the players start cleanly. If the
+      // event page dies mid-stagger, the next config tick's top-up
+      // resumes where this left off.
+      await new Promise(r => setTimeout(r, RESCUE_OPEN_STAGGER_MS));
+      session = await loadRescueSession();
+      if (!session || !session.active) return;
+    }
+  }
+}
+
+// Sweep for leftover streak-rescue targets: the sidebar "Save your
+// Streak" entry, /save-streak/ links anywhere in open Twitch tabs, and
+// the extension's own bell-scraped at-risk store.
+async function sweepForSaveStreakTargets(session) {
+  const known = new Set([
+    ...session.queue.map(e => e.streamer),
+    ...session.slots.map(s => s.streamer),
+    ...session.rescued,
+  ]);
+  const found = new Map();
+
+  try {
+    const map = await loadAtRiskStreaks();
+    for (const e of Object.values(map)) {
+      if (e && e.streamer && !e.acknowledged_at && !known.has(e.streamer) && !found.has(e.streamer)) {
+        found.set(e.streamer, {
+          streamer: e.streamer,
+          url: e.save_url || `https://www.twitch.tv/save-streak/${e.streamer}`,
+          kind: "ended",
+        });
+      }
+    }
+  } catch (e) {
+    await log("warn", "Rescue sweep: at-risk store read failed:", e?.message || String(e));
+  }
+
+  try {
+    const tabs = await browser.tabs.query({ url: "*://*.twitch.tv/*" });
+    for (const tab of tabs) {
+      let resp = null;
+      try {
+        resp = await browser.tabs.sendMessage(tab.id, { action: "scanSaveStreak" });
+      } catch {
+        continue; // dead page or no content script; load recovery handles it
+      }
+      if (resp && Array.isArray(resp.slugs)) {
+        for (const slug of resp.slugs) {
+          const s = String(slug).toLowerCase();
+          if (s && !known.has(s) && !found.has(s)) {
+            found.set(s, {
+              streamer: s,
+              url: `https://www.twitch.tv/save-streak/${s}`,
+              kind: "ended",
+            });
+          }
+        }
+      }
+    }
+  } catch (e) {
+    await log("warn", "Rescue sweep: tab scan failed:", e?.message || String(e));
+  }
+
+  return Array.from(found.values());
+}
+
+async function rotateRescue() {
+  const session = await loadRescueSession();
+  if (!session || !session.active) {
+    await browser.alarms.clear(RESCUE_ROTATE_ALARM);
+    return;
+  }
+
+  // Queue drained: sweep for stragglers before winding down.
+  if (session.queue.length === 0 && !session.sweepDone) {
+    const found = await sweepForSaveStreakTargets(session);
+    if (found.length > 0) {
+      session.queue.push(...found);
+      await log("info", `Rescue sweep found ${found.length} additional streak target(s)`);
+      notifyUser(
+        "Stream Monitor",
+        `Streak sweep found ${found.length} more stream(s) to rescue; continuing the rotation.`
+      );
+    } else {
+      session.sweepDone = true;
+      await log("info", "Rescue sweep found nothing further; winding down");
+    }
+    await saveRescueSession(session);
+  }
+
+  // The oldest slot's turn is over.
+  if (session.slots.length > 0) {
+    const oldest = session.slots.shift();
+    session.rescued.push(oldest.streamer);
+    await saveRescueSession(session);
+    try {
+      await browser.tabs.remove(Number(oldest.tabKey));
+      await log("info", `Rescue: closed ${oldest.streamer} (tab ${oldest.tabKey}) after its rotation turn`);
+    } catch (e) {
+      await log("warn", `Rescue: failed to close tab ${oldest.tabKey}:`, e?.message || String(e));
+    }
+  }
+
+  await topUpRescueSlots();
+
+  const after = await loadRescueSession();
+  if (!after || !after.active) return;
+  if (after.slots.length === 0 && after.queue.length === 0 && after.sweepDone) {
+    await log("info", `Rescue session complete: ${after.rescued.length} stream(s) watched`);
+    notifyUser("Stream Monitor", `Streak rescue complete: watched ${after.rescued.length} stream(s).`);
+    await clearRescueSession();
+  } else {
+    await browser.alarms.create(RESCUE_ROTATE_ALARM, { delayInMinutes: RESCUE_ROTATE_MINUTES });
+  }
+}
+
+// A rescue tab vanished outside the rotation (user closed it, raid close,
+// navigate-away untrack). Free the slot, count the streamer as done, and
+// pull the next target forward.
+async function handleRescueTabGone(tabKey) {
+  const session = await loadRescueSession();
+  if (!session || !session.active) return;
+  const idx = session.slots.findIndex(s => s.tabKey === tabKey);
+  if (idx === -1) return;
+  const [slot] = session.slots.splice(idx, 1);
+  session.rescued.push(slot.streamer);
+  await saveRescueSession(session);
+  await log("info", `Rescue: tab ${tabKey} (${slot.streamer}) closed externally; slot freed`);
+  await topUpRescueSlots();
+  const after = await loadRescueSession();
+  if (after && after.active && after.slots.length === 0 && after.queue.length === 0 && after.sweepDone) {
+    notifyUser("Stream Monitor", `Streak rescue complete: watched ${after.rescued.length} stream(s).`);
+    await clearRescueSession();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
 
@@ -718,6 +1174,20 @@ async function fetchConfig() {
         await browser.storage.local.set({ liveStreamers: data.live_streamers });
       }
 
+      // Streak-rescue offer from the desktop (published when the user's
+      // own stream ends). Also use the tick to self-heal an active
+      // session whose slots dropped below capacity.
+      try {
+        await maybeStartRescueFromConfig(data.rescue);
+        const rescueSession = await loadRescueSession();
+        if (rescueSession && rescueSession.active) {
+          await topUpRescueSlots();
+          await ensureRescueAlarm();
+        }
+      } catch (e) {
+        await log("warn", "Rescue config handling failed:", e?.message || String(e));
+      }
+
       await log("info", `Config loaded: ${monitored.length} monitored, ${pinned.length} pinned`);
       return new Set(monitored);
     }
@@ -782,13 +1252,21 @@ async function onTabCreated(tab) {
   const { trackedTabs, monitoredStreamers } = await loadState();
 
   if (monitoredStreamers.has(streamer)) {
-    trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0, openedAt: Date.now() };
+    // A rescue open racing this event keeps its rescue flag so the
+    // rotation's tab is never treated as a plain tracked tab.
+    const viaRescue = !!(await rescuePendingStreamerFor(tab.url));
+    trackedTabs[String(tab.id)] = {
+      originalStreamer: streamer,
+      raidHopCount: 0,
+      openedAt: Date.now(),
+      ...(viaRescue ? { rescue: true } : {}),
+    };
     await saveTrackedTabs(trackedTabs);
     const muted = await muteTabIfEnabled(tab.id, streamer);
-    const focused = await focusTabIfEnabled(tab);
+    const focused = viaRescue ? false : await focusTabIfEnabled(tab);
     // Delay slightly so the page has time to load the video player
     setTimeout(() => activatePlayerControl(tab.id), 3000);
-    await log("info", `Tab ${tab.id} created for monitored streamer: ${streamer}${muted ? " (muted)" : ""}${focused ? " (focused)" : ""}`);
+    await log("info", `Tab ${tab.id} created for monitored streamer: ${streamer}${muted ? " (muted)" : ""}${focused ? " (focused)" : ""}${viaRescue ? " (rescue)" : ""}`);
   }
 }
 
@@ -806,8 +1284,17 @@ async function onTabUpdated(tabId, changeInfo, tab) {
   // (e.g. after a reload triggered by keepalive or error recovery)
   if (changeInfo.status === "complete") {
     const { trackedTabs } = await loadState();
-    if (trackedTabs[String(tabId)]) {
+    const completed = trackedTabs[String(tabId)];
+    if (completed) {
       setTimeout(() => activatePlayerControl(tabId), 3000);
+      // Verify the page actually loaded. Browser error pages ("Server
+      // Not Found") also report status complete but never run the
+      // content script; catching that here gets the first recovery
+      // reload out ~10s after the failed load instead of waiting for
+      // the next keepalive tick.
+      setTimeout(() => {
+        checkTrackedTabLoaded(String(tabId), completed.originalStreamer);
+      }, LOAD_VERIFY_AFTER_COMPLETE_MS);
     }
   }
 
@@ -850,6 +1337,7 @@ async function onTabUpdated(tabId, changeInfo, tab) {
       await saveTrackedTabs(trackedTabs);
       await cancelPendingSwapsForTab(tabKey);
       await cancelPendingExpirationForTab(tabKey);
+      await clearLoadRecoveryForTab(tabKey);
       try {
         await browser.tabs.remove(tabId);
       } catch (e) {
@@ -862,16 +1350,26 @@ async function onTabUpdated(tabId, changeInfo, tab) {
       await saveTrackedTabs(trackedTabs);
       await cancelPendingSwapsForTab(tabKey);
       await cancelPendingExpirationForTab(tabKey);
+      await clearLoadRecoveryForTab(tabKey);
+      await handleRescueTabGone(tabKey);
     }
   } else if (newStreamer && monitoredStreamers.has(newStreamer) && isStreamMonitorTab(changeInfo.url)) {
     // New navigation to a monitored streamer opened by Stream Monitor (sm=1)
     const now = Date.now();
-    trackedTabs[tabKey] = { originalStreamer: newStreamer, raidHopCount: 0, openedAt: now };
+    // A rescue open racing this event keeps its rescue flag so the
+    // rotation's tab is exempt from max-tabs displacement below.
+    const viaRescue = !!(await rescuePendingStreamerFor(changeInfo.url));
+    trackedTabs[tabKey] = {
+      originalStreamer: newStreamer,
+      raidHopCount: 0,
+      openedAt: now,
+      ...(viaRescue ? { rescue: true } : {}),
+    };
     await saveTrackedTabs(trackedTabs);
     const muted = await muteTabIfEnabled(tabId, newStreamer);
-    const focused = await focusTabIfEnabled(tab);
+    const focused = viaRescue ? false : await focusTabIfEnabled(tab);
     setTimeout(() => activatePlayerControl(tabId), 3000);
-    await log("info", `Tab ${tabId} navigated to monitored streamer: ${newStreamer}${muted ? " (muted)" : ""}${focused ? " (focused)" : ""}`);
+    await log("info", `Tab ${tabId} navigated to monitored streamer: ${newStreamer}${muted ? " (muted)" : ""}${focused ? " (focused)" : ""}${viaRescue ? " (rescue)" : ""}`);
 
     // Enforce max tabs: when at capacity, try to displace an unpinned
     // open tab. Pinned tabs (streamers the user marked "Keep Open" in
@@ -886,7 +1384,7 @@ async function onTabUpdated(tabId, changeInfo, tab) {
     //   - all open tabs are pinned → schedule a pending expiration on
     //     the new tab at now + GRACE_MS so it still gets its 10 minutes
     //     before closing to respect the user's pinned set.
-    if (maxTabs > 0) {
+    if (maxTabs > 0 && !viaRescue) {
       const tabCount = Object.keys(trackedTabs).length;
       if (tabCount > maxTabs) {
         const candidates = Object.entries(trackedTabs).map(([k, info]) => {
@@ -895,6 +1393,7 @@ async function onTabUpdated(tabId, changeInfo, tab) {
             tabKey: k,
             streamer: info.originalStreamer,
             pinned: pinnedStreamers.has(info.originalStreamer),
+            rescue: !!info.rescue,
             openedAt,
             graceUntil: openedAt + GRACE_MS,
             inGrace: now - openedAt < GRACE_MS,
@@ -906,11 +1405,11 @@ async function onTabUpdated(tabId, changeInfo, tab) {
         // FIFO eviction (oldest first) so the longest-running tab cycles
         // out and newer ones get more time to build streak.
         const displaceable = others
-          .filter(c => !c.pinned && !c.inGrace)
+          .filter(c => !c.pinned && !c.rescue && !c.inGrace)
           .sort((a, b) => a.openedAt - b.openedAt);
         // Unpinned but in grace: schedule a swap for the earliest expiry.
         const shielded = others
-          .filter(c => !c.pinned && c.inGrace)
+          .filter(c => !c.pinned && !c.rescue && c.inGrace)
           .sort((a, b) => a.graceUntil - b.graceUntil);
 
         if (displaceable.length > 0) {
@@ -954,11 +1453,11 @@ async function onTabUpdated(tabId, changeInfo, tab) {
           // any of them. The new tab still gets its 10-minute streak
           // window before closing.
           await log("info",
-            `Max tabs (${maxTabs}) reached and all open tabs are pinned. Keeping ${newStreamer}'s tab open for ${GRACE_MINUTES}m to preserve streak, then closing.`
+            `Max tabs (${maxTabs}) reached and all open tabs are pinned or rescue-protected. Keeping ${newStreamer}'s tab open for ${GRACE_MINUTES}m to preserve streak, then closing.`
           );
           notifyUser(
             "Stream Monitor",
-            `Max tabs (${maxTabs}) reached. All open streams are pinned, so ${newStreamer}'s tab will close in ${GRACE_MINUTES} minutes after their streak is preserved.`
+            `Max tabs (${maxTabs}) reached. All open streams are protected, so ${newStreamer}'s tab will close in ${GRACE_MINUTES} minutes after their streak is preserved.`
           );
           await schedulePendingExpiration(tabKey, newStreamer, now + GRACE_MS);
         }
@@ -977,6 +1476,8 @@ async function onTabRemoved(tabId) {
   }
   await cancelPendingSwapsForTab(tabKey);
   await cancelPendingExpirationForTab(tabKey);
+  await clearLoadRecoveryForTab(tabKey);
+  await handleRescueTabGone(tabKey);
 }
 
 async function onAlarm(alarm) {
@@ -993,9 +1494,20 @@ async function onAlarm(alarm) {
     const tabIds = Object.keys(trackedTabs);
     if (tabIds.length === 0) return;
     await log("info", `Keepalive alarm: pinging ${tabIds.length} tracked tab(s)`);
-    for (const tabId of tabIds) {
-      sendToContentScript(Number(tabId), { action: "keepalive" });
+    for (const tabKey of tabIds) {
+      // The alive-check doubles as the load-failure probe: a tab whose
+      // page never loaded (browser error page, discarded tab) has no
+      // content script to answer, and checkTrackedTabLoaded reloads it
+      // with backoff. Dead tabs get no keepalive message; there is
+      // nothing in them to keep alive.
+      const alive = await checkTrackedTabLoaded(tabKey, trackedTabs[tabKey].originalStreamer);
+      if (alive) {
+        sendToContentScript(Number(tabKey), { action: "keepalive" });
+      }
     }
+  } else if (alarm.name === RESCUE_ROTATE_ALARM) {
+    await log("info", "Rescue rotation alarm fired");
+    await rotateRescue();
   } else if (alarm.name.startsWith(PENDING_SWAP_ALARM_PREFIX)) {
     const newTabKey = alarm.name.slice(PENDING_SWAP_ALARM_PREFIX.length);
     await log("info", `Pending swap alarm fired for tab ${newTabKey}`);
@@ -1087,6 +1599,33 @@ browser.runtime.onInstalled.addListener((details) => {
       }
       await log("info", `Dropped ${dropped} stale pending expiration(s) on startup`);
     }
+  }
+
+  // Same cleanup for load-recovery state.
+  const recovery = await loadLoadRecovery();
+  const staleRecovery = Object.keys(recovery).filter(k => !liveTabIds.has(k));
+  if (staleRecovery.length > 0) {
+    for (const k of staleRecovery) {
+      delete recovery[k];
+    }
+    await saveLoadRecovery(recovery);
+    await log("info", `Dropped ${staleRecovery.length} stale load-recovery entries on startup`);
+  }
+
+  // Reconcile an in-flight rescue session: drop slots whose tabs are
+  // gone (counting them as done), make sure the rotation alarm exists,
+  // and refill open slots from the queue.
+  const rescueSession = await loadRescueSession();
+  if (rescueSession && rescueSession.active) {
+    const gone = rescueSession.slots.filter(s => !liveTabIds.has(s.tabKey));
+    if (gone.length > 0) {
+      rescueSession.slots = rescueSession.slots.filter(s => liveTabIds.has(s.tabKey));
+      rescueSession.rescued.push(...gone.map(s => s.streamer));
+      await saveRescueSession(rescueSession);
+      await log("info", `Rescue: reconciled ${gone.length} missing slot tab(s) on startup`);
+    }
+    await ensureRescueAlarm();
+    await topUpRescueSlots();
   }
 
   await log("info", "Event page ready");
