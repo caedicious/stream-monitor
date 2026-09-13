@@ -6,6 +6,8 @@ installer_output/
 *.xpi
 icon.ico
 __pycache__/
+/StreamMonitorInstaller.exe
+/stream_monitor_chrome_*.zip
 
 # Claude Code
 .claude/
