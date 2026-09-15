@@ -307,6 +307,108 @@ def test_rescue_fallback_flushes_after_timeout(monitor):
     assert monitor.queued_vods == {}
 
 
+def test_rescue_candidates_prefer_live_over_queued_vod(monitor):
+    """A streamer who ended during the pause (VOD queued) but is live again
+    when the pause lifts gets ONE candidate: the live stream. Watching live
+    saves the streak; the save-streak link would only duplicate the tab."""
+    monitor.queued_vods = {
+        "alice": {"url": "https://www.twitch.tv/save-streak/alice?sm=1", "ended_at": "2026-09-15T01:00:00.000Z"},
+        "bob": {"url": "https://www.twitch.tv/save-streak/bob?sm=1", "ended_at": "2026-09-15T02:00:00.000Z"},
+    }
+    monitor.missed_while_paused["alice"] = "12:00:00"
+    cands = monitor._build_rescue_candidates({"alice"})
+    assert {(c["streamer"], c["kind"]) for c in cands} == {
+        ("bob", "ended"),
+        ("alice", "live"),
+    }
+
+
+def test_rescue_ack_drops_vod_for_live_candidate(monitor):
+    """Acking a live candidate also clears any queued VOD for the same
+    streamer so a later flush can't open a duplicate save-streak tab."""
+    monitor.missed_while_paused["alice"] = "12:00:00"
+    monitor.streamers["alice"].browser_opened = False
+    monitor._offer_rescue_or_flush({"alice"})
+    # The VOD lands after the offer went out (alice ended during the ack
+    # window); the live candidate still covers her streak.
+    monitor.queued_vods["alice"] = {
+        "url": "https://www.twitch.tv/save-streak/alice?sm=1", "ended_at": "x",
+    }
+    offer = monitor.rescue_pending
+    with patch("stream_monitor_tray.webbrowser.open") as mopen:
+        assert monitor.acknowledge_rescue(offer["id"]) is True
+    mopen.assert_not_called()
+    assert monitor.queued_vods == {}
+
+
+def test_rescue_fallback_waits_while_extension_polls(monitor, monkeypatch):
+    """Past the 180s soft deadline with the extension still polling /config,
+    the desktop holds the offer (logging rescue_ack_overdue once) instead of
+    flooding. The hard deadline flushes even if polls continue: this is the
+    v1.7.2 incident where a live extension failed every ack."""
+    import time as _time
+    import stream_monitor_tray as sm
+
+    monitor.queued_vods = {
+        "bob": {"url": "https://www.twitch.tv/save-streak/bob?sm=1", "ended_at": "x"},
+    }
+    monitor._offer_rescue_or_flush(set())
+    monitor._rescue_deadline_monotonic = 0.0  # soft deadline passed
+    monkeypatch.setattr(sm, "_extension_last_seen_monotonic", _time.monotonic())
+
+    with patch("stream_monitor_tray.webbrowser.open") as mopen:
+        monitor._maybe_fallback_rescue()
+    mopen.assert_not_called()
+    assert monitor.rescue_pending is not None  # offer still published
+    assert monitor._rescue_overdue_logged is True
+
+    # Hard deadline passes: flush happens despite live polling.
+    monitor._rescue_offer_started_monotonic = (
+        _time.monotonic() - sm.RESCUE_ACK_HARD_TIMEOUT_SECONDS - 1
+    )
+    with patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
+        monitor._maybe_fallback_rescue()
+        assert monitor.wait_for_pending_opens(timeout=5)
+    assert monitor.rescue_pending is None
+    assert monitor.queued_vods == {}
+
+
+def test_rescue_fallback_immediate_when_no_polls(monitor, monkeypatch):
+    """With nothing polling /config (browser closed), the 180s fallback
+    fires exactly as pre-1.7.3."""
+    import stream_monitor_tray as sm
+
+    monkeypatch.setattr(sm, "_extension_last_seen_monotonic", None)
+    monitor.queued_vods = {
+        "bob": {"url": "https://www.twitch.tv/save-streak/bob?sm=1", "ended_at": "x"},
+    }
+    monitor._offer_rescue_or_flush(set())
+    monitor._rescue_deadline_monotonic = 0.0
+    with patch("stream_monitor_tray.webbrowser.open", return_value=True):
+        monitor._maybe_fallback_rescue()
+        assert monitor.wait_for_pending_opens(timeout=5)
+    assert monitor.rescue_pending is None
+    assert monitor.queued_vods == {}
+
+
+def test_rescue_fallback_skips_vod_when_live_opened(monitor):
+    """Fallback path: a streamer opened live doesn't also get their queued
+    save-streak tab (the venusdawnvt double-open seen on 1.7.2)."""
+    monitor.queued_vods = {
+        "alice": {"url": "https://www.twitch.tv/save-streak/alice?sm=1", "ended_at": "x"},
+    }
+    monitor.missed_while_paused["alice"] = "12:00:00"
+    monitor.live_streamers = ["alice"]
+    monitor._offer_rescue_or_flush({"alice"})
+    monitor._rescue_deadline_monotonic = 0.0
+    with patch("stream_monitor_tray.webbrowser.open", return_value=True) as mopen:
+        monitor._maybe_fallback_rescue()
+        assert monitor.wait_for_pending_opens(timeout=5)
+    opened = {c.args[0] for c in mopen.call_args_list}
+    assert opened == {"https://twitch.tv/alice?sm=1"}
+    assert monitor.queued_vods == {}
+
+
 def test_queue_does_not_flush_if_manual_pause_still_active(monitor):
     """If auto_pause lifts but the manual pause is still on, no rescue
     offer is published and the queue stays intact — only opening would

@@ -983,13 +983,25 @@ async function maybeStartRescueFromConfig(rescueOffer) {
   }
   if (!acked) return;
 
-  const entries = rescueOffer.candidates
+  const raw = rescueOffer.candidates
     .map(c => ({
       streamer: String(c.streamer || "").toLowerCase(),
       url: c.url,
       kind: c.kind === "ended" ? "ended" : "live",
     }))
     .filter(e => e.streamer && typeof e.url === "string");
+  // The same streamer can arrive twice (ended during the pause, then live
+  // again by the time the pause lifted). Watching the live stream saves
+  // the streak, so the live entry wins; exact repeats collapse too.
+  const liveNow = new Set(raw.filter(e => e.kind === "live").map(e => e.streamer));
+  const seen = new Set();
+  const entries = [];
+  for (const e of raw) {
+    if (e.kind === "ended" && liveNow.has(e.streamer)) continue;
+    if (seen.has(e.streamer)) continue;
+    seen.add(e.streamer);
+    entries.push(e);
+  }
 
   if (!session || !session.active) {
     session = {
