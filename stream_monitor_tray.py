@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.7.3"
+VERSION = "1.8.0"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -561,6 +561,11 @@ class Config:
     own_channel: str = ""
     im_live_pause: bool = False
     vod_fallback: bool = False
+    # Release tag the user asked not to be reminded about again (the
+    # "do not remind me" checkbox on the update prompt). Cleared
+    # implicitly when a newer version than the skipped one appears,
+    # because the comparison is against this exact string.
+    skip_update_version: str = ""
 
     def __post_init__(self):
         if self.streamers is None:
@@ -1424,14 +1429,15 @@ class StreamMonitorApp:
         threading.Thread(target=self._check_for_updates_ui, daemon=True).start()
     
     def _check_for_updates_ui(self):
-        """Check for updates with UI feedback."""
+        """Manual tray-menu check: prompt and install like the launch
+        check, but ignore a saved "do not remind me" for the version,
+        since the user explicitly asked."""
         self.update_status("Checking for updates...")
-        update_available, latest_version, download_url = self.check_for_updates()
-        
+        update_available, latest_version, release = self.check_for_updates()
+
         if update_available:
             self.update_status(f"Update available: v{latest_version}")
-            # Open browser to releases page
-            webbrowser.open(download_url)
+            self._offer_update(latest_version, release)
         else:
             self.update_status("Up to date!")
             time.sleep(3)
@@ -1439,11 +1445,26 @@ class StreamMonitorApp:
                 self.update_status("Monitoring...")
             else:
                 self.update_status("Stopped")
+
+    def _offer_update(self, latest_version: str, release: dict) -> None:
+        """Prompt the user and act on their answer."""
+        choice = self._prompt_update_dialog(latest_version)
+        if choice == "yes":
+            self._download_and_install_update(latest_version, release)
+        elif choice == "later_skip":
+            self.config.skip_update_version = latest_version
+            self.config.save()
+            log.info("User muted update reminders for v%s", latest_version)
+        else:
+            log.info("User deferred update to v%s", latest_version)
     
-    def check_for_updates(self) -> tuple[bool, str, str]:
+    def check_for_updates(self) -> tuple[bool, str, dict]:
         """
         Check GitHub for newer releases.
-        Returns: (update_available, latest_version, download_url)
+        Returns: (update_available, latest_version, release_data). The
+        release_data dict is GitHub's release JSON (assets included) so
+        the installer can be downloaded without a second API call; it is
+        empty when the check failed.
         """
         try:
             response = requests.get(
@@ -1452,35 +1473,130 @@ class StreamMonitorApp:
             )
             response.raise_for_status()
             data = response.json()
-            
+
             latest_version = data.get("tag_name", "").lstrip("v")
-            download_url = data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases")
-            
-            # Compare versions
             if self._is_newer_version(latest_version, VERSION):
-                return True, latest_version, download_url
-            
-            return False, latest_version, download_url
-            
+                return True, latest_version, data
+
+            return False, latest_version, data
+
         except requests.RequestException as e:
             log.error("Update check failed: %s", e)
-            return False, VERSION, f"https://github.com/{GITHUB_REPO}/releases"
-    
+            return False, VERSION, {}
+
     def _is_newer_version(self, latest: str, current: str) -> bool:
         """Compare version strings (e.g., '1.2.0' > '1.1.0')."""
-        try:
-            latest_parts = [int(x) for x in latest.split(".")]
-            current_parts = [int(x) for x in current.split(".")]
-            
-            # Pad to same length
-            while len(latest_parts) < len(current_parts):
-                latest_parts.append(0)
-            while len(current_parts) < len(latest_parts):
-                current_parts.append(0)
-            
-            return latest_parts > current_parts
-        except ValueError:
+        if not latest:
             return False
+        latest_parts = _version_parts(latest)
+        current_parts = _version_parts(current)
+
+        # Pad to same length
+        while len(latest_parts) < len(current_parts):
+            latest_parts.append(0)
+        while len(current_parts) < len(latest_parts):
+            current_parts.append(0)
+
+        return latest_parts > current_parts
+
+    def _prompt_update_dialog(self, latest_version: str) -> str:
+        """Show the update prompt in a SEPARATE process and return the
+        user's choice: "yes", "later", or "later_skip". pystray and
+        tkinter cannot share this process without breaking keyboard
+        input, the same reason the settings editor is its own process."""
+        import subprocess
+        try:
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--update-dialog", VERSION, latest_version]
+            else:
+                cmd = [
+                    sys.executable, str(Path(__file__).resolve()),
+                    "--update-dialog", VERSION, latest_version,
+                ]
+            proc = subprocess.run(cmd)
+            return {10: "yes", 11: "later", 12: "later_skip"}.get(proc.returncode, "later")
+        except Exception as e:
+            log.error("Update dialog failed: %s", e)
+            return "later"
+
+    def _download_and_install_update(self, latest_version: str, release: dict) -> None:
+        """Download the installer from the release, verify it against the
+        release's own SHA256SUMS.txt, then hand off to a detached script
+        that runs the silent install and relaunches the app, and exit."""
+        import hashlib
+        import subprocess
+        try:
+            assets = {
+                a.get("name"): a.get("browser_download_url")
+                for a in release.get("assets", [])
+            }
+            installer_url = assets.get("StreamMonitorInstaller.exe")
+            sums_url = assets.get("SHA256SUMS.txt")
+            if not installer_url or not sums_url:
+                raise RuntimeError("release is missing the installer or SHA256SUMS.txt asset")
+
+            self.update_status(f"Downloading update v{latest_version}...")
+            self.send_notification("Stream Monitor", f"Downloading update v{latest_version}...")
+
+            sums_resp = requests.get(sums_url, timeout=30)
+            sums_resp.raise_for_status()
+            expected = _installer_hash_from_sums(sums_resp.text)
+            if not expected:
+                raise RuntimeError("installer hash not found in SHA256SUMS.txt")
+
+            update_dir = CONFIG_DIR / "update"
+            update_dir.mkdir(parents=True, exist_ok=True)
+            target = update_dir / f"StreamMonitorInstaller-{latest_version}.exe"
+            digest = hashlib.sha256()
+            with requests.get(installer_url, timeout=60, stream=True) as resp:
+                resp.raise_for_status()
+                with open(target, "wb") as f:
+                    for chunk in resp.iter_content(1024 * 1024):
+                        f.write(chunk)
+                        digest.update(chunk)
+            if digest.hexdigest().lower() != expected:
+                target.unlink(missing_ok=True)
+                raise RuntimeError("downloaded installer failed SHA256 verification")
+
+            # The installer cannot replace a running exe, so a detached
+            # cmd script waits for this process to exit, installs
+            # silently, relaunches the app, and cleans up after itself.
+            bat = update_dir / "apply_update.bat"
+            bat.write_text(
+                "@echo off\r\n"
+                "timeout /t 3 /nobreak >nul\r\n"
+                f'"{target}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\n'
+                f'start "" "{sys.executable}"\r\n'
+                f'del "{target}"\r\n'
+                'del "%~f0"\r\n',
+                encoding="utf-8",
+            )
+            log.info("Update v%s verified; handing off to the installer and exiting", latest_version)
+            log_activity(
+                "update_install_started",
+                from_version=VERSION, to_version=latest_version,
+            )
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(
+                ["cmd", "/c", str(bat)],
+                creationflags=CREATE_NO_WINDOW,
+                close_fds=True,
+            )
+            if self.monitor:
+                self.monitor.stop()
+            if self.icon:
+                self.icon.stop()
+        except Exception as e:
+            log.error("Update install failed: %s", e)
+            log_activity(
+                "update_install_failed",
+                to_version=latest_version, error=str(e),
+            )
+            self.update_status(f"Update v{latest_version} failed; will retry next launch")
+            self.send_notification(
+                "Stream Monitor",
+                f"Update to v{latest_version} failed ({e}). It will be offered again on the next launch.",
+            )
     
     def on_about(self, icon, item):
         """Open the about page in the browser."""
@@ -1802,14 +1918,120 @@ class StreamMonitorApp:
         )
 
     def _startup_update_check(self):
-        """Check for updates silently on startup."""
+        """Launch-time update check: prompt to download and install when a
+        newer release exists, unless the user muted reminders for exactly
+        that version. Dev (non-frozen) runs never prompt or install."""
         time.sleep(5)  # Wait a bit after startup
-        update_available, latest_version, download_url = self.check_for_updates()
-        if update_available:
-            self.update_status(f"Update available: v{latest_version}")
+        update_available, latest_version, release = self.check_for_updates()
+        if not update_available:
+            return
+        self.update_status(f"Update available: v{latest_version}")
+        if not getattr(sys, "frozen", False):
+            log.info("Update v%s available; prompt skipped in a non-frozen run", latest_version)
+            return
+        if self.config.skip_update_version == latest_version:
+            log.info("Update v%s available but reminders for it are muted", latest_version)
+            return
+        self._offer_update(latest_version, release)
+
+
+def _version_parts(value: str) -> list:
+    """Leading digits of each dot segment; suffixed segments like '2-pre'
+    count as their numeric part, so a stray tag suffix can never crash
+    the comparison."""
+    parts = []
+    for piece in value.split("."):
+        digits = ""
+        for ch in piece:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    return parts
+
+
+def _installer_hash_from_sums(sums_text: str) -> Optional[str]:
+    """Extract the installer's SHA256 from a release's SHA256SUMS.txt
+    (GNU coreutils format: "<hash>  <filename>", comment lines start
+    with '#'). Returns the lowercase hex digest or None."""
+    for line in sums_text.splitlines():
+        line = line.strip()
+        if line.startswith("#") or not line:
+            continue
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == "StreamMonitorInstaller.exe":
+            candidate = parts[0].lower()
+            if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
+                return candidate
+    return None
+
+
+def run_update_dialog(current_version: str, latest_version: str) -> int:
+    """The update prompt. Runs in its OWN process (main() dispatches on
+    --update-dialog): pystray and tkinter cannot share the tray process
+    without breaking keyboard input, the same reason the settings editor
+    is a separate process.
+
+    Exit codes: 10 install now, 11 not right now, 12 not right now and
+    do not remind again for this version."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    result = {"code": 11}
+    root = tk.Tk()
+    root.title("Stream Monitor Update")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+
+    frame = ttk.Frame(root, padding=20)
+    frame.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(frame, text="New update available", font=("", 12, "bold")).pack(anchor=tk.W)
+    ttk.Label(
+        frame,
+        text=(
+            f"Stream Monitor v{latest_version} is available (you have v{current_version}).\n"
+            "Would you like to install it? The app will restart itself when it finishes."
+        ),
+        justify=tk.LEFT,
+    ).pack(anchor=tk.W, pady=(8, 12))
+
+    remind_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(
+        frame, text="Do not remind me about this version", variable=remind_var
+    ).pack(anchor=tk.W)
+
+    def choose(code: int):
+        result["code"] = code
+        root.destroy()
+
+    def not_now():
+        choose(12 if remind_var.get() else 11)
+
+    buttons = ttk.Frame(frame)
+    buttons.pack(fill=tk.X, pady=(14, 0))
+    ttk.Button(buttons, text="Yes", width=12, command=lambda: choose(10)).pack(
+        side=tk.RIGHT, padx=(8, 0)
+    )
+    ttk.Button(buttons, text="Not right now", width=14, command=not_now).pack(side=tk.RIGHT)
+    root.protocol("WM_DELETE_WINDOW", not_now)
+
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+    y = (root.winfo_screenheight() - root.winfo_height()) // 3
+    root.geometry(f"+{x}+{y}")
+    root.mainloop()
+    return result["code"]
 
 
 def main():
+    # Dialog mode: spawned by the tray process (which cannot host tkinter
+    # next to pystray). Must be handled before any tray/server startup so
+    # the single-instance port is never touched.
+    if len(sys.argv) >= 2 and sys.argv[1] == "--update-dialog":
+        current = sys.argv[2] if len(sys.argv) > 2 else VERSION
+        latest = sys.argv[3] if len(sys.argv) > 3 else ""
+        sys.exit(run_update_dialog(current, latest))
     app = StreamMonitorApp()
     app.run()
 
