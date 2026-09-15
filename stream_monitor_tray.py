@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -1561,12 +1561,33 @@ class StreamMonitorApp:
             # The installer cannot replace a running exe, so a detached
             # cmd script waits for this process to exit, installs
             # silently, relaunches the app, and cleans up after itself.
+            #
+            # Relaunch is done with a settle delay and a bounded retry: a
+            # freshly written onefile exe can briefly fail to start while
+            # antivirus scans it (the bootloader cannot load its extracted
+            # python DLL yet, the "Failed to load Python DLL" error). We
+            # poll the config server and only stop once it answers, so a
+            # transient first-launch failure self-heals instead of leaving
+            # the user with no running app.
             bat = update_dir / "apply_update.bat"
+            exe = sys.executable
+            config_url = f"http://127.0.0.1:{CONFIG_SERVER_PORT}/config"
             bat.write_text(
                 "@echo off\r\n"
                 "timeout /t 3 /nobreak >nul\r\n"
                 f'"{target}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\n'
-                f'start "" "{sys.executable}"\r\n'
+                "timeout /t 5 /nobreak >nul\r\n"
+                f'start "" "{exe}"\r\n'
+                "for /L %%i in (1,1,6) do (\r\n"
+                "  timeout /t 3 /nobreak >nul\r\n"
+                f'  curl -s -m 2 "{config_url}" >nul 2>&1 && goto smdone\r\n'
+                ")\r\n"
+                f'start "" "{exe}"\r\n'
+                "for /L %%i in (1,1,6) do (\r\n"
+                "  timeout /t 3 /nobreak >nul\r\n"
+                f'  curl -s -m 2 "{config_url}" >nul 2>&1 && goto smdone\r\n'
+                ")\r\n"
+                ":smdone\r\n"
                 f'del "{target}"\r\n'
                 'del "%~f0"\r\n',
                 encoding="utf-8",
