@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -1553,27 +1553,30 @@ class StreamMonitorApp:
             # cmd script waits for this process to exit, installs
             # silently, relaunches the app, and cleans up after itself.
             #
-            # Relaunch is done with a settle delay and a bounded retry: a
-            # freshly written onefile exe can briefly fail to start while
-            # antivirus scans it (the bootloader cannot load its extracted
-            # python DLL yet, the "Failed to load Python DLL" error). We
-            # poll the config server and only stop once it answers, so a
-            # transient first-launch failure self-heals instead of leaving
-            # the user with no running app.
+            # Relaunch uses explorer.exe, not "start". Launching the new
+            # onefile exe as a descendant of THIS exiting onefile app made
+            # its bootloader fail to load its extracted python DLL
+            # ("Failed to load Python DLL ... _MEI...\python312.dll ... The
+            # specified module could not be found"), reproducibly, on a
+            # clean self-update. Handing the path to explorer.exe launches
+            # it as a child of the shell instead, with a clean process and
+            # environment, which loads correctly. A bounded retry that
+            # polls the config server still guards against a transient miss.
             bat = update_dir / "apply_update.bat"
             exe = sys.executable
             config_url = f"http://127.0.0.1:{CONFIG_SERVER_PORT}/config"
             bat.write_text(
                 "@echo off\r\n"
+                'set "_MEIPASS2="\r\n'
                 "timeout /t 3 /nobreak >nul\r\n"
                 f'"{target}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\n'
                 "timeout /t 5 /nobreak >nul\r\n"
-                f'start "" "{exe}"\r\n'
+                f'explorer.exe "{exe}"\r\n'
                 "for /L %%i in (1,1,6) do (\r\n"
                 "  timeout /t 3 /nobreak >nul\r\n"
                 f'  curl -s -m 2 "{config_url}" >nul 2>&1 && goto smdone\r\n'
                 ")\r\n"
-                f'start "" "{exe}"\r\n'
+                f'explorer.exe "{exe}"\r\n'
                 "for /L %%i in (1,1,6) do (\r\n"
                 "  timeout /t 3 /nobreak >nul\r\n"
                 f'  curl -s -m 2 "{config_url}" >nul 2>&1 && goto smdone\r\n'
@@ -1588,11 +1591,21 @@ class StreamMonitorApp:
                 "update_install_started",
                 from_version=VERSION, to_version=latest_version,
             )
+            # Strip _MEIPASS2 from the child environment. A PyInstaller
+            # onefile app sets it to its own temp extraction dir; a child
+            # that is also a onefile exe (the relaunched app) would inherit
+            # it and try to load its python DLL from THIS app's dir, which
+            # is deleted moments later on exit, failing with "Failed to
+            # load Python DLL". Clearing it lets the installer and the
+            # relaunched app extract their own bundles cleanly.
             CREATE_NO_WINDOW = 0x08000000
+            child_env = os.environ.copy()
+            child_env.pop("_MEIPASS2", None)
             subprocess.Popen(
                 ["cmd", "/c", str(bat)],
                 creationflags=CREATE_NO_WINDOW,
                 close_fds=True,
+                env=child_env,
             )
             if self.monitor:
                 self.monitor.stop()
