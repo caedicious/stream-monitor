@@ -144,3 +144,52 @@ def test_startup_check_never_prompts_in_dev_runs(monkeypatch):
     app = _launch_app(monkeypatch, frozen=False, skip_version="")
     app._startup_update_check()
     app._offer_update.assert_not_called()
+
+
+# --- download retry helpers --------------------------------------------------
+
+def test_get_text_retries_then_succeeds(monkeypatch):
+    """A transient failure (e.g. a just-published asset still returning
+    404) is retried and the eventual success is returned."""
+    monkeypatch.setattr(sm.time, "sleep", lambda s: None)
+    ok = MagicMock()
+    ok.text = "hash  StreamMonitorInstaller.exe"
+    ok.raise_for_status = lambda: None
+    calls = [sm.requests.RequestException("404"), sm.requests.RequestException("reset"), ok]
+    with patch.object(sm.requests, "get", side_effect=calls):
+        assert sm._http_get_text_with_retry("http://x", attempts=4) == ok.text
+
+
+def test_get_text_raises_after_exhausting_attempts(monkeypatch):
+    monkeypatch.setattr(sm.time, "sleep", lambda s: None)
+    with patch.object(sm.requests, "get", side_effect=sm.requests.RequestException("down")):
+        try:
+            sm._http_get_text_with_retry("http://x", attempts=3)
+            assert False, "expected RequestException"
+        except sm.requests.RequestException:
+            pass
+
+
+def test_download_file_retries_then_returns_hash(monkeypatch, tmp_path):
+    """The installer download restarts cleanly on a transient failure and
+    returns the sha256 of the bytes actually written."""
+    import hashlib
+    monkeypatch.setattr(sm.time, "sleep", lambda s: None)
+    payload = b"installer-bytes-" * 1000
+    expected = hashlib.sha256(payload).hexdigest()
+
+    def good_ctx():
+        cm = MagicMock()
+        resp = MagicMock()
+        resp.raise_for_status = lambda: None
+        resp.iter_content = lambda n: iter([payload])
+        cm.__enter__ = lambda self: resp
+        cm.__exit__ = lambda self, *a: False
+        return cm
+
+    calls = [sm.requests.RequestException("timeout"), good_ctx()]
+    dest = tmp_path / "installer.exe"
+    with patch.object(sm.requests, "get", side_effect=calls):
+        got = sm._download_file_with_retry("http://x", dest, attempts=3)
+    assert got == expected
+    assert dest.read_bytes() == payload

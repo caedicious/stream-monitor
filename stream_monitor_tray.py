@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -1523,7 +1523,6 @@ class StreamMonitorApp:
         """Download the installer from the release, verify it against the
         release's own SHA256SUMS.txt, then hand off to a detached script
         that runs the silent install and relaunches the app, and exit."""
-        import hashlib
         import subprocess
         try:
             assets = {
@@ -1538,23 +1537,15 @@ class StreamMonitorApp:
             self.update_status(f"Downloading update v{latest_version}...")
             self.send_notification("Stream Monitor", f"Downloading update v{latest_version}...")
 
-            sums_resp = requests.get(sums_url, timeout=30)
-            sums_resp.raise_for_status()
-            expected = _installer_hash_from_sums(sums_resp.text)
+            expected = _installer_hash_from_sums(_http_get_text_with_retry(sums_url))
             if not expected:
                 raise RuntimeError("installer hash not found in SHA256SUMS.txt")
 
             update_dir = CONFIG_DIR / "update"
             update_dir.mkdir(parents=True, exist_ok=True)
             target = update_dir / f"StreamMonitorInstaller-{latest_version}.exe"
-            digest = hashlib.sha256()
-            with requests.get(installer_url, timeout=60, stream=True) as resp:
-                resp.raise_for_status()
-                with open(target, "wb") as f:
-                    for chunk in resp.iter_content(1024 * 1024):
-                        f.write(chunk)
-                        digest.update(chunk)
-            if digest.hexdigest().lower() != expected:
+            actual = _download_file_with_retry(installer_url, target)
+            if actual.lower() != expected:
                 target.unlink(missing_ok=True)
                 raise RuntimeError("downloaded installer failed SHA256 verification")
 
@@ -1986,6 +1977,48 @@ def _installer_hash_from_sums(sums_text: str) -> Optional[str]:
             if len(candidate) == 64 and all(c in "0123456789abcdef" for c in candidate):
                 return candidate
     return None
+
+
+def _http_get_text_with_retry(url: str, attempts: int = 4) -> str:
+    """GET text (the checksum file) with a few retries. Covers transient
+    network failures and the brief window after a release is published
+    where GitHub returns 404 for an asset that is still propagating.
+    Raises the last error if every attempt fails."""
+    last = None
+    for i in range(attempts):
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as e:
+            last = e
+            log.warning("Fetch attempt %d/%d failed for %s: %s", i + 1, attempts, url, e)
+            time.sleep(min(2 ** i, 15))
+    raise last
+
+
+def _download_file_with_retry(url: str, dest, attempts: int = 4) -> str:
+    """Download url to dest, returning the sha256 hex digest. Each attempt
+    restarts the download from scratch; retries cover transient network
+    failures and a just-published asset still propagating on GitHub's CDN.
+    Raises the last error if every attempt fails."""
+    import hashlib
+    last = None
+    for i in range(attempts):
+        try:
+            digest = hashlib.sha256()
+            with requests.get(url, timeout=60, stream=True) as resp:
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_content(1024 * 1024):
+                        f.write(chunk)
+                        digest.update(chunk)
+            return digest.hexdigest()
+        except requests.RequestException as e:
+            last = e
+            log.warning("Download attempt %d/%d failed for %s: %s", i + 1, attempts, url, e)
+            time.sleep(min(2 ** i, 15))
+    raise last
 
 
 def run_update_dialog(current_version: str, latest_version: str) -> int:
