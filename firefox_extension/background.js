@@ -39,6 +39,21 @@ const PENDING_EXPIRE_ALARM_PREFIX = "pending-expire-";
 // attempts. The counter resets as soon as a ping succeeds.
 const LOAD_RECOVERY_BASE_DELAY_MS = 60 * 1000;
 const LOAD_RECOVERY_MAX_DELAY_MS = 5 * 60 * 1000;
+
+// Streak-rescue rotation (v1.7.0). When the desktop's auto-pause lifts it
+// publishes a rescue offer in /config; this extension acknowledges via
+// POST /rescue_ack and then owns the whole rotation: open the first
+// RESCUE_BATCH_SIZE targets, and every RESCUE_ROTATE_MINUTES close the
+// oldest open rescue tab and open the next queued one. When the queue
+// drains, a sweep looks for leftover "Save your Streak" UI (sidebar
+// entry, bell cards, at-risk store) and feeds anything found back into
+// the queue. The session ends when a sweep finds nothing and the last
+// slots have finished their turns.
+const RESCUE_ROTATE_ALARM = "rescue-rotate";
+const RESCUE_BATCH_SIZE = 3;
+const RESCUE_ROTATE_MINUTES = 30;
+const RESCUE_OPEN_STAGGER_MS = 10000;
+const RESCUE_ACK_URL = "http://127.0.0.1:52832/rescue_ack";
 // After a tracked tab reports status "complete", wait this long before
 // verifying the content script is alive. Error pages report "complete"
 // too, so this catches a failed open within seconds instead of waiting
@@ -483,6 +498,23 @@ browser.runtime.onMessage.addListener((message, sender) => {
 
 const STREAK_EVENT_URL = "http://127.0.0.1:52832/streak_event";
 
+// POST JSON to the desktop app. Uses XMLHttpRequest for the same reason
+// as fetchConfig: fetch() can throw NetworkError in MV3 event pages that
+// just woke from suspension, and these posts fire on exactly that wake
+// path (the config alarm sees a rescue offer, a streak scan after wake).
+function postJson(url, payload) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.timeout = 5000;
+    xhr.onload = () => resolve({ status: xhr.status, ok: xhr.status >= 200 && xhr.status < 300 });
+    xhr.onerror = () => reject(new Error("XHR network error"));
+    xhr.ontimeout = () => reject(new Error("XHR timeout"));
+    xhr.send(JSON.stringify(payload));
+  });
+}
+
 async function forwardStreakEvent(event) {
   try {
     const hasPerm = await browser.permissions.contains({
@@ -492,12 +524,7 @@ async function forwardStreakEvent(event) {
       await log("info", "Streak event detected but host permission not granted; skipping");
       return;
     }
-    const resp = await fetch(STREAK_EVENT_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(event),
-      signal: AbortSignal.timeout(5000),
-    });
+    const resp = await postJson(STREAK_EVENT_URL, event);
     if (!resp.ok) {
       await log("warn", `Streak event POST returned HTTP ${resp.status}`);
     } else {
@@ -844,25 +871,32 @@ async function maybeStartRescueFromConfig(rescueOffer) {
   // browser profile claimed it) and we must not open anything.
   let acked = false;
   try {
-    const resp = await fetch(RESCUE_ACK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id: rescueOffer.id }),
-      signal: AbortSignal.timeout(5000),
-    });
+    const resp = await postJson(RESCUE_ACK_URL, { id: rescueOffer.id });
     acked = resp.ok || resp.status === 204;
   } catch (e) {
     await log("warn", "Rescue ack POST failed:", e?.message || String(e));
   }
   if (!acked) return;
 
-  const entries = rescueOffer.candidates
+  const raw = rescueOffer.candidates
     .map(c => ({
       streamer: String(c.streamer || "").toLowerCase(),
       url: c.url,
       kind: c.kind === "ended" ? "ended" : "live",
     }))
     .filter(e => e.streamer && typeof e.url === "string");
+  // The same streamer can arrive twice (ended during the pause, then live
+  // again by the time the pause lifted). Watching the live stream saves
+  // the streak, so the live entry wins; exact repeats collapse too.
+  const liveNow = new Set(raw.filter(e => e.kind === "live").map(e => e.streamer));
+  const seen = new Set();
+  const entries = [];
+  for (const e of raw) {
+    if (e.kind === "ended" && liveNow.has(e.streamer)) continue;
+    if (seen.has(e.streamer)) continue;
+    seen.add(e.streamer);
+    entries.push(e);
+  }
 
   if (!session || !session.active) {
     session = {

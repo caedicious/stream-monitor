@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -144,6 +144,34 @@ _tray_notifier: Optional[Callable[[str, str], None]] = None
 # falls back to the pre-1.7 behavior of opening everything at once through
 # the paced queue.
 RESCUE_ACK_TIMEOUT_SECONDS = 180
+
+# The 180s window assumes the extension is absent (browser closed, old
+# version). If the extension is demonstrably alive (it polls GET /config
+# every minute) but the ack has not arrived (transient POST failure, an
+# extension-side bug), flushing at 180s floods the browser for nothing.
+# While polls keep arriving the offer stays published until the hard
+# deadline below; the blind 180s fallback applies only when nothing has
+# polled recently.
+RESCUE_ACK_HARD_TIMEOUT_SECONDS = 600
+EXTENSION_ALIVE_WINDOW_SECONDS = 150
+
+_extension_last_seen_monotonic: Optional[float] = None
+_extension_seen_lock = threading.Lock()
+
+
+def note_extension_contact() -> None:
+    """Record that something (the browser extension) just fetched /config."""
+    global _extension_last_seen_monotonic
+    with _extension_seen_lock:
+        _extension_last_seen_monotonic = time.monotonic()
+
+
+def extension_seen_within(seconds: float) -> bool:
+    """True if /config was fetched within the last `seconds` seconds."""
+    with _extension_seen_lock:
+        last = _extension_last_seen_monotonic
+    return last is not None and (time.monotonic() - last) <= seconds
+
 
 _rescue_ack_handler: Optional[Callable[[str], bool]] = None
 
@@ -321,6 +349,7 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/config":
+            note_extension_contact()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "moz-extension://*")
@@ -610,6 +639,8 @@ class TwitchMonitor:
         # (ack) and the monitor thread (fallback timeout) racing.
         self.rescue_pending: Optional[dict] = None
         self._rescue_deadline_monotonic: float = 0.0
+        self._rescue_offer_started_monotonic: float = 0.0
+        self._rescue_overdue_logged: bool = False
         self._rescue_lock = threading.Lock()
         # Per-streamer metadata captured on the latest "live" check, used to
         # enrich the activity log (title, game, viewer count at the moment
@@ -873,6 +904,15 @@ class TwitchMonitor:
         while we were paused first (save-streak URLs, earliest-ended first,
         because they have burned the most of their 24h save window), then
         streams that are still live right now."""
+        live_names = [
+            name for name in list(self.missed_while_paused)
+            if name in live_set
+        ]
+        live_name_set = set(live_names)
+        # A streamer can be in both lists: ended during the pause (VOD
+        # queued) and live again by the time the pause lifted. Watching
+        # the live stream saves the streak, so the live candidate wins
+        # and the save-streak candidate is dropped.
         ended = [
             {
                 "streamer": streamer,
@@ -881,6 +921,7 @@ class TwitchMonitor:
                 "ended_at": entry.get("ended_at"),
             }
             for streamer, entry in self.queued_vods.items()
+            if streamer not in live_name_set
         ]
         ended.sort(key=lambda c: c.get("ended_at") or "")
         live = [
@@ -890,8 +931,7 @@ class TwitchMonitor:
                 "kind": "live",
                 "ended_at": None,
             }
-            for name in list(self.missed_while_paused)
-            if name in live_set
+            for name in live_names
         ]
         return ended + live
 
@@ -912,7 +952,9 @@ class TwitchMonitor:
         }
         with self._rescue_lock:
             self.rescue_pending = offer
+            self._rescue_offer_started_monotonic = time.monotonic()
             self._rescue_deadline_monotonic = time.monotonic() + RESCUE_ACK_TIMEOUT_SECONDS
+            self._rescue_overdue_logged = False
         ConfigRequestHandler.config_data["rescue"] = offer
         log.info(
             "Rescue offer %s published: %d candidate(s), extension has %ds to acknowledge",
@@ -935,6 +977,11 @@ class TwitchMonitor:
                 self.queued_vods.pop(name, None)
             else:
                 self.missed_while_paused.pop(name, None)
+                # A VOD queued for the same streamer (ended during the
+                # pause, live again now) is covered by the live tab the
+                # extension is about to open; drop it so it can't flush
+                # a duplicate save-streak tab later.
+                self.queued_vods.pop(name, None)
                 state = self.streamers.get(name)
                 if state is not None:
                     state.browser_opened = True
@@ -952,23 +999,56 @@ class TwitchMonitor:
         return True
 
     def _maybe_fallback_rescue(self):
-        """Monitor-loop tick: if a published rescue offer was never acked
-        within the timeout, open everything the pre-1.7 way."""
+        """Monitor-loop tick: if a published rescue offer was never acked,
+        open everything the pre-1.7 way.
+
+        The blind 180s deadline is meant for an absent extension (browser
+        closed, pre-1.7 version). If /config polls are still arriving the
+        extension is alive and merely failing to ack, so the offer stays
+        published (it will retry on every poll) until the hard deadline."""
+        offer_to_flush = None
+        overdue_offer_id = None
+        now = time.monotonic()
         with self._rescue_lock:
             offer = self.rescue_pending
-            if not offer or time.monotonic() < self._rescue_deadline_monotonic:
+            if not offer or now < self._rescue_deadline_monotonic:
                 return
-            self.rescue_pending = None
+            hard_deadline = (
+                self._rescue_offer_started_monotonic + RESCUE_ACK_HARD_TIMEOUT_SECONDS
+            )
+            if now < hard_deadline and extension_seen_within(EXTENSION_ALIVE_WINDOW_SECONDS):
+                if not self._rescue_overdue_logged:
+                    self._rescue_overdue_logged = True
+                    overdue_offer_id = offer["id"]
+            else:
+                self.rescue_pending = None
+                offer_to_flush = offer
+        if overdue_offer_id is not None:
+            log.warning(
+                "Rescue offer %s unacked after %ds but the extension is still polling /config; "
+                "holding the offer up to %ds before falling back",
+                overdue_offer_id, RESCUE_ACK_TIMEOUT_SECONDS, RESCUE_ACK_HARD_TIMEOUT_SECONDS,
+            )
+            log_activity("rescue_ack_overdue", offer_id=overdue_offer_id)
+        if offer_to_flush is None:
+            return
         ConfigRequestHandler.config_data["rescue"] = None
         log.warning(
-            "Rescue offer %s not acknowledged within %ds; falling back to paced open of everything",
-            offer["id"], RESCUE_ACK_TIMEOUT_SECONDS,
+            "Rescue offer %s not acknowledged; falling back to paced open of everything",
+            offer_to_flush["id"],
         )
-        log_activity("rescue_fallback_flush", offer_id=offer["id"])
-        self._open_still_live_missed_streams(set(self.live_streamers), reason="rescue_fallback")
+        log_activity("rescue_fallback_flush", offer_id=offer_to_flush["id"])
+        opened_live = self._open_still_live_missed_streams(
+            set(self.live_streamers), reason="rescue_fallback"
+        )
+        for name in opened_live:
+            # Their live tab was just opened; a queued save-streak link
+            # for the same streamer would only open a duplicate tab.
+            if self.queued_vods.pop(name, None) is not None:
+                log.info("Dropped queued VOD for %s: their live stream was just opened", name)
         self._flush_queued_vods(reason="rescue_fallback")
 
-    def _open_still_live_missed_streams(self, live_set: set, reason: str = "unpause") -> int:
+    def _open_still_live_missed_streams(self, live_set: set, reason: str = "unpause") -> list:
         """When a pause lifts, open the LIVE stream for every streamer that
         was skipped while paused and is still live right now.
 
@@ -982,10 +1062,10 @@ class TwitchMonitor:
         Streamers that are no longer live were already handled by the VOD
         fallback when they went offline during the pause (queued + flushed),
         so we only act on the still-live ones here. Opens route through the
-        paced queue. Returns the count opened.
+        paced queue. Returns the list of streamer names opened.
         """
         if not self.missed_while_paused:
-            return 0
+            return []
         still_live = [
             name for name in list(self.missed_while_paused)
             if name in live_set
@@ -1007,7 +1087,7 @@ class TwitchMonitor:
                 if len(still_live) > 1 else
                 f"Opening {still_live[0]}'s live stream"
             )
-        return len(still_live)
+        return still_live
 
     def process_state_changes(self, current_status: dict[str, bool]):
         live_count = 0
