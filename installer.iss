@@ -2,7 +2,7 @@
 ; Download Inno Setup from: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "Stream Monitor"
-#define MyAppVersion "1.8.3"
+#define MyAppVersion "1.8.4"
 #define MyAppPublisher "Stream Monitor"
 #define MyAppExeName "StreamMonitor.exe"
 #define MyAppSetupExeName "StreamMonitorSetup.exe"
@@ -53,7 +53,7 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Comment: "Start Stream Monitor with Windows"
 
 [Run]
-; Always launch Stream Monitor after install — it handles first-time setup itself
+; Always launch Stream Monitor after install; it handles first-time setup itself
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch Stream Monitor"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
