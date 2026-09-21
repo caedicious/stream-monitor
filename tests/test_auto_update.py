@@ -4,8 +4,11 @@ The GUI dialog and the installer handoff run in separate processes and
 are not unit-testable here; these tests cover every decision the tray
 process makes around them: version comparison (including suffixed tags,
 which crashed the pre-1.8 comparator), SHA256SUMS parsing, the update
-check's return contract, and the prompt-outcome handling.
+check's return contract, the prompt-outcome handling, and the text of
+the handoff script it writes.
 """
+import re
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import stream_monitor_tray as sm
@@ -193,3 +196,43 @@ def test_download_file_retries_then_returns_hash(monkeypatch, tmp_path):
         got = sm._download_file_with_retry("http://x", dest, attempts=3)
     assert got == expected
     assert dest.read_bytes() == payload
+
+
+# --- handoff script -----------------------------------------------------------
+
+def _write_handoff_script(monkeypatch, tmp_path):
+    """Run _download_and_install_update with the network and the detached
+    launch faked out, and return the apply_update.bat text it wrote."""
+    digest = "c" * 64
+    monkeypatch.setattr(sm, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(sm, "log_activity", lambda *a, **k: None)
+    monkeypatch.setattr(sm, "_http_get_text_with_retry",
+                        lambda url, **k: f"{digest}  StreamMonitorInstaller.exe\n")
+    monkeypatch.setattr(sm, "_download_file_with_retry", lambda url, dest, **k: digest)
+    launched = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **k: launched.append(args))
+    app = _bound("_download_and_install_update")
+    release = {"assets": [
+        {"name": "StreamMonitorInstaller.exe", "browser_download_url": "http://x/installer"},
+        {"name": "SHA256SUMS.txt", "browser_download_url": "http://x/sums"},
+    ]}
+    app._download_and_install_update("9.9.9", release)
+    bat = tmp_path / "update" / "apply_update.bat"
+    assert launched == [["cmd", "/c", str(bat)]], app.send_notification.call_args_list
+    return bat.read_text(encoding="utf-8")
+
+
+def test_handoff_script_calls_system_tools_by_full_path(monkeypatch, tmp_path):
+    """The script inherits the app's PATH, which can list Git for Windows'
+    GNU tools (Git\\usr\\bin) before System32 (anything started from Git
+    Bash does). A bare "timeout" then resolves to GNU timeout, which
+    rejects "/t 3 /nobreak" and exits at once, so pre-1.8.4 every wait in
+    the script was skipped. Each system tool must be named by full path."""
+    script = _write_handoff_script(monkeypatch, tmp_path)
+    assert r'"%SystemRoot%\System32\timeout.exe" /t 3 /nobreak' in script
+    assert r'"%SystemRoot%\System32\timeout.exe" /t 5 /nobreak' in script
+    assert r'"%SystemRoot%\System32\curl.exe" -s -m 2 ' in script
+    assert r'"%SystemRoot%\explorer.exe" "' in script
+    # A tool name that is not the tail of a path is a bare invocation
+    bare = re.compile(r"(?<![\\\w])(timeout|curl|explorer)\b", re.IGNORECASE)
+    assert [line for line in script.splitlines() if bare.search(line)] == []

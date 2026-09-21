@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -127,7 +127,7 @@ def log_activity(event: str, **fields):
 
 
 # ---------------------------------------------------------------------------
-# Streak events — incoming from the browser extension via POST /streak_event
+# Streak events: incoming from the browser extension via POST /streak_event
 # ---------------------------------------------------------------------------
 
 # Module-level notifier set by StreamMonitorApp at startup. Allows the HTTP
@@ -263,7 +263,7 @@ def read_activity_log(limit: Optional[int] = None) -> list:
     """Read the activity log into a list of dicts. Reverse-chronological.
 
     Tolerates partial last lines from concurrent writes. Only the newest
-    MAX_ACTIVITY_EVENTS_SERVED lines are parsed — older history stays on
+    MAX_ACTIVITY_EVENTS_SERVED lines are parsed. Older history stays on
     disk and is available via the raw .jsonl download.
     """
     if not STREAM_ACTIVITY_FILE.exists():
@@ -504,7 +504,7 @@ class _SingletonHTTPServer(ThreadingHTTPServer):
     explicitly opt out of address reuse here.
 
     ThreadingHTTPServer (one daemon thread per request) keeps a slow
-    request — a large /activity.json read, a wedged client — from blocking
+    request (a large /activity.json read, a wedged client) from blocking
     every other endpoint behind it. The handlers are safe for this: the
     activity log writes go through _activity_lock, streak events through
     _streak_event_lock, and config_data reads are GIL-atomic dict lookups.
@@ -658,7 +658,7 @@ class TwitchMonitor:
         # extension's content scripts time to apply mute / low-quality /
         # keepalive before the next tab arrives. The worker is a daemon
         # thread: it dies with the process, and any queued-but-unopened
-        # entries are simply lost on exit (acceptable — the next poll
+        # entries are simply lost on exit (acceptable: the next poll
         # cycle re-detects still-live streamers).
         self.tab_open_spacing: float = TAB_OPEN_SPACING_SECONDS
         self._open_queue: queue.Queue = queue.Queue()
@@ -678,7 +678,7 @@ class TwitchMonitor:
         position = self._open_queue.qsize()
         if position > 0:
             # Only log the queued event when the open will actually wait
-            # behind others — the common single-open case stays one log line.
+            # behind others, so the common single-open case stays one log line.
             log_activity(
                 "tab_open_queued",
                 kind=kind,
@@ -725,7 +725,7 @@ class TwitchMonitor:
                     **item["extra"],
                 )
             except Exception as e:
-                # The worker must never die — a dead worker would silently
+                # The worker must never die: a dead worker would silently
                 # strand every future tab open.
                 log.error("Tab-open worker iteration failed: %s", e)
             finally:
@@ -1058,7 +1058,7 @@ class TwitchMonitor:
         was skipped while paused and is still live right now.
 
         Without this, a streamer who went live during the pause and is
-        still broadcasting when the pause ends would never get opened —
+        still broadcasting when the pause ends would never get opened:
         process_state_changes only opens on the offline->live transition
         (not state.was_live), and that transition already happened (and was
         skipped) earlier. They'd otherwise only surface via the VOD
@@ -1189,7 +1189,7 @@ class TwitchMonitor:
                             )
                             self.notify_callback(
                                 "Stream Monitor",
-                                f"Save-streak link for {username} queued — opens when you're no longer paused"
+                                f"Save-streak link for {username} queued (opens when you're no longer paused)"
                             )
                         else:
                             self.status_callback(f"Opening save-streak page for {username}")
@@ -1562,24 +1562,35 @@ class StreamMonitorApp:
             # it as a child of the shell instead, with a clean process and
             # environment, which loads correctly. A bounded retry that
             # polls the config server still guards against a transient miss.
+            #
+            # System tools are called by full path, never by bare name. cmd
+            # resolves a bare name through the PATH this script inherits from
+            # the app. When that PATH lists Git for Windows' GNU tools
+            # (Git\usr\bin) before System32, as it does for anything started
+            # from Git Bash, a bare "timeout" is GNU timeout, which rejects
+            # "/t 3 /nobreak" and exits at once, so every wait in this script
+            # would be skipped.
             bat = update_dir / "apply_update.bat"
             exe = sys.executable
             config_url = f"http://127.0.0.1:{CONFIG_SERVER_PORT}/config"
+            timeout_exe = r'"%SystemRoot%\System32\timeout.exe"'
+            curl_exe = r'"%SystemRoot%\System32\curl.exe"'
+            explorer_exe = r'"%SystemRoot%\explorer.exe"'
             bat.write_text(
                 "@echo off\r\n"
                 'set "_MEIPASS2="\r\n'
-                "timeout /t 3 /nobreak >nul\r\n"
+                f"{timeout_exe} /t 3 /nobreak >nul\r\n"
                 f'"{target}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\n'
-                "timeout /t 5 /nobreak >nul\r\n"
-                f'explorer.exe "{exe}"\r\n'
+                f"{timeout_exe} /t 5 /nobreak >nul\r\n"
+                f'{explorer_exe} "{exe}"\r\n'
                 "for /L %%i in (1,1,6) do (\r\n"
-                "  timeout /t 3 /nobreak >nul\r\n"
-                f'  curl -s -m 2 "{config_url}" >nul 2>&1 && goto smdone\r\n'
+                f"  {timeout_exe} /t 3 /nobreak >nul\r\n"
+                f'  {curl_exe} -s -m 2 "{config_url}" >nul 2>&1 && goto smdone\r\n'
                 ")\r\n"
-                f'explorer.exe "{exe}"\r\n'
+                f'{explorer_exe} "{exe}"\r\n'
                 "for /L %%i in (1,1,6) do (\r\n"
-                "  timeout /t 3 /nobreak >nul\r\n"
-                f'  curl -s -m 2 "{config_url}" >nul 2>&1 && goto smdone\r\n'
+                f"  {timeout_exe} /t 3 /nobreak >nul\r\n"
+                f'  {curl_exe} -s -m 2 "{config_url}" >nul 2>&1 && goto smdone\r\n'
                 ")\r\n"
                 ":smdone\r\n"
                 f'del "{target}"\r\n'
@@ -1679,7 +1690,7 @@ class StreamMonitorApp:
         yield Item("Clear all queued", self._clear_all_queued_vods)
 
     def _open_queued_vod_now(self, streamer: str, vod_url: str):
-        """User clicked a queued-VOD row in the tray submenu — hand it to
+        """User clicked a queued-VOD row in the tray submenu: hand it to
         the paced open queue and remove it from the VOD queue. (Still
         paced: if another tab opened within the last few seconds, this one
         waits out the remainder of the spacing window so the browser isn't
@@ -1698,7 +1709,7 @@ class StreamMonitorApp:
                 pass
 
     def _clear_all_queued_vods(self, icon, item):
-        """User picked 'Clear all queued' — drop every entry without opening
+        """User picked 'Clear all queued': drop every entry without opening
         anything."""
         if not self.monitor:
             return
