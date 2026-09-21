@@ -954,12 +954,11 @@ async function openRescueTab(session, entry) {
 
   let tab = null;
   try {
-    // Rescue tabs open in the background on purpose: the rotation fires
-    // every 30 minutes and stealing focus each time would be obnoxious.
-    // The player-control machinery (ensurePlaying button clicks,
-    // keepalive, load recovery) is what makes an unfocused tab count,
-    // same as any other tracked tab.
-    tab = await browser.tabs.create({ url, active: false });
+    // Honor the auto-focus setting, same as every other stream open. A
+    // focused tab is what reliably gets the player started and the view
+    // counted, and that matters most here: the whole point of a rescue
+    // tab is to earn streak credit. Auto-focus off keeps background opens.
+    tab = await browser.tabs.create({ url, active: await shouldAutoFocus() });
   } catch (e) {
     await log("warn", `Rescue: failed to open tab for ${entry.streamer}:`, e?.message || String(e));
     delete session.pendingOpens[url];
@@ -991,7 +990,27 @@ async function openRescueTab(session, entry) {
   return true;
 }
 
+// Only one top-up loop may run at a time. The config alarm and an
+// event-page wake can fire in the same instant (both fetch config and
+// both reach here); two concurrent loops each hold a stale session
+// copy, overwrite each other's saves, and open every candidate at once
+// with duplicate slot numbers instead of RESCUE_BATCH_SIZE on a timer.
+// Concurrent callers coalesce onto the in-flight loop.
+let rescueTopUpInFlight = null;
+
 async function topUpRescueSlots() {
+  if (rescueTopUpInFlight) return rescueTopUpInFlight;
+  rescueTopUpInFlight = (async () => {
+    try {
+      await topUpRescueSlotsLoop();
+    } finally {
+      rescueTopUpInFlight = null;
+    }
+  })();
+  return rescueTopUpInFlight;
+}
+
+async function topUpRescueSlotsLoop() {
   let session = await loadRescueSession();
   if (!session || !session.active) return;
   while (session.slots.length < RESCUE_BATCH_SIZE && session.queue.length > 0) {
