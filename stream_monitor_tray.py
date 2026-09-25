@@ -47,7 +47,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 GITHUB_REPO = "caedicious/stream-monitor"
 
 # Anonymous install counter (v1.9.0): a random install id, the version, and
@@ -1328,8 +1328,17 @@ class TwitchMonitor:
 
         self.status_callback("Authenticating...")
         if not self._get_oauth_token():
-            self.status_callback("Auth failed")
-            return False
+            # On a restart (a settings save) the refresh can fail on a
+            # transient blip. The existing app token stays valid for weeks
+            # and the API layer re-authenticates on a 401, so keep
+            # monitoring on it rather than leaving the monitor stopped with
+            # only a tooltip saying so. A manual Start with no token still
+            # fails, as before.
+            if preserve_state and getattr(self, "oauth_token", None):
+                log.warning("Token refresh failed on restart; continuing with the existing token")
+            else:
+                self.status_callback("Auth failed")
+                return False
 
         previous = getattr(self, "streamers", None) or {}
         self.streamers = {
