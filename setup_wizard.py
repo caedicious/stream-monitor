@@ -15,7 +15,7 @@ from tkinter import ttk, messagebox
 
 import requests
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 # Configuration
 APP_NAME = "StreamMonitor"
@@ -27,6 +27,54 @@ else:
     STARTUP_DIR = Path.home() / ".config/autostart"
 
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def load_existing_settings() -> dict:
+    """Streamers and credentials saved by a previous run, so the wizard
+    starts from what the user already has instead of a blank slate.
+    Empty when there is no config yet or it does not parse."""
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    raw = data.get("streamers")
+    streamers = (
+        [s.strip() for s in raw if isinstance(s, str) and s.strip()]
+        if isinstance(raw, list) else []
+    )
+    client_id = data.get("client_id")
+    client_secret = data.get("client_secret")
+    return {
+        "streamers": streamers,
+        "client_id": client_id if isinstance(client_id, str) else "",
+        "client_secret": client_secret if isinstance(client_secret, str) else "",
+    }
+
+
+def write_config(streamers, client_id, client_secret) -> None:
+    """Save the wizard's answers, keeping every other field an existing
+    config already has (pins, check interval, own channel, install id)."""
+    config = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "streamers": list(streamers),
+    }
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                existing.update(config)
+                config = existing
+        except (OSError, ValueError):
+            pass
+    config.setdefault("check_interval", 60)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
 
 
 class SetupWizard:
@@ -42,10 +90,13 @@ class SetupWizard:
         y = (self.root.winfo_screenheight() - 500) // 2
         self.root.geometry(f"+{x}+{y}")
         
-        # Data
-        self.streamers = []
-        self.client_id = ""
-        self.client_secret = ""
+        # Data: start from what is already saved (v1.10.1). The Start menu's
+        # "Settings" shortcut opened this wizard for a long time, so people
+        # used it to add streamers and lost everything they did not retype.
+        existing = load_existing_settings()
+        self.streamers = existing.get("streamers", [])
+        self.client_id = existing.get("client_id", "")
+        self.client_secret = existing.get("client_secret", "")
         
         # Current page
         self.current_page = 0
@@ -453,27 +504,7 @@ Enjoy!
         ).pack(pady=20, padx=20, anchor=tk.W)
     
     def finish(self):
-        # Save configuration
-        config = {
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "streamers": self.streamers,
-            "check_interval": 60
-        }
-
-        # Preserve any existing config fields (from a previous install/upgrade)
-        if CONFIG_FILE.exists():
-            try:
-                with open(CONFIG_FILE, "r") as f:
-                    existing = json.load(f)
-                existing.update(config)
-                config = existing
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f, indent=2)
+        write_config(self.streamers, self.client_id, self.client_secret)
 
         # Create startup shortcut (Windows)
         if sys.platform == "win32":
