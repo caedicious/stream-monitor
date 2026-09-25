@@ -48,3 +48,26 @@ def test_read_config_if_parseable(tmp_config_dir):
     assert loaded is not None and loaded.streamers == ["y", "x"]
     cfg.unlink()
     assert sm._read_config_if_parseable() is None
+
+
+def test_restart_keeps_old_token_when_refresh_fails(monitor, monkeypatch):
+    """v1.9.1: a settings save restarts the monitor; a transient token
+    refresh failure must not leave monitoring stopped. The old token is
+    kept (the API layer re-authenticates on a 401 anyway)."""
+    monkeypatch.setattr(sm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(monitor, "_monitor_loop", lambda: None)
+    monitor.thread = None
+    monitor.oauth_token = "old-token"
+    monkeypatch.setattr(monitor, "_get_oauth_token", lambda: False)
+    monitor.restart()
+    assert monitor.running is True
+    assert monitor.oauth_token == "old-token"
+
+
+def test_manual_start_still_fails_without_a_token(monitor, monkeypatch):
+    monkeypatch.setattr(sm.time, "sleep", lambda s: None)
+    monitor.thread = None
+    monitor.oauth_token = None
+    monkeypatch.setattr(monitor, "_get_oauth_token", lambda: False)
+    assert monitor.start() is False
+    assert monitor.running is False
