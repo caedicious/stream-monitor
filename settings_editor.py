@@ -11,7 +11,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-VERSION = "1.8.5"
+VERSION = "1.8.6"
 
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
@@ -66,9 +66,10 @@ def main():
     ttk.Label(main_frame, text="Streamers to Monitor:", font=("", 10, "bold")).pack(anchor=tk.W)
     ttk.Label(
         main_frame,
-        text="Drag to reorder: the list order is your priority. Streams higher in the "
-             "list open first when several go live at once and come first in the "
-             "streak rescue queue. Toggle 'Keep Open' to protect a stream from being "
+        text="The list order is your priority: streams higher in the list open first "
+             "when several go live at once and come first in the streak rescue queue. "
+             "Drag a row or use Move Up / Move Down to reorder. Add puts a new name "
+             "right below the selected row. Keep Open protects a stream from being "
              "closed when max tabs is reached.",
         font=("", 8),
         foreground="gray",
@@ -86,7 +87,11 @@ def main():
     list_frame = ttk.Frame(main_frame)
     list_frame.pack(fill=tk.X, pady=(0, 5))
 
-    streamers_listbox = tk.Listbox(list_frame, height=8, font=("", 10), activestyle="dotbox")
+    # exportselection=False keeps the row selection when you click into the
+    # Add box, so "Add inserts below the selected row" is reliable.
+    streamers_listbox = tk.Listbox(
+        list_frame, height=8, font=("", 10), activestyle="dotbox", exportselection=False
+    )
     streamers_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     list_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=streamers_listbox.yview)
@@ -101,9 +106,9 @@ def main():
 
     def _render_streamers(select_index=None):
         streamers_listbox.delete(0, tk.END)
-        for name in streamer_list:
+        for rank, name in enumerate(streamer_list, 1):
             prefix = PIN_PREFIX if name in pinned_set else NO_PIN_PREFIX
-            streamers_listbox.insert(tk.END, f"{prefix}{name}")
+            streamers_listbox.insert(tk.END, f"{rank:>2}. {prefix}{name}")
         if select_index is not None and 0 <= select_index < len(streamer_list):
             streamers_listbox.selection_set(select_index)
             streamers_listbox.see(select_index)
@@ -132,6 +137,19 @@ def main():
         else:
             _render_streamers()
 
+    def _move_selected(delta):
+        sel = streamers_listbox.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        j = i + delta
+        if not (0 <= j < len(streamer_list)):
+            return
+        streamer_list.insert(j, streamer_list.pop(i))
+        _render_streamers(j)
+
+    ttk.Button(list_buttons, text="Move Up", command=lambda: _move_selected(-1), width=10).pack(pady=2)
+    ttk.Button(list_buttons, text="Move Down", command=lambda: _move_selected(1), width=10).pack(pady=2)
     ttk.Button(list_buttons, text="Keep Open", command=_toggle_keep_open, width=10).pack(pady=2)
     ttk.Button(list_buttons, text="Remove", command=_remove_selected, width=10).pack(pady=2)
 
@@ -148,33 +166,82 @@ def main():
         if name in streamer_list:
             messagebox.showinfo("Already added", f"'{name}' is already in the list.")
             return
-        streamer_list.append(name)
+        # Land the new name right below the selected row so it takes the
+        # priority you picked; with nothing selected it goes to the bottom.
+        sel = streamers_listbox.curselection()
+        at = sel[0] + 1 if sel else len(streamer_list)
+        streamer_list.insert(at, name)
         add_entry.delete(0, tk.END)
-        _render_streamers(len(streamer_list) - 1)
+        _render_streamers(at)
 
     add_entry.bind("<Return>", _add_streamer)
     ttk.Button(add_frame, text="Add", command=_add_streamer, width=10).pack(side=tk.LEFT, padx=(6, 0))
 
     _render_streamers()
 
-    # Drag to reorder. The list order is the priority (see the hint above),
-    # so the row under the pointer follows the drag and the working list is
-    # reordered live; Save writes it out in this order.
-    drag_state = {"from": None}
+    # Drag to reorder. The list order is the priority (see the hint above):
+    # the grabbed row follows the pointer and the working list is reordered
+    # live; Save writes it out in this order. A press in the blank area
+    # below the last row starts nothing, and dragging past the top or
+    # bottom edge scrolls the list so one drag can travel the whole list.
+    drag_state = {"from": None, "y": 0, "job": None}
+    AUTOSCROLL_MS = 120
 
-    def _drag_start(event):
-        drag_state["from"] = streamers_listbox.nearest(event.y)
+    def _row_at(y):
+        """Index of the row under y, or None when y is in the blank area."""
+        if streamers_listbox.size() == 0:
+            return None
+        idx = streamers_listbox.nearest(y)
+        box = streamers_listbox.bbox(idx)
+        if box is None or y < box[1] or y > box[1] + box[3]:
+            return None
+        return idx
 
-    def _drag_motion(event):
+    def _cancel_autoscroll():
+        if drag_state["job"] is not None:
+            streamers_listbox.after_cancel(drag_state["job"])
+            drag_state["job"] = None
+
+    def _move_dragged_to(dst):
         src = drag_state["from"]
-        dst = streamers_listbox.nearest(event.y)
-        if src is None or dst == src or not (0 <= src < len(streamer_list))                 or not (0 <= dst < len(streamer_list)):
+        if src is None or dst is None or dst == src \
+                or not (0 <= src < len(streamer_list)) or not (0 <= dst < len(streamer_list)):
             return
         streamer_list.insert(dst, streamer_list.pop(src))
         drag_state["from"] = dst
         _render_streamers(dst)
 
+    def _autoscroll_tick():
+        drag_state["job"] = None
+        if drag_state["from"] is None:
+            return
+        y = drag_state["y"]
+        if y < 0:
+            streamers_listbox.yview_scroll(-1, "units")
+        elif y > streamers_listbox.winfo_height():
+            streamers_listbox.yview_scroll(1, "units")
+        else:
+            return
+        _move_dragged_to(streamers_listbox.nearest(y))
+        drag_state["job"] = streamers_listbox.after(AUTOSCROLL_MS, _autoscroll_tick)
+
+    def _drag_start(event):
+        drag_state["from"] = _row_at(event.y)
+        drag_state["y"] = event.y
+
+    def _drag_motion(event):
+        if drag_state["from"] is None:
+            return
+        drag_state["y"] = event.y
+        if event.y < 0 or event.y > streamers_listbox.winfo_height():
+            if drag_state["job"] is None:
+                _autoscroll_tick()
+            return
+        _cancel_autoscroll()
+        _move_dragged_to(streamers_listbox.nearest(event.y))
+
     def _drag_end(_event):
+        _cancel_autoscroll()
         drag_state["from"] = None
 
     streamers_listbox.bind("<ButtonPress-1>", _drag_start)
