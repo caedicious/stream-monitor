@@ -10,6 +10,7 @@ import logging.handlers
 import os
 import platform
 import queue
+import re
 import sys
 import threading
 import time
@@ -47,7 +48,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 GITHUB_REPO = "caedicious/stream-monitor"
 
 # Anonymous install counter (v1.9.0): a random install id, the version, and
@@ -69,6 +70,12 @@ CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 # before the next tab lands. All stream/VOD tab opens flow through a single
 # paced queue with this many seconds between opens.
 TAB_OPEN_SPACING_SECONDS = 10
+# Fresh-start handling of tabs the extension reports as already open
+# (v1.10.0). A report older than this is not trusted as a seed, and once
+# seeded the monitor waits this long for a report made after the start
+# before deciding the browser is gone and opening the skipped streams.
+STARTUP_OPEN_TABS_MAX_AGE_SECONDS = 10 * 60
+STARTUP_FRESH_REPORT_TIMEOUT_SECONDS = 90
 
 # Configuration paths
 APP_NAME = "StreamMonitor"
@@ -186,6 +193,109 @@ def extension_seen_within(seconds: float) -> bool:
 
 
 _rescue_ack_handler: Optional[Callable[[str], bool]] = None
+
+
+# ---------------------------------------------------------------------------
+# Open-tab reports from the browser extension (v1.10.0)
+#
+# Each browser extension POSTs /open_tabs with the monitored streamers that
+# have a Stream Monitor tab open in that browser (rescue tabs included),
+# after every config refresh and whenever the set changes. The latest
+# report per browser is kept in memory and mirrored to a small file next to
+# config.json, so a fresh start (a relaunch, or Stop then Start from the
+# tray) can see what was open a moment ago and not open it a second time.
+# Names are lowercase Twitch logins; nothing else is stored.
+# ---------------------------------------------------------------------------
+OPEN_TABS_MAX_STREAMERS = 500
+_OPEN_TABS_BROWSER_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+_OPEN_TABS_LOGIN_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+_open_tabs_lock = threading.Lock()
+# browser -> {"streamers": frozenset[str], "epoch": float, "mono": float}
+_open_tabs_reports: dict[str, dict] = {}
+
+
+def _extension_tabs_path() -> Path:
+    return CONFIG_DIR / "extension_tabs.json"
+
+
+def record_extension_open_tabs(browser, streamers, reason: str = "", *,
+                               now_epoch: Optional[float] = None,
+                               now_mono: Optional[float] = None) -> bool:
+    """Store one report. Returns False (storing nothing) for a malformed
+    payload; malformed streamer names inside a good payload are dropped."""
+    if not isinstance(browser, str) or not isinstance(streamers, list):
+        return False
+    browser = browser.strip().lower()
+    if not _OPEN_TABS_BROWSER_RE.match(browser):
+        return False
+    names = set()
+    for raw in streamers[:OPEN_TABS_MAX_STREAMERS]:
+        if isinstance(raw, str):
+            name = raw.strip().lower()
+            if _OPEN_TABS_LOGIN_RE.match(name):
+                names.add(name)
+    epoch = time.time() if now_epoch is None else now_epoch
+    mono = time.monotonic() if now_mono is None else now_mono
+    with _open_tabs_lock:
+        previous = _open_tabs_reports.get(browser)
+        _open_tabs_reports[browser] = {"streamers": frozenset(names), "epoch": epoch, "mono": mono}
+        snapshot = {b: dict(rep) for b, rep in _open_tabs_reports.items()}
+    if previous is None or previous["streamers"] != frozenset(names):
+        log.info("Open-tabs report from %s (%s): %s", browser, reason or "update",
+                 ", ".join(sorted(names)) or "none")
+    _persist_open_tabs_reports(snapshot)
+    return True
+
+
+def _persist_open_tabs_reports(snapshot: dict[str, dict]) -> None:
+    """Mirror the reports to disk (best effort, atomic replace) so the next
+    process can seed its start from them."""
+    path = _extension_tabs_path()
+    data = {b: {"ts": rep["epoch"], "streamers": sorted(rep["streamers"])}
+            for b, rep in snapshot.items()}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        log.debug("Could not persist the open-tabs report: %s", e)
+
+
+def extension_open_tabs_snapshot() -> dict[str, dict]:
+    """Copy of the latest report per browser received by this process."""
+    with _open_tabs_lock:
+        return {b: dict(rep) for b, rep in _open_tabs_reports.items()}
+
+
+def load_persisted_open_tabs(max_age_seconds: float,
+                             now_epoch: Optional[float] = None) -> dict[str, frozenset]:
+    """Reports a previous process mirrored to disk, for browsers whose
+    report is at most max_age_seconds old. Malformed content is ignored."""
+    path = _extension_tabs_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    now = time.time() if now_epoch is None else now_epoch
+    result: dict[str, frozenset] = {}
+    for browser, rep in data.items():
+        if not isinstance(browser, str) or not isinstance(rep, dict):
+            continue
+        ts = rep.get("ts")
+        names = rep.get("streamers")
+        if not isinstance(ts, (int, float)) or not isinstance(names, list):
+            continue
+        if now - ts > max_age_seconds:
+            continue
+        result[browser] = frozenset(
+            n for n in names if isinstance(n, str) and _OPEN_TABS_LOGIN_RE.match(n)
+        )
+    return result
 
 
 def set_rescue_ack_handler(fn: Callable[[str], bool]) -> None:
@@ -433,12 +543,13 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         """Handle inbound events from the browser extension.
 
-        Currently the only POST endpoint is /streak_event, which the
-        extension calls when it detects a Twitch "your N-stream streak on
-        X broke / ends in Yh" notification card in the page DOM. Twitch
-        does not expose a public API for viewing streaks, so the
-        extension scrapes them from the bell-dropdown / notifications
-        page and relays the result here.
+        /streak_event: the extension detected a Twitch "your N-stream
+        streak on X broke / ends in Yh" notification card in the page DOM
+        (Twitch has no public API for viewing streaks, so the extension
+        scrapes them from the bell dropdown / notifications page).
+        /open_tabs: the monitored streamers with a Stream Monitor tab open
+        in that browser (see record_extension_open_tabs).
+        /rescue_ack: the extension claims the published rescue offer.
         """
         if self.path == "/streak_event":
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -463,6 +574,29 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+
+        if self.path == "/open_tabs":
+            # 204 = stored, 400 = malformed. A body of 16 KB covers any
+            # realistic tab count many times over.
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length <= 0 or length > 16384:
+                self.send_response(400)
+                self.end_headers()
+                return
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.send_response(400)
+                self.end_headers()
+                return
+            ok = isinstance(payload, dict) and record_extension_open_tabs(
+                payload.get("browser"), payload.get("streamers"),
+                str(payload.get("reason", ""))[:32],
+            )
+            self.send_response(204 if ok else 400)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             return
@@ -639,6 +773,12 @@ class TwitchMonitor:
         self._http = requests.Session()
         self.oauth_token: Optional[str] = None
         self.streamers: dict[str, StreamerState] = {}
+        # Fresh-start bookkeeping for streams the extension reported as
+        # already open in the browser (see _seed_startup_open_tabs).
+        self._startup_seed: dict[str, set] = {}
+        self._startup_claims: dict[str, set] = {}
+        self._startup_skipped: set = set()
+        self._startup_mono: float = float("-inf")
         self.running = False
         self.paused = False
         self.auto_paused = False  # True when user's own channel is live
@@ -1157,7 +1297,25 @@ class TwitchMonitor:
                         f"{username} is now live on Twitch!"
                     )
 
-                    if self.effectively_paused:
+                    claimed_by = self._browsers_with_tab_open(username)
+                    if claimed_by:
+                        # Already open in the browser (per the extension's
+                        # last report): no second tab. Settled later by
+                        # _reconcile_startup_skips.
+                        log.info(
+                            "Skipping tab open for %s: already open in %s",
+                            username, ", ".join(sorted(claimed_by)),
+                        )
+                        log_activity(
+                            "tab_open_skipped",
+                            streamer=username,
+                            reason="already_open",
+                            browsers=sorted(claimed_by),
+                        )
+                        state.browser_opened = True
+                        self._startup_claims[username] = set(claimed_by)
+                        self._startup_skipped.add(username)
+                    elif self.effectively_paused:
                         log.info("Skipping tab open for %s (effectively paused)", username)
                         self.status_callback(f"{username} went LIVE! (paused)")
                         # Track missed streams while paused
@@ -1246,6 +1404,11 @@ class TwitchMonitor:
             self.status_callback(f"{live_count} streamer(s) live")
         else:
             self.status_callback("Monitoring...")
+
+        # The seed only ever applies to the first poll after a fresh start;
+        # a stream that goes live later gets a tab as usual.
+        self._startup_seed = {}
+        self._reconcile_startup_skips(current_status)
     
     def _monitor_loop(self):
         log.info("Monitor loop started (interval: %ds)", self.config.check_interval)
@@ -1347,6 +1510,8 @@ class TwitchMonitor:
             for name in self.config.streamers
         }
         log.info("Monitoring %d streamer(s): %s", len(self.streamers), list(self.streamers.keys()))
+        if not preserve_state:
+            self._seed_startup_open_tabs()
 
         self.running = True
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -1360,6 +1525,81 @@ class TwitchMonitor:
         if self.thread:
             self.thread.join(timeout=2)
         self.status_callback("Stopped")
+
+    def _seed_startup_open_tabs(self) -> None:
+        """On a fresh start, take the newest open-tab report per browser
+        (received by this process, else the copy the previous process
+        mirrored to disk) that is at most STARTUP_OPEN_TABS_MAX_AGE_SECONDS
+        old. A streamer in it who is live on the first poll is treated as
+        already open, so no second tab is opened. A report made after this
+        start (or a timeout) then settles each skip for good in
+        _reconcile_startup_skips."""
+        now_epoch = time.time()
+        self._startup_mono = time.monotonic()
+        self._startup_claims = {}
+        self._startup_skipped = set()
+        seed = {
+            browser: set(names)
+            for browser, names in load_persisted_open_tabs(
+                STARTUP_OPEN_TABS_MAX_AGE_SECONDS, now_epoch
+            ).items()
+        }
+        for browser, rep in extension_open_tabs_snapshot().items():
+            if now_epoch - rep["epoch"] <= STARTUP_OPEN_TABS_MAX_AGE_SECONDS:
+                seed[browser] = set(rep["streamers"])
+        self._startup_seed = seed
+        if any(seed.values()):
+            log.info(
+                "Extension reports stream tabs already open: %s",
+                {b: sorted(s) for b, s in seed.items() if s},
+            )
+
+    def _browsers_with_tab_open(self, name: str) -> set:
+        return {b for b, names in self._startup_seed.items() if name in names}
+
+    def _reconcile_startup_skips(self, current_status: dict[str, bool]) -> None:
+        """Settle streams skipped at start because a tab was reported open.
+        A report received after this start that lists the streamer confirms
+        the skip. Once every browser that claimed the tab has reported
+        again without it, or no report has arrived within
+        STARTUP_FRESH_REPORT_TIMEOUT_SECONDS (browser closed, extension
+        gone), the stream is opened after all if it is still live."""
+        if not self._startup_skipped:
+            return
+        fresh = {
+            b: rep for b, rep in extension_open_tabs_snapshot().items()
+            if rep["mono"] >= self._startup_mono
+        }
+        timed_out = (
+            time.monotonic() - self._startup_mono >= STARTUP_FRESH_REPORT_TIMEOUT_SECONDS
+        )
+        for name in sorted(self._startup_skipped, key=self._list_rank):
+            if any(name in rep["streamers"] for rep in fresh.values()):
+                log.info("%s: tab confirmed open by the extension", name)
+                self._startup_skipped.discard(name)
+                continue
+            claims = self._startup_claims.get(name, set())
+            gone = bool(claims) and claims <= set(fresh)
+            if not (gone or timed_out):
+                continue  # still waiting on a browser that claimed it
+            self._startup_skipped.discard(name)
+            state = self.streamers.get(name)
+            if state is None or not current_status.get(name):
+                continue  # off the list, or offline now: nothing to open
+            why = "the tab is gone" if gone else "no report arrived in time"
+            if self.effectively_paused:
+                state.browser_opened = False
+                self.missed_while_paused[name] = time.strftime("%H:%M:%S")
+                log.info("%s: %s, but paused, so not opening (tracked as missed)", name, why)
+                log_activity(
+                    "tab_open_skipped",
+                    streamer=name,
+                    reason="auto_paused" if self.auto_paused else "paused",
+                )
+            else:
+                log.info("%s: %s, opening it now", name, why)
+                self.status_callback(f"{name} went LIVE!")
+                self.open_stream(name)
 
     def restart(self):
         """Restart after a settings change, keeping the state of streamers

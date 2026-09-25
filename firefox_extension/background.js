@@ -54,6 +54,10 @@ const RESCUE_BATCH_SIZE = 3;
 const RESCUE_ROTATE_MINUTES = 30;
 const RESCUE_OPEN_STAGGER_MS = 10000;
 const RESCUE_ACK_URL = "http://127.0.0.1:52832/rescue_ack";
+// Where the desktop learns which monitored streamers already have a
+// Stream Monitor tab open in this browser (v1.10.0). See reportOpenTabs.
+const OPEN_TABS_URL = "http://127.0.0.1:52832/open_tabs";
+const OPEN_TABS_BROWSER = "firefox";
 // After a tracked tab reports status "complete", wait this long before
 // verifying the content script is alive. Error pages report "complete"
 // too, so this catches a failed open within seconds instead of waiting
@@ -141,6 +145,9 @@ async function loadState() {
 
 async function saveTrackedTabs(trackedTabs) {
   await browser.storage.local.set({ trackedTabs });
+  // The set of open Stream Monitor tabs just changed: tell the desktop,
+  // without holding up the caller.
+  reportOpenTabs("tabs-changed").catch(() => {});
 }
 
 async function saveMonitoredStreamers(list) {
@@ -535,6 +542,47 @@ async function forwardStreakEvent(event) {
     }
   } catch (e) {
     await log("info", "Streak event POST failed (desktop app likely not running):", e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Open-tabs report (v1.10.0)
+//
+// Tells the desktop app which monitored streamers already have a Stream
+// Monitor tab open in this browser (every tracked tab, rescue tabs
+// included). The desktop keeps the latest report per browser, so when it
+// is relaunched (or Stop then Start from the tray) it can leave those
+// streams alone instead of opening a second tab for each. Sent after every
+// config refresh and whenever the tracked set changes. A desktop older
+// than 1.10.0 answers 404; that is logged once and otherwise ignored.
+// ---------------------------------------------------------------------------
+
+let openTabsUnsupportedLogged = false;
+
+async function reportOpenTabs(reason) {
+  try {
+    const hasPerm = await browser.permissions.contains({ origins: ["http://127.0.0.1/*"] });
+    if (!hasPerm) return;
+    const { trackedTabs } = await loadState();
+    const streamers = [...new Set(
+      Object.values(trackedTabs)
+        .map(t => String((t && t.originalStreamer) || "").toLowerCase())
+        .filter(Boolean)
+    )];
+    const resp = await postJson(OPEN_TABS_URL, { browser: OPEN_TABS_BROWSER, streamers, reason });
+    if (resp.status === 404) {
+      if (!openTabsUnsupportedLogged) {
+        openTabsUnsupportedLogged = true;
+        await log("info", "Desktop app does not accept open-tabs reports yet (older than 1.10.0)");
+      }
+    } else if (!resp.ok) {
+      await log("warn", `Open-tabs report returned HTTP ${resp.status}`);
+    } else {
+      await log("info", `Open-tabs report sent (${reason}): ${streamers.length} streamer(s) with a tab open`);
+    }
+  } catch (e) {
+    // Desktop app not running: expected when the extension runs standalone.
+    await log("info", "Open-tabs report failed (desktop app likely not running):", e?.message || String(e));
   }
 }
 
@@ -1539,6 +1587,7 @@ async function onAlarm(alarm) {
     await fetchConfig();
     // Re-scan tabs in case streamers list changed
     await scanExistingTabs();
+    await reportOpenTabs("refresh");
   } else if (alarm.name === KEEPALIVE_ALARM) {
     // Send keepalive ping to all tracked tabs — this drives the content
     // script's keepalive from the background, avoiding browser throttling
@@ -1618,6 +1667,7 @@ browser.runtime.onInstalled.addListener((details) => {
 
   // Reconcile tracked tabs with reality
   await scanExistingTabs();
+  await reportOpenTabs("init");
 
   // Drop pending swaps whose tabs are gone; the alarms API persists alarms
   // across restarts but the tab IDs they reference may no longer be valid.
