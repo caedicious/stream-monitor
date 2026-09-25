@@ -52,6 +52,8 @@ After setup, Stream Monitor runs in your system tray and automatically starts wh
 
 The companion browser extension auto-closes tabs when a streamer raids, keeps background streams counted as viewers, and adds auto-mute / low-quality / max-tabs controls. It talks only to the desktop app running on your own PC (`http://127.0.0.1:52832`), so nothing leaves your machine.
 
+The desktop app sends one anonymous ping a day (a random install ID, the version, and the OS name) to the developer's server so active installs can be counted. Nothing else is sent, no IP address is stored, and the "Send anonymous install ping" checkbox in Settings turns it off. Details in [PRIVACY.md](PRIVACY.md).
+
 **Firefox**
 Install from the Mozilla Add-ons store:
 https://addons.mozilla.org/firefox/addon/stream-monitor-tab-closer/

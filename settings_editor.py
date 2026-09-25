@@ -11,7 +11,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-VERSION = "1.8.6"
+VERSION = "1.9.0"
 
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
@@ -295,6 +295,13 @@ def main():
     vod_var = tk.BooleanVar(value=config.get("vod_fallback", False))
     ttk.Checkbutton(toggle_frame, text="Auto-open VOD if stream missed", variable=vod_var).pack(anchor=tk.W)
 
+    ping_var = tk.BooleanVar(value=config.get("usage_ping", True))
+    ttk.Checkbutton(
+        toggle_frame,
+        text="Send anonymous install ping (counts installs, nothing else)",
+        variable=ping_var,
+    ).pack(anchor=tk.W)
+
     # Status label
     status_label = ttk.Label(main_frame, text="", font=("", 9))
     status_label.pack(pady=(5, 0))
@@ -338,6 +345,7 @@ def main():
         config["own_channel"] = own_channel_entry.get().strip()
         config["im_live_pause"] = im_live_var.get()
         config["vod_fallback"] = vod_var.get()
+        config["usage_ping"] = ping_var.get()
         save_config(config)
         
         status_label.config(text="✓ Settings saved! Restart Stream Monitor to apply.", foreground="green")
