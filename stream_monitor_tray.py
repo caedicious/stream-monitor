@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.8.5"
+VERSION = "1.8.6"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -1296,7 +1296,13 @@ class TwitchMonitor:
                     break
                 time.sleep(1)
     
-    def start(self) -> bool:
+    def start(self, preserve_state: bool = False) -> bool:
+        """Begin monitoring. With preserve_state, streamers still on the
+        list keep their live/opened state across the restart a settings
+        change triggers, so a stream that is live with a tab open is not
+        opened a second time (the old restart reset every streamer to
+        "never seen" and re-opened everything live). A manual Start from
+        the tray still begins from a clean slate."""
         log.info("Starting monitor...")
         if not self.config.is_valid():
             log.error("Cannot start: config is invalid (missing client_id, client_secret, or streamers)")
@@ -1308,8 +1314,10 @@ class TwitchMonitor:
             self.status_callback("Auth failed")
             return False
 
+        previous = getattr(self, "streamers", None) or {}
         self.streamers = {
-            name.lower(): StreamerState(name=name.lower())
+            name.lower(): (previous.get(name.lower()) if preserve_state else None)
+            or StreamerState(name=name.lower())
             for name in self.config.streamers
         }
         log.info("Monitoring %d streamer(s): %s", len(self.streamers), list(self.streamers.keys()))
@@ -1328,10 +1336,12 @@ class TwitchMonitor:
         self.status_callback("Stopped")
 
     def restart(self):
+        """Restart after a settings change, keeping the state of streamers
+        still on the list so nothing already open is opened again."""
         log.info("Restarting monitor")
         self.stop()
         time.sleep(0.5)
-        self.start()
+        self.start(preserve_state=True)
 
 
 def create_icon_image(color="green"):
@@ -1403,36 +1413,53 @@ class StreamMonitorApp:
                 setup_script = Path(__file__).parent / "setup_wizard.py"
                 subprocess.Popen([sys.executable, str(setup_script)])
         
-        # Start a thread to watch for config changes
-        def watch_for_changes():
-            import time
-            old_config = json.dumps(asdict(self.config), sort_keys=True)
-            for _ in range(120):  # Watch for 2 minutes
-                time.sleep(2)
-                new_config_obj = Config.load()
-                new_config = json.dumps(asdict(new_config_obj), sort_keys=True)
-                if new_config != old_config:
-                    self.config = new_config_obj
-                    # Update config server for browser extension
-                    ConfigRequestHandler.config_data.update({
-                        "streamers": self.config.streamers,
-                        "pinned_streamers": self.config.pinned_streamers,
-                        "version": VERSION
-                    })
-                    log_activity(
-                        "config_loaded",
-                        streamers=list(self.config.streamers),
-                        pinned_streamers=list(self.config.pinned_streamers),
-                        interval=self.config.check_interval,
-                        reason="settings_changed",
-                    )
-                    if self.monitor:
-                        self.monitor.config = self.config
-                        self.monitor.restart()
-                    break
-        
-        threading.Thread(target=watch_for_changes, daemon=True).start()
+        # Saved changes are picked up by the always-on config watcher
+        # (_config_watch_loop), not by a timer tied to this window.
     
+    def _config_watch_loop(self):
+        """Apply settings saved by the editor for the life of the process.
+        Polls the config file's mtime every 2s. The old watcher only ran
+        for 4 minutes after Settings was opened, so a later Save silently
+        did nothing until the next app start."""
+        def mtime():
+            try:
+                return CONFIG_FILE.stat().st_mtime_ns
+            except OSError:
+                return None
+
+        last_seen = mtime()
+        while True:
+            time.sleep(2)
+            current = mtime()
+            if current == last_seen:
+                continue
+            new_config = _read_config_if_parseable()
+            if new_config is None:
+                continue  # mid-write or missing: look again next tick
+            last_seen = current
+            before = json.dumps(asdict(self.config), sort_keys=True)
+            after = json.dumps(asdict(new_config), sort_keys=True)
+            if before != after:
+                self._apply_config_change(new_config)
+
+    def _apply_config_change(self, new_config: "Config") -> None:
+        self.config = new_config
+        ConfigRequestHandler.config_data.update({
+            "streamers": self.config.streamers,
+            "pinned_streamers": self.config.pinned_streamers,
+            "version": VERSION,
+        })
+        log_activity(
+            "config_loaded",
+            streamers=list(self.config.streamers),
+            pinned_streamers=list(self.config.pinned_streamers),
+            interval=self.config.check_interval,
+            reason="settings_changed",
+        )
+        if self.monitor:
+            self.monitor.config = self.config
+            self.monitor.restart()
+
     def on_start(self, icon, item):
         if self.monitor and not self.monitor.running:
             self.monitor.start()
@@ -1950,6 +1977,7 @@ class StreamMonitorApp:
 
         # Check for updates on startup (silently)
         threading.Thread(target=self._startup_update_check, daemon=True).start()
+        threading.Thread(target=self._config_watch_loop, daemon=True).start()
 
         # Run the icon (blocking)
         self.icon.run()
@@ -1986,6 +2014,18 @@ class StreamMonitorApp:
             log.info("Update v%s available but reminders for it are muted", latest_version)
             return
         self._offer_update(latest_version, release)
+
+
+def _read_config_if_parseable() -> Optional["Config"]:
+    """Load the config file only if it currently parses as JSON. The
+    settings editor writes the file in place, so a read that lands
+    mid-write would come back as a default (empty) Config and, applied,
+    would drop every streamer. Callers retry later on None."""
+    try:
+        json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return Config.load()
 
 
 def _version_parts(value: str) -> list:
