@@ -8,10 +8,12 @@ import json
 import logging
 import logging.handlers
 import os
+import platform
 import queue
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from collections import deque
 from datetime import datetime, timezone
@@ -45,8 +47,18 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.8.6"
+VERSION = "1.9.0"
 GITHUB_REPO = "caedicious/stream-monitor"
+
+# Anonymous install counter (v1.9.0): a random install id, the version, and
+# the OS name, once a day, to the developer's API so active installs can be
+# counted. Nothing else is sent and the server keeps no IP address; see
+# PRIVACY.md. Off via usage_ping in config.json (Settings has the checkbox).
+# Never sent from a non-frozen (dev) run, so local testing cannot inflate
+# the count.
+USAGE_PING_URL = "https://schedapi.caedvt.com/api/stream-monitor/ping"
+USAGE_PING_INTERVAL_SECONDS = 24 * 60 * 60
+USAGE_PING_RETRY_SECONDS = 60 * 60
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
 # Minimum spacing between consecutive browser-tab opens. Opening many tabs
@@ -566,6 +578,11 @@ class Config:
     # implicitly when a newer version than the skipped one appears,
     # because the comparison is against this exact string.
     skip_update_version: str = ""
+    # Anonymous install counter (v1.9.0): install_id is a random UUID minted
+    # on first run and sent once a day with the version. usage_ping False
+    # turns the ping off entirely.
+    install_id: str = ""
+    usage_ping: bool = True
 
     def __post_init__(self):
         if self.streamers is None:
@@ -1370,6 +1387,7 @@ def create_icon_image(color="green"):
 class StreamMonitorApp:
     def __init__(self):
         self.config = Config.load()
+        self._ensure_install_id()
         self.monitor: Optional[TwitchMonitor] = None
         self.icon: Optional[pystray.Icon] = None
         self.status = "Starting..."
@@ -1416,6 +1434,34 @@ class StreamMonitorApp:
         # Saved changes are picked up by the always-on config watcher
         # (_config_watch_loop), not by a timer tied to this window.
     
+    def _ensure_install_id(self) -> None:
+        """Mint the random install id on first run and persist it. Saving
+        from here is safe with the config watcher: self.config already holds
+        the new value, so the watcher sees no difference and does nothing."""
+        if self.config.install_id:
+            return
+        self.config.install_id = str(uuid.uuid4())
+        try:
+            self.config.save()
+        except OSError as e:
+            log.warning("Could not persist install_id: %s", e)
+
+    def _usage_ping_loop(self):
+        """Daily anonymous install ping. Dev (non-frozen) runs never ping. The
+        usage_ping setting is re-read before every send, so turning it off in
+        Settings stops the next ping without a restart. A failed send retries
+        in an hour instead of a day, so a server outage does not cost a whole
+        day of signal."""
+        if not getattr(sys, "frozen", False):
+            return
+        time.sleep(15)
+        while True:
+            if not self.config.usage_ping or not self.config.install_id:
+                time.sleep(USAGE_PING_INTERVAL_SECONDS)
+                continue
+            ok = _send_usage_ping(self.config.install_id, VERSION)
+            time.sleep(USAGE_PING_INTERVAL_SECONDS if ok else USAGE_PING_RETRY_SECONDS)
+
     def _config_watch_loop(self):
         """Apply settings saved by the editor for the life of the process.
         Polls the config file's mtime every 2s. The old watcher only ran
@@ -1978,6 +2024,7 @@ class StreamMonitorApp:
         # Check for updates on startup (silently)
         threading.Thread(target=self._startup_update_check, daemon=True).start()
         threading.Thread(target=self._config_watch_loop, daemon=True).start()
+        threading.Thread(target=self._usage_ping_loop, daemon=True).start()
 
         # Run the icon (blocking)
         self.icon.run()
@@ -2014,6 +2061,24 @@ class StreamMonitorApp:
             log.info("Update v%s available but reminders for it are muted", latest_version)
             return
         self._offer_update(latest_version, release)
+
+
+def _send_usage_ping(install_id: str, version: str) -> bool:
+    """POST the anonymous install ping. True on a 2xx. Never raises."""
+    try:
+        resp = requests.post(
+            USAGE_PING_URL,
+            json={"install_id": install_id, "version": version, "os": platform.system() or "unknown"},
+            timeout=10,
+        )
+        if 200 <= resp.status_code < 300:
+            log.debug("Usage ping sent (v%s)", version)
+            return True
+        log.debug("Usage ping rejected: HTTP %s", resp.status_code)
+        return False
+    except requests.RequestException as e:
+        log.debug("Usage ping failed: %s", e)
+        return False
 
 
 def _read_config_if_parseable() -> Optional["Config"]:
