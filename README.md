@@ -62,7 +62,7 @@ https://addons.mozilla.org/firefox/addon/stream-monitor-tab-closer/
 Install from the Chrome Web Store:
 https://chromewebstore.google.com/detail/stream-monitor-companion/aaaaibcmmahcedpcdfcbhnjfkgmcgcii
 
-The desktop app must be running for the extension to do anything. It pulls your monitored streamer list from the local config server on port 52832.
+The desktop app must be running for the extension to do anything. It pulls your monitored streamer list from the local config server on port 52832. It also tells the desktop app which streams already have a tab open, so relaunching the app does not open them a second time.
 
 ### Updating
 
