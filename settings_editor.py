@@ -11,7 +11,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-VERSION = "1.8.4"
+VERSION = "1.8.5"
 
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
@@ -66,8 +66,10 @@ def main():
     ttk.Label(main_frame, text="Streamers to Monitor:", font=("", 10, "bold")).pack(anchor=tk.W)
     ttk.Label(
         main_frame,
-        text="Toggle 'Keep open' to mark a stream as one you always want kept open. "
-             "When max tabs is reached, only un-kept streams will be closed to make room.",
+        text="Drag to reorder: the list order is your priority. Streams higher in the "
+             "list open first when several go live at once and come first in the "
+             "streak rescue queue. Toggle 'Keep Open' to protect a stream from being "
+             "closed when max tabs is reached.",
         font=("", 8),
         foreground="gray",
         wraplength=460,
@@ -154,7 +156,31 @@ def main():
     ttk.Button(add_frame, text="Add", command=_add_streamer, width=10).pack(side=tk.LEFT, padx=(6, 0))
 
     _render_streamers()
-    
+
+    # Drag to reorder. The list order is the priority (see the hint above),
+    # so the row under the pointer follows the drag and the working list is
+    # reordered live; Save writes it out in this order.
+    drag_state = {"from": None}
+
+    def _drag_start(event):
+        drag_state["from"] = streamers_listbox.nearest(event.y)
+
+    def _drag_motion(event):
+        src = drag_state["from"]
+        dst = streamers_listbox.nearest(event.y)
+        if src is None or dst == src or not (0 <= src < len(streamer_list))                 or not (0 <= dst < len(streamer_list)):
+            return
+        streamer_list.insert(dst, streamer_list.pop(src))
+        drag_state["from"] = dst
+        _render_streamers(dst)
+
+    def _drag_end(_event):
+        drag_state["from"] = None
+
+    streamers_listbox.bind("<ButtonPress-1>", _drag_start)
+    streamers_listbox.bind("<B1-Motion>", _drag_motion)
+    streamers_listbox.bind("<ButtonRelease-1>", _drag_end)
+
     # Credentials section
     ttk.Label(main_frame, text="Twitch API Credentials:", font=("", 10, "bold")).pack(anchor=tk.W)
     

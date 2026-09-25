@@ -241,9 +241,11 @@ def test_pause_lift_publishes_rescue_offer_instead_of_flushing(monitor):
     assert sm.ConfigRequestHandler.config_data["rescue"] == offer
     # Ownership not transferred yet: queue intact until ack or fallback.
     assert set(monitor.queued_vods) == {"alice", "bob"}
-    # Priority order: ended entries sorted earliest-ended first.
+    # Priority order: the settings list order comes first (v1.8.5), with
+    # earliest-ended only as the tiebreak. The fixture lists alice before
+    # bob, so alice leads even though bob ended earlier.
     streamers_in_order = [c["streamer"] for c in offer["candidates"]]
-    assert streamers_in_order == ["bob", "alice"]
+    assert streamers_in_order == ["alice", "bob"]
     assert all(c["kind"] == "ended" for c in offer["candidates"])
 
 
@@ -523,3 +525,19 @@ def test_worker_survives_open_failure(monitor):
         "https://twitch.tv/alice?sm=1",
         "https://twitch.tv/bob?sm=1",
     ]
+
+
+def test_list_order_is_open_priority(monitor):
+    """v1.8.5: the settings list order is the priority for OPEN order.
+    Within the ended tier it beats earliest-ended; the live tier follows
+    it too. It never decides eviction (that stays oldest-first + Keep Open)."""
+    monitor.config.streamers = ["bob", "alice", "carol"]
+    monitor.queued_vods = {
+        "alice": {"url": "https://www.twitch.tv/save-streak/alice?sm=1", "ended_at": "2026-09-24T01:00:00.000Z"},
+        "bob": {"url": "https://www.twitch.tv/save-streak/bob?sm=1", "ended_at": "2026-09-24T02:00:00.000Z"},
+    }
+    monitor.missed_while_paused["carol"] = "12:00:00"
+    monitor.missed_while_paused["dave"] = "12:01:00"  # not on the list: sorts last
+    cands = monitor._build_rescue_candidates({"carol", "dave"})
+    assert [c["streamer"] for c in cands] == ["bob", "alice", "carol", "dave"]
+    assert [c["kind"] for c in cands] == ["ended", "ended", "live", "live"]
