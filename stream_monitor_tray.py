@@ -45,7 +45,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.8.4"
+VERSION = "1.8.5"
 GITHUB_REPO = "caedicious/stream-monitor"
 CONFIG_SERVER_PORT = 52832  # Arbitrary high port for localhost config server
 
@@ -904,15 +904,28 @@ class TwitchMonitor:
         )
         return count
 
+    def _list_rank(self, name: str) -> int:
+        """Position of a streamer in the settings list (0 = top). The list
+        order is the user's priority for OPEN order: rescue queue order
+        within each tier and which live streams open first when several
+        go live at once. It never decides which tab gets closed; max-tabs
+        displacement stays oldest-first plus Keep Open. Unlisted names
+        (bell/sidebar rescue finds) sort after every listed one."""
+        try:
+            return [s.lower() for s in self.config.streamers].index(name.lower())
+        except ValueError:
+            return len(self.config.streamers)
+
     def _build_rescue_candidates(self, live_set: set) -> list:
         """Assemble the rescue queue in priority order: streams that ended
-        while we were paused first (save-streak URLs, earliest-ended first,
-        because they have burned the most of their 24h save window), then
-        streams that are still live right now."""
-        live_names = [
-            name for name in list(self.missed_while_paused)
-            if name in live_set
-        ]
+        while we were paused first (save-streak URLs), then streams that
+        are still live right now. Within each tier the settings list order
+        is the priority (top of the list first), with earliest-ended as
+        the tiebreak for the ended tier."""
+        live_names = sorted(
+            (name for name in list(self.missed_while_paused) if name in live_set),
+            key=self._list_rank,
+        )
         live_name_set = set(live_names)
         # A streamer can be in both lists: ended during the pause (VOD
         # queued) and live again by the time the pause lifted. Watching
@@ -928,7 +941,7 @@ class TwitchMonitor:
             for streamer, entry in self.queued_vods.items()
             if streamer not in live_name_set
         ]
-        ended.sort(key=lambda c: c.get("ended_at") or "")
+        ended.sort(key=lambda c: (self._list_rank(c["streamer"]), c.get("ended_at") or ""))
         live = [
             {
                 "streamer": name,
@@ -1071,10 +1084,10 @@ class TwitchMonitor:
         """
         if not self.missed_while_paused:
             return []
-        still_live = [
-            name for name in list(self.missed_while_paused)
-            if name in live_set
-        ]
+        still_live = sorted(
+            (name for name in list(self.missed_while_paused) if name in live_set),
+            key=self._list_rank,
+        )
         for name in still_live:
             self.missed_while_paused.pop(name, None)
             state = self.streamers.get(name)
@@ -1104,7 +1117,11 @@ class TwitchMonitor:
         # show which VODs are waiting for the pause to lift.
         ConfigRequestHandler.config_data["queued_vods"] = dict(self.queued_vods)
 
-        for username, is_live in current_status.items():
+        # List order is the priority when several streamers go live on the
+        # same poll: opens are enqueued top-of-list first.
+        for username, is_live in sorted(
+            current_status.items(), key=lambda kv: self._list_rank(kv[0])
+        ):
             state = self.streamers[username]
 
             if is_live:
