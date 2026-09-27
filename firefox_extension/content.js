@@ -16,6 +16,10 @@
   const POLL_INTERVAL_MS = 3000;
   const MAX_RETRIES = 20; // Stop retrying after ~60s if video never appears
   const LOG_PREFIX = "[Stream Monitor Content]";
+  // True inside a twitch.tv frame embedded by another page (a multistream
+  // site framing Twitch chat, v1.11.1). Comparing window references never
+  // throws, even when the parent is cross-origin.
+  const IN_FRAME = window !== window.top;
 
   let ensurePlaybackEnabled = false;
   let lowQualityEnabled = false;
@@ -497,7 +501,9 @@
   // Message handler — receives commands from the background script
   // -----------------------------------------------------------------------
 
-  browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Only the top-level page answers the background's tab messages; a
+  // frame answering first would shadow it.
+  if (!IN_FRAME) browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.action) {
       case "ensurePlaying":
         ensurePlaybackEnabled = true;
@@ -887,7 +893,9 @@
 
   function currentStreamerSlug() {
     const seg = window.location.pathname.split("/").filter(Boolean);
-    if (seg[0] === "save-streak" && seg[1]) return seg[1].toLowerCase();
+    if ((seg[0] === "save-streak" || seg[0] === "embed" || seg[0] === "popout") && seg[1]) {
+      return seg[1].toLowerCase();
+    }
     return seg[0] ? seg[0].toLowerCase() : "";
   }
 
@@ -947,9 +955,13 @@
   // Init — start error checking immediately, playback control on command
   // -----------------------------------------------------------------------
 
-  console.log(LOG_PREFIX, "Content script loaded on", window.location.href);
-  startErrorChecking();
-  startStreakMonitor();
-  startBellSurveillance();
+  console.log(LOG_PREFIX, IN_FRAME ? "Content script loaded in a frame on" : "Content script loaded on", window.location.href);
+  // Inside an embedded Twitch frame only the bonus claimer runs: the
+  // player, streak and bell features belong to the top-level page.
+  if (!IN_FRAME) {
+    startErrorChecking();
+    startStreakMonitor();
+    startBellSurveillance();
+  }
   startBonusClaimer();
 })();

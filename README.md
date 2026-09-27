@@ -36,7 +36,7 @@ A Windows application that monitors Twitch streamers and automatically opens the
 - **Auto-Mute Tabs**: Optionally mute every stream tab at the browser level so a dozen streams don't shout at you
 - **Low Quality Mode**: Optionally drop every opened stream to the lowest quality to save bandwidth
 - **Raid Follow-Through**: Optionally stay for exactly one raid hop before closing
-- **Auto-Claim Bonus Points**: The extension clicks the channel points chest when it appears, on any Twitch tab (toggle in the extension popup)
+- **Auto-Claim Bonus Points**: The extension clicks the channel points chest when it appears, on any Twitch tab, including Twitch chat embedded on other sites (toggle in the extension popup)
 - **Max Tabs Limit**: Cap how many concurrent stream tabs can be open at once
 
 ## For Users
