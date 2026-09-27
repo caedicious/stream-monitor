@@ -483,6 +483,24 @@ async function handleTabError(tabId) {
 }
 
 // Listen for messages from content scripts
+// Channel points bonus claims reported by content scripts (v1.11.0): one
+// log line each and a running total for the popup. Serialized through a
+// promise chain so two tabs claiming in the same tick cannot both write the
+// same total. The chain itself is in-memory by design: losing it on a
+// recycle costs nothing, the total lives in storage.local.
+let _bonusClaimQueue = Promise.resolve();
+
+function recordBonusClaim(streamer, tabId) {
+  _bonusClaimQueue = _bonusClaimQueue
+    .then(async () => {
+      const result = await chrome.storage.local.get("bonusClaimCount");
+      const total = (Number(result.bonusClaimCount) || 0) + 1;
+      await chrome.storage.local.set({ bonusClaimCount: total });
+      await log("info", `Claimed channel points bonus on ${streamer || "unknown"} (tab ${tabId}); ${total} so far`);
+    })
+    .catch(() => {});
+}
+
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message.action === "tabError" && sender.tab) {
     handleTabError(sender.tab.id);
@@ -500,6 +518,8 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   } else if (message.type === "clear_acknowledged_streaks") {
     clearAcknowledgedStreaks().then(() => sendResponse({ ok: true }));
     return true;
+  } else if (message.type === "bonus_claimed") {
+    recordBonusClaim(message.streamer, sender.tab ? sender.tab.id : null);
   }
 });
 

@@ -518,6 +518,7 @@
       case "keepalive":
         // Triggered by background script's alarm — not throttled
         keepalive();
+        claimBonusIfPresent("keepalive");
         sendResponse({ ok: true });
         break;
 
@@ -857,8 +858,89 @@
     });
   }
 
+  // -----------------------------------------------------------------------
+  // Channel points bonus (v1.11.0): click Twitch's "Claim Bonus" chest when
+  // it appears in the chat's points area, on any Twitch tab. Off via the
+  // popup's "Auto-claim bonus points" toggle (default on).
+  //
+  // The claimable state is Twitch's own button; this only clicks it, the
+  // same way the player strategy clicks Twitch's own play button. The chest
+  // icon's class is the primary anchor because it is locale-independent;
+  // the English aria-label is only a fallback. The chest stays claimable
+  // until clicked, so a 5s poll (throttled to about once a minute in a
+  // background tab) plus the unthrottled keepalive tick is plenty.
+  // -----------------------------------------------------------------------
+
+  const BONUS_POLL_MS = 5000;
+  const BONUS_CLICK_COOLDOWN_MS = 10000;
+  let autoClaimBonusEnabled = true;
+  let _lastBonusClickMs = 0;
+  let _bonusPollTimer = null;
+
+  function findBonusClaimButton(root) {
+    const doc = root || document;
+    const icon = doc.querySelector(".claimable-bonus__icon");
+    const fromIcon = icon && icon.closest("button");
+    if (fromIcon) return fromIcon;
+    return doc.querySelector('button[aria-label*="Claim Bonus" i]');
+  }
+
+  function currentStreamerSlug() {
+    const seg = window.location.pathname.split("/").filter(Boolean);
+    if (seg[0] === "save-streak" && seg[1]) return seg[1].toLowerCase();
+    return seg[0] ? seg[0].toLowerCase() : "";
+  }
+
+  function claimBonusIfPresent(reason) {
+    if (!autoClaimBonusEnabled) return false;
+    const now = Date.now();
+    if (now - _lastBonusClickMs < BONUS_CLICK_COOLDOWN_MS) return false;
+    let button = null;
+    try {
+      button = findBonusClaimButton();
+    } catch (e) {
+      return false;
+    }
+    // getClientRects is empty for display:none, unlike offsetParent, which
+    // is also null for position:fixed ancestors.
+    if (!button || button.disabled || button.getClientRects().length === 0) return false;
+    _lastBonusClickMs = now;
+    button.click();
+    console.log(LOG_PREFIX, `Claimed channel points bonus (${reason})`);
+    try {
+      browser.runtime.sendMessage({
+        type: "bonus_claimed",
+        streamer: currentStreamerSlug(),
+        page_url: window.location.href,
+      });
+    } catch (e) {
+      // Background asleep or the extension reloading: the claim itself
+      // already happened, only the log line is lost.
+    }
+    return true;
+  }
+
+  function startBonusClaimer() {
+    if (_bonusPollTimer) return;
+    browser.storage.local.get("autoClaimBonus")
+      .then((result) => {
+        autoClaimBonusEnabled = (result && result.autoClaimBonus) ?? true;
+      })
+      .catch(() => {});
+
+    browser.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes.autoClaimBonus) {
+        autoClaimBonusEnabled = changes.autoClaimBonus.newValue ?? true;
+      }
+    });
+    _bonusPollTimer = setInterval(() => claimBonusIfPresent("poll"), BONUS_POLL_MS);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") claimBonusIfPresent("visible");
+    });
+  }
+
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { parseStreakText, parseBellBadgeCount };
+    module.exports = { parseStreakText, parseBellBadgeCount, findBonusClaimButton };
   }
 
   // -----------------------------------------------------------------------
@@ -869,4 +951,5 @@
   startErrorChecking();
   startStreakMonitor();
   startBellSurveillance();
+  startBonusClaimer();
 })();

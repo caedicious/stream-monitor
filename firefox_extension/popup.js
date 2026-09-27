@@ -4,12 +4,15 @@ const autoFocusEl = document.getElementById("auto-focus");
 const extensionPausedEl = document.getElementById("extension-paused");
 const lowQualityEl = document.getElementById("low-quality");
 const raidFollowEl = document.getElementById("raid-follow");
+const autoClaimBonusEl = document.getElementById("auto-claim-bonus");
+const autoClaimBonusNoteEl = document.getElementById("auto-claim-bonus-note");
 const maxTabsEl = document.getElementById("max-tabs");
 const notificationsEl = document.getElementById("notifications-enabled");
 
 async function loadSettings() {
   const result = await browser.storage.local.get([
-    "autoMute", "autoFocusTabs", "extensionPaused", "lowQuality", "raidFollowThrough", "maxTabs"
+    "autoMute", "autoFocusTabs", "extensionPaused", "lowQuality", "raidFollowThrough", "maxTabs",
+    "autoClaimBonus", "bonusClaimCount"
   ]);
   autoMuteEl.checked = result.autoMute || false;
   // Default ON for autoFocus — see shouldAutoFocus in background.js
@@ -17,6 +20,13 @@ async function loadSettings() {
   extensionPausedEl.checked = result.extensionPaused || false;
   lowQualityEl.checked = result.lowQuality || false;
   raidFollowEl.checked = result.raidFollowThrough || false;
+  // Default ON, like auto-focus.
+  autoClaimBonusEl.checked = result.autoClaimBonus ?? true;
+  const claimed = Number(result.bonusClaimCount) || 0;
+  if (claimed > 0) {
+    autoClaimBonusNoteEl.textContent =
+      `Clicks the channel points chest when it appears, on any Twitch tab. Claimed so far: ${claimed}`;
+  }
   maxTabsEl.value = result.maxTabs || 0;
 
   // Reflect the actual notifications permission state, not a stored
@@ -49,6 +59,10 @@ lowQualityEl.addEventListener("change", async () => {
 
 raidFollowEl.addEventListener("change", async () => {
   await browser.storage.local.set({ raidFollowThrough: raidFollowEl.checked });
+});
+
+autoClaimBonusEl.addEventListener("change", async () => {
+  await browser.storage.local.set({ autoClaimBonus: autoClaimBonusEl.checked });
 });
 
 maxTabsEl.addEventListener("change", async () => {

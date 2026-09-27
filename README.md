@@ -36,6 +36,7 @@ A Windows application that monitors Twitch streamers and automatically opens the
 - **Auto-Mute Tabs**: Optionally mute every stream tab at the browser level so a dozen streams don't shout at you
 - **Low Quality Mode**: Optionally drop every opened stream to the lowest quality to save bandwidth
 - **Raid Follow-Through**: Optionally stay for exactly one raid hop before closing
+- **Auto-Claim Bonus Points**: The extension clicks the channel points chest when it appears, on any Twitch tab (toggle in the extension popup)
 - **Max Tabs Limit**: Cap how many concurrent stream tabs can be open at once
 
 ## For Users
@@ -50,7 +51,7 @@ After setup, Stream Monitor runs in your system tray and automatically starts wh
 
 ### Browser Extension (Optional)
 
-The companion browser extension auto-closes tabs when a streamer raids, keeps background streams counted as viewers, and adds auto-mute / low-quality / max-tabs controls. It talks only to the desktop app running on your own PC (`http://127.0.0.1:52832`), so nothing leaves your machine.
+The companion browser extension auto-closes tabs when a streamer raids, keeps background streams counted as viewers, and adds auto-mute / low-quality / max-tabs controls and auto-claims the channel points bonus. It talks only to the desktop app running on your own PC (`http://127.0.0.1:52832`), so nothing leaves your machine.
 
 The desktop app sends one anonymous ping a day (a random install ID, the version, and the OS name) to the developer's server so active installs can be counted. Nothing else is sent, no IP address is stored, and the "Send anonymous install ping" checkbox in Settings turns it off. Details in [PRIVACY.md](PRIVACY.md).
 
