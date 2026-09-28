@@ -15,7 +15,7 @@ from tkinter import ttk, messagebox
 
 import requests
 
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 
 # Configuration
 APP_NAME = "StreamMonitor"
@@ -425,9 +425,11 @@ If you're not logged in to Twitch, you'll need to log in first.
         self.root.update()
         
         try:
+            # Form body, not the URL: requests puts the request URL in its
+            # exception text, which the label below shows on screen.
             response = requests.post(
                 "https://id.twitch.tv/oauth2/token",
-                params={
+                data={
                     "client_id": client_id,
                     "client_secret": client_secret,
                     "grant_type": "client_credentials"
