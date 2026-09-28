@@ -628,11 +628,17 @@
   // Match the visible text of a streak notification card. We keep the
   // regexes tolerant: Twitch occasionally swaps "Stream" for "Live", and
   // the rescue-window phrasing varies between "next Yh", "next Y hours",
-  // and "next Y days".
+  // and "next Y days". The count may carry thousands separators
+  // ("1,024-stream"); a plain count matches exactly as before.
   const STREAK_BROKE_RE =
-    /Your\s+(\d+)[- ](?:stream|live)\s+streak\s+on\s+([^\s!.,]+)\s+broke/i;
+    /Your\s+(\d{1,3}(?:,\d{3})+|\d+)[- ](?:stream|live)\s+streak\s+on\s+([^\s!.,]+)\s+broke/i;
   const STREAK_IN_DANGER_RE =
-    /Your\s+(\d+)[- ](?:stream|live)\s+streak\s+on\s+([^\s!.,]+)\s+(?:ends|expires)\s+in\s+(\d+)\s*(h|hours?|d|days?|m|mins?|minutes?)/i;
+    /Your\s+(\d{1,3}(?:,\d{3})+|\d+)[- ](?:stream|live)\s+streak\s+on\s+([^\s!.,]+)\s+(?:ends|expires)\s+in\s+(\d+)\s*(h|hours?|d|days?|m|mins?|minutes?)/i;
+
+  // A streak count as matched above, separators removed.
+  function parseStreakCount(text) {
+    return parseInt(text.replace(/,/g, ""), 10);
+  }
 
   // Parse a single block of text. Returns null if no streak match.
   function parseStreakText(text) {
@@ -642,7 +648,7 @@
       return {
         status: "broke",
         streamer: m[2].toLowerCase(),
-        count: parseInt(m[1], 10),
+        count: parseStreakCount(m[1]),
         deadline_hours: 24, // Twitch's documented rescue window
       };
     }
@@ -656,7 +662,7 @@
       return {
         status: "in_danger",
         streamer: m[2].toLowerCase(),
-        count: parseInt(m[1], 10),
+        count: parseStreakCount(m[1]),
         deadline_hours: hours,
       };
     }
@@ -832,6 +838,174 @@
       });
       obs.observe(document.body, { childList: true, subtree: true });
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // Save-streak page check (v1.11.2). Twitch's own "Save your streak" link
+  // sometimes lands on a card reading "No Content Eligible / You've already
+  // maintained your N-stream streak with X. Keep'em going by watching more
+  // live streams!" That means the streak is safe and the "broke" card that
+  // led here is stale. Report it once per visit to a /save-streak/<login>
+  // page so the background can close the tab (or end its rescue turn) and
+  // the desktop can ignore further "broke" cards for X until X goes live
+  // again. Twitch changes pages in place (history.pushState, no new
+  // document), so the top frame follows its path and arms a fresh check
+  // on every arrival at a save-streak page.
+  // -----------------------------------------------------------------------
+  const ALREADY_SAVED_RE =
+    /already\s+maintained\s+your\s+(\d{1,3}(?:,\d{3})+|\d+)[- ](?:stream|live)\s+streak\s+with\s+([^\s!.,]+)/i;
+  // Twitch renders the card after the channel page itself: scan at these
+  // delays after arriving, then on relevant mutations.
+  const SAVE_STREAK_SCAN_DELAYS_MS = [3000, 8000, 15000];
+  // Backstop for a card that renders late or changes its text in place,
+  // which the observer (added nodes only) cannot see. Bounded so a page
+  // left open for hours stops scanning.
+  const SAVE_STREAK_RESCAN_MS = 30000;
+  const SAVE_STREAK_RESCAN_WINDOW_MS = 10 * 60 * 1000;
+  // In-app navigation fires no event a content script can hear, so the
+  // top frame compares its path on this cadence.
+  const ROUTE_POLL_MS = 1000;
+
+  let _saveStreakRoute = null; // routeKey() the current check belongs to
+  let _saveStreakReported = false; // this visit already reported
+  let _saveStreakTimers = []; // one-shot scans for this visit
+  let _saveStreakRescanTimer = null;
+  let _saveStreakMutationScan = null; // the pending 500 ms rescan, if any
+  let _saveStreakObserver = null;
+
+  // {count, streamer} for a block of text with the "already maintained"
+  // wording, else null. The streamer here is Twitch's display name; the
+  // caller prefers the login from the page path.
+  function parseAlreadySavedText(text) {
+    if (!text || text.length > 600) return null;
+    const m = ALREADY_SAVED_RE.exec(text);
+    if (!m) return null;
+    return { count: parseStreakCount(m[1]), streamer: m[2].toLowerCase() };
+  }
+
+  function isSaveStreakPage() {
+    const seg = window.location.pathname.split("/").filter(Boolean);
+    return seg[0] === "save-streak" && !!seg[1];
+  }
+
+  // The path without a trailing slash or letter case, so Twitch tidying
+  // the URL in place does not count as a new visit.
+  function routeKey() {
+    return window.location.pathname.split("/").filter(Boolean).join("/").toLowerCase();
+  }
+
+  // Twitch display names are the login in other capitals, or a localized
+  // name that cannot be compared. A login-like name that does not start
+  // with this page's login belongs to another streamer: a card left over
+  // from the page before an in-app navigation.
+  function cardNameFitsLogin(name, login) {
+    return !/^[a-z0-9_]+$/.test(name) || name.startsWith(login);
+  }
+
+  function scanForAlreadySaved() {
+    if (_saveStreakReported || !document.body || !isSaveStreakPage()) return false;
+    // A scan queued for an earlier path must not report under this one;
+    // the route watcher re-arms for the new path.
+    if (routeKey() !== _saveStreakRoute) return false;
+    const login = currentStreamerSlug();
+    const candidates = document.body.querySelectorAll("p, span, div, h1, h2, h3, h4, article");
+    for (const el of candidates) {
+      if (el.children.length > 4) continue;
+      const text = (el.textContent || "").trim();
+      if (text.length < 20 || !/maintained/i.test(text)) continue;
+      const parsed = parseAlreadySavedText(text);
+      if (!parsed || !cardNameFitsLogin(parsed.streamer, login)) continue;
+      _saveStreakReported = true;
+      stopSaveStreakCheck();
+      const streamer = login || parsed.streamer;
+      try {
+        chrome.runtime.sendMessage({
+          type: "streak_event",
+          event: {
+            status: "already_saved",
+            streamer,
+            count: parsed.count,
+            detected_at: new Date().toISOString(),
+            page_url: window.location.href,
+          },
+        });
+        console.log(LOG_PREFIX, `Streak already saved for ${streamer} (${parsed.count}-stream); reported`);
+      } catch (e) {
+        console.warn(LOG_PREFIX, "Failed to report saved streak:", e && e.message);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // Cancels every pending scan and detaches the observer.
+  function stopSaveStreakCheck() {
+    for (const t of _saveStreakTimers) clearTimeout(t);
+    _saveStreakTimers = [];
+    if (_saveStreakRescanTimer) {
+      clearInterval(_saveStreakRescanTimer);
+      _saveStreakRescanTimer = null;
+    }
+    if (_saveStreakMutationScan) {
+      clearTimeout(_saveStreakMutationScan);
+      _saveStreakMutationScan = null;
+    }
+    if (_saveStreakObserver) {
+      _saveStreakObserver.disconnect();
+      _saveStreakObserver = null;
+    }
+  }
+
+  // Starts the check for the page the top frame is on now (a no-op beyond
+  // cleanup when that is not a save-streak page).
+  function armSaveStreakCheck() {
+    stopSaveStreakCheck();
+    _saveStreakRoute = routeKey();
+    _saveStreakReported = false;
+    if (!isSaveStreakPage()) return;
+    for (const delay of SAVE_STREAK_SCAN_DELAYS_MS) {
+      _saveStreakTimers.push(setTimeout(scanForAlreadySaved, delay));
+    }
+    const rescanUntil = Date.now() + SAVE_STREAK_RESCAN_WINDOW_MS;
+    _saveStreakRescanTimer = setInterval(() => {
+      if (Date.now() > rescanUntil) {
+        clearInterval(_saveStreakRescanTimer);
+        _saveStreakRescanTimer = null;
+        return;
+      }
+      scanForAlreadySaved();
+    }, SAVE_STREAK_RESCAN_MS);
+    if (typeof MutationObserver === "function" && document.body) {
+      const obs = new MutationObserver((mutations) => {
+        // One full-page rescan per burst of relevant mutations.
+        if (_saveStreakMutationScan) return;
+        let relevant = false;
+        for (const m of mutations) {
+          for (const node of m.addedNodes) {
+            const text = node.textContent;
+            if (text && /maintained/i.test(text)) {
+              relevant = true;
+              break;
+            }
+          }
+          if (relevant) break;
+        }
+        if (!relevant) return;
+        _saveStreakMutationScan = setTimeout(() => {
+          _saveStreakMutationScan = null;
+          scanForAlreadySaved();
+        }, 500);
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+      _saveStreakObserver = obs;
+    }
+  }
+
+  function startSaveStreakCheck() {
+    armSaveStreakCheck();
+    setInterval(() => {
+      if (routeKey() !== _saveStreakRoute) armSaveStreakCheck();
+    }, ROUTE_POLL_MS);
   }
 
   // -----------------------------------------------------------------------
@@ -1061,7 +1235,7 @@
   }
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = { parseStreakText, parseBellBadgeCount, findBonusClaimButton };
+    module.exports = { parseStreakText, parseBellBadgeCount, findBonusClaimButton, parseAlreadySavedText };
   }
 
   // -----------------------------------------------------------------------
@@ -1074,6 +1248,7 @@
   if (!IN_FRAME) {
     startErrorChecking();
     startStreakMonitor();
+    startSaveStreakCheck();
     startBellSurveillance();
   }
   startBonusClaimer();

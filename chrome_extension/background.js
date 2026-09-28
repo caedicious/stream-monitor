@@ -501,22 +501,35 @@ function recordBonusClaim(streamer, tabId) {
     .catch(() => {});
 }
 
-chrome.runtime.onMessage.addListener((message, sender) => {
+// The streak handlers below run without being awaited; a storage failure
+// inside them lands in the debug log instead of an unhandled rejection.
+function logStreakStateError(e) {
+  log("warn", "Streak state update failed:", e?.message || String(e));
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "tabError" && sender.tab) {
     handleTabError(sender.tab.id);
   } else if (message.action === "reloadTab" && sender.tab) {
     reloadTrackedTab(sender.tab.id);
   } else if (message.type === "streak_event" && message.event) {
-    forwardStreakEvent(message.event);
-    persistAtRiskStreak(message.event);
+    if (message.event.status === "already_saved") {
+      handleStreakAlreadySaved(message.event, sender.tab ? sender.tab.id : null).catch(logStreakStateError);
+    } else {
+      handleStreakCard(message.event).catch(logStreakStateError);
+    }
   } else if (message.type === "ack_streak" && message.streamer) {
-    acknowledgeAtRiskStreak(message.streamer).then(() => sendResponse({ ok: true }));
+    // Answer on failure too, so the popup's awaited call always settles.
+    acknowledgeAtRiskStreak(message.streamer)
+      .then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
     return true; // async response
   } else if (message.type === "dismiss_streak" && message.streamer) {
-    dismissAtRiskStreak(message.streamer).then(() => sendResponse({ ok: true }));
+    dismissAtRiskStreak(message.streamer)
+      .then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
     return true;
   } else if (message.type === "clear_acknowledged_streaks") {
-    clearAcknowledgedStreaks().then(() => sendResponse({ ok: true }));
+    clearAcknowledgedStreaks()
+      .then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
     return true;
   } else if (message.type === "bonus_claimed") {
     recordBonusClaim(message.streamer, sender.tab ? sender.tab.id : null);
@@ -525,9 +538,10 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
 // ---------------------------------------------------------------------------
 // Streak event relay — POST to desktop's /streak_event so it can log and
-// raise a tray notification. Best-effort: if the desktop app is not
-// running the post will fail silently, which is the same behavior as the
-// /config fetch on startup.
+// raise a tray notification. Best-effort for broke and in_danger cards: if
+// the desktop app is not running the post fails quietly, the same as the
+// /config fetch on startup. Resolves true only on a 2xx, which is what an
+// already_saved report needs before it stops being re-sent.
 // ---------------------------------------------------------------------------
 
 const STREAK_EVENT_URL = "http://127.0.0.1:52832/streak_event";
@@ -539,7 +553,7 @@ async function forwardStreakEvent(event) {
     });
     if (!hasPerm) {
       await log("info", "Streak event detected but host permission not granted; skipping");
-      return;
+      return false;
     }
     const resp = await fetch(STREAK_EVENT_URL, {
       method: "POST",
@@ -549,16 +563,18 @@ async function forwardStreakEvent(event) {
     });
     if (!resp.ok) {
       await log("warn", `Streak event POST returned HTTP ${resp.status}`);
-    } else {
-      await log(
-        "info",
-        `Streak event reported: ${event.status} on ${event.streamer} (count=${event.count})`
-      );
+      return false;
     }
+    await log(
+      "info",
+      `Streak event reported: ${event.status} on ${event.streamer} (count=${event.count})`
+    );
+    return true;
   } catch (e) {
     // Desktop app not running, or network blocked. This is expected when
     // the extension is installed standalone without the companion app.
     await log("info", "Streak event POST failed (desktop app likely not running):", e.message);
+    return false;
   }
 }
 
@@ -618,6 +634,22 @@ async function reportOpenTabs(reason) {
 const ACK_EXPIRY_BUFFER_MS = 4 * 60 * 60 * 1000; // 4h after deadline -> drop
 const STREAK_BADGE_COLOR = "#dc3545";
 
+// Every read-modify-write of atRiskStreaks and savedStreaks runs through
+// this chain: the content scripts, the popup and the config tick can all
+// write in the same instant, and storage.local has no transactions. A
+// check-then-write (a card is only at risk if the streak is not saved)
+// must also sit inside one step. In-memory by design: losing the chain on
+// a recycle costs nothing, the data lives in storage.local. A step must
+// never wait on another withStreakState call, or the chain deadlocks.
+let _streakStateQueue = Promise.resolve();
+
+function withStreakState(fn) {
+  const run = _streakStateQueue.then(fn);
+  // Keep the chain going after a failed step; the caller still sees it.
+  _streakStateQueue = run.catch(() => {});
+  return run;
+}
+
 async function loadAtRiskStreaks() {
   const r = await chrome.storage.local.get("atRiskStreaks");
   return r.atRiskStreaks || {};
@@ -635,7 +667,8 @@ function _entryExpired(entry, now) {
   return now - detected > deadlineHours * 3600 * 1000 + ACK_EXPIRY_BUFFER_MS;
 }
 
-async function pruneExpiredAtRiskStreaks() {
+// Chain step only; callers outside the chain use pruneExpiredAtRiskStreaks.
+async function pruneExpiredAtRiskStreaksStep() {
   const map = await loadAtRiskStreaks();
   const now = Date.now();
   let changed = false;
@@ -649,63 +682,423 @@ async function pruneExpiredAtRiskStreaks() {
   return map;
 }
 
-async function persistAtRiskStreak(event) {
-  if (!event || !event.streamer || !event.status) return;
-  const map = await pruneExpiredAtRiskStreaks();
-  const key = event.streamer.toLowerCase();
-  const existing = map[key];
-  // Upgrade rule: a "broke" event always wins over a stale "in_danger",
-  // and a newer detection replaces an older one of the same status.
-  // Acknowledged entries get re-armed if a new event of the same kind
-  // arrives (Twitch sometimes re-issues warnings as the deadline nears).
-  map[key] = {
-    streamer: key,
-    status: event.status === "broke" ? "broke" : "in_danger",
-    count: typeof event.count === "number" ? event.count : (existing?.count ?? 0),
-    detected_at: event.detected_at || new Date().toISOString(),
-    deadline_hours: typeof event.deadline_hours === "number"
-      ? event.deadline_hours
-      : (existing?.deadline_hours ?? 24),
-    save_url: event.save_url || existing?.save_url || `https://www.twitch.tv/${key}`,
-    acknowledged_at: null,
-  };
-  await saveAtRiskStreaks(map);
-  await refreshStreakBadge(map);
+function pruneExpiredAtRiskStreaks() {
+  return withStreakState(pruneExpiredAtRiskStreaksStep);
 }
 
-async function acknowledgeAtRiskStreak(streamer) {
-  if (!streamer) return;
-  const key = streamer.toLowerCase();
-  const map = await loadAtRiskStreaks();
-  if (!map[key]) return;
-  map[key].acknowledged_at = new Date().toISOString();
-  await saveAtRiskStreaks(map);
-  await refreshStreakBadge(map);
+// The desktop's count rule: a card whose count is above the saved count is
+// about a break after the save (the streak grew since). Needs both counts.
+function cardOutgrowsSave(card, save) {
+  return Number.isInteger(card.count) && Number.isInteger(save.count) && card.count > save.count;
 }
 
-async function dismissAtRiskStreak(streamer) {
-  if (!streamer) return;
-  const key = streamer.toLowerCase();
-  const map = await loadAtRiskStreaks();
-  if (!map[key]) return;
-  delete map[key];
-  await saveAtRiskStreaks(map);
-  await refreshStreakBadge(map);
-}
-
-async function clearAcknowledgedStreaks() {
-  const map = await loadAtRiskStreaks();
-  let changed = false;
-  for (const key of Object.keys(map)) {
-    if (map[key].acknowledged_at) {
-      delete map[key];
-      changed = true;
+// Stores a broke or in_danger card as at risk unless a save that counts
+// covers it. Resolves to {stored: true, detectedAt}, or {stored: false,
+// askDesktop} where askDesktop means the save that dropped it is one the
+// desktop knows, so the desktop's verdict on this card is worth fetching
+// (handleStreakCard). afterDesktop marks that second look: it never
+// replaces a row for a card seen later than this one.
+function persistAtRiskStreak(event, { afterDesktop = false } = {}) {
+  if (!event || !event.streamer || !event.status) return Promise.resolve({ stored: false });
+  const key = String(event.streamer).toLowerCase();
+  return withStreakState(async () => {
+    const saves = await loadSavedStreaks();
+    const save = saves[key];
+    if (savedEntryCounts(save, Date.now())) {
+      if (cardOutgrowsSave(event, save)) {
+        // The streak grew after the save, so the card is about a newer
+        // break and the save no longer holds (the desktop ends it too).
+        delete saves[key];
+        await saveSavedStreaks(saves);
+        await log("info",
+          `Save for ${key} ended: the ${event.status} card shows a ${event.count}-stream streak, the save a ${save.count}-stream one`
+        );
+      } else {
+        // A stale card: Twitch already confirmed this streak as kept.
+        await log("info", afterDesktop
+          ? `Ignoring ${event.status} card for ${key}: the desktop still counts the streak as saved`
+          : `Ignoring ${event.status} card for ${key}: streak already saved`);
+        // A report still owed to the desktop cannot be judged there.
+        return { stored: false, askDesktop: !(save.source === "local" && save.pending) };
+      }
     }
-  }
-  if (changed) {
+    const map = await pruneExpiredAtRiskStreaksStep();
+    const existing = map[key];
+    const detectedAt = event.detected_at || new Date().toISOString();
+    if (afterDesktop && existing && Date.parse(existing.detected_at) > Date.parse(detectedAt)) {
+      return { stored: false, askDesktop: false };
+    }
+    // Upgrade rule: a "broke" event always wins over a stale "in_danger",
+    // and a newer detection replaces an older one of the same status.
+    // Acknowledged entries get re-armed if a new event of the same kind
+    // arrives (Twitch sometimes re-issues warnings as the deadline nears).
+    map[key] = {
+      streamer: key,
+      status: event.status === "broke" ? "broke" : "in_danger",
+      count: typeof event.count === "number" ? event.count : (existing?.count ?? 0),
+      detected_at: detectedAt,
+      deadline_hours: typeof event.deadline_hours === "number"
+        ? event.deadline_hours
+        : (existing?.deadline_hours ?? 24),
+      save_url: event.save_url || existing?.save_url || `https://www.twitch.tv/${key}`,
+      acknowledged_at: null,
+    };
     await saveAtRiskStreaks(map);
     await refreshStreakBadge(map);
+    return { stored: true, detectedAt };
+  });
+}
+
+// A broke or in_danger card from a content script: sent to the desktop and
+// judged here at the same time. When a save the desktop knows dropped it,
+// the desktop's verdict decides once it has answered the card's POST: it
+// ends a save that a higher-count card outgrew or whose broadcast has
+// ended, so a /config fetched now shows whether that save still counts. A
+// stored row records that the desktop saw its card (see saveSettlesRow).
+async function handleStreakCard(event) {
+  const posted = forwardStreakEvent(event).then(ok => (ok ? Date.now() : null));
+  let outcome = await persistAtRiskStreak(event);
+  const seenAt = await posted;
+  if (seenAt === null) return;
+  if (!outcome.stored && outcome.askDesktop && (await refreshSavedStreaksFromDesktop())) {
+    outcome = await persistAtRiskStreak(event, { afterDesktop: true });
   }
+  if (outcome.stored) await noteCardSeenByDesktop(event.streamer, outcome.detectedAt, seenAt);
+}
+
+// Marks the at-risk row of a card the desktop accepted with a 2xx. A newer
+// card may have replaced the row meanwhile; that one is left alone.
+function noteCardSeenByDesktop(streamer, detectedAt, seenAt) {
+  const key = String(streamer).toLowerCase();
+  return withStreakState(async () => {
+    const map = await loadAtRiskStreaks();
+    const row = map[key];
+    if (!row || row.detected_at !== detectedAt) return;
+    row.desktop_seen_at = seenAt;
+    await saveAtRiskStreaks(map);
+  });
+}
+
+// Whether a save makes an at-risk row moot. Never when the row's card
+// outgrows the save. Otherwise when the card was seen at or before the
+// save, or when the desktop saw the card before this list was fetched and
+// still lists the save: its verdict that the card is stale. A later card
+// the desktop never saw stays, since it may be a break the desktop could
+// not see (a broadcast it missed while it was off).
+function saveSettlesRow(save, row, fetchStartedAt) {
+  if (cardOutgrowsSave(row, save)) return false;
+  const rowAt = Date.parse(row.detected_at);
+  const saveAt = Date.parse(save.at);
+  if (isNaN(rowAt) || isNaN(saveAt) || rowAt <= saveAt) return true;
+  return save.source === "desktop" && typeof row.desktop_seen_at === "number" &&
+    row.desktop_seen_at < fetchStartedAt;
+}
+
+// ---------------------------------------------------------------------------
+// Already-saved streaks (v1.11.2)
+//
+// A save-streak page that reads "You've already maintained your N-stream
+// streak with X" means there is nothing to watch: the streak is safe. The
+// content script reports it as a streak_event with status "already_saved".
+// The desktop owns the rule "saved until X next goes live" and publishes
+// the saves that still count in /config as saved_streaks.
+//
+// savedStreaks (storage.local) maps a login to one of:
+//   {at, source: "desktop", seenAt, count?}
+//     Listed by the desktop. Counts while /config keeps listing it, and
+//     stops SAVED_STREAK_LOCAL_TTL_MS after the last fetch that did, so a
+//     desktop that went quiet cannot hide a later break for good. count is
+//     kept from this browser's own report of that save; /config has none.
+//   {at, source: "local", count, page_url, pending: true}
+//     Seen here, not yet acknowledged with a 2xx. Counts for
+//     SAVED_STREAK_LOCAL_TTL_MS from the detection (at) and is re-sent with
+//     its original payload after every successful /config.
+//   {at, source: "local", count, page_url, pending: false, deliveredAt}
+//     Acknowledged. The first list fetched after the delivery decides it:
+//     absent there means the desktop saw a go-live after the detection.
+// ---------------------------------------------------------------------------
+
+const SAVED_STREAK_LOCAL_TTL_MS = 24 * 60 * 60 * 1000;
+// The desktop's own login rule; a report it would refuse is dropped here.
+const SAVED_STREAK_LOGIN_RE = /^[a-z0-9_]{1,64}$/;
+
+async function loadSavedStreaks() {
+  const r = await chrome.storage.local.get("savedStreaks");
+  return r.savedStreaks && typeof r.savedStreaks === "object" ? r.savedStreaks : {};
+}
+
+async function saveSavedStreaks(map) {
+  await chrome.storage.local.set({ savedStreaks: map });
+}
+
+function savedEntryCounts(entry, now) {
+  if (!entry || typeof entry !== "object") return false;
+  if (entry.source === "desktop") {
+    return typeof entry.seenAt === "number" && now - entry.seenAt < SAVED_STREAK_LOCAL_TTL_MS;
+  }
+  const at = Date.parse(entry.at);
+  return !isNaN(at) && now - at < SAVED_STREAK_LOCAL_TTL_MS;
+}
+
+// Logins whose streak currently counts as saved.
+async function savedStreakSet() {
+  const map = await loadSavedStreaks();
+  const now = Date.now();
+  const set = new Set();
+  for (const [key, entry] of Object.entries(map)) {
+    if (savedEntryCounts(entry, now)) set.add(key);
+  }
+  return set;
+}
+
+async function isStreakSaved(streamer) {
+  const key = String(streamer || "").toLowerCase();
+  if (!key) return false;
+  return (await savedStreakSet()).has(key);
+}
+
+// Folds the desktop's saved_streaks into ours (entry shapes above). A
+// fetchStartedAt at or before a delivery means this list may predate that
+// report, so it cannot judge it yet. A save that counts afterwards also
+// clears the at-risk rows it settles (saveSettlesRow): one written before
+// the save was known, or a card another browser scraped.
+function mergeSavedStreaksFromDesktop(listed, fetchStartedAt) {
+  return withStreakState(async () => {
+    const now = Date.now();
+    const desktop = {};
+    for (const [name, at] of Object.entries(listed || {})) {
+      const key = String(name).toLowerCase();
+      if (SAVED_STREAK_LOGIN_RE.test(key) && typeof at === "string") desktop[key] = at;
+    }
+    const before = await loadSavedStreaks();
+    const next = {};
+    for (const [key, entry] of Object.entries(before)) {
+      if (!entry || entry.source !== "local" || !savedEntryCounts(entry, now)) continue;
+      if (entry.pending) {
+        next[key] = entry; // still owed to the desktop
+      } else if (desktop[key]) {
+        continue; // the desktop's entry below replaces it
+      } else if (typeof entry.deliveredAt !== "number" || fetchStartedAt <= entry.deliveredAt) {
+        next[key] = entry; // not yet judged by a list fetched after delivery
+      }
+      // Otherwise delivered and not listed: superseded by a go-live.
+    }
+    for (const [key, at] of Object.entries(desktop)) {
+      if (next[key]) continue;
+      const entry = { at, source: "desktop", seenAt: now };
+      // The same save this browser reported (same detection time) keeps
+      // its count, so the count rule still works while the desktop is down.
+      const prev = before[key];
+      if (prev && prev.at === at && Number.isInteger(prev.count)) entry.count = prev.count;
+      next[key] = entry;
+    }
+    await saveSavedStreaks(next);
+
+    const had = new Set(Object.keys(before).filter(k => savedEntryCounts(before[k], now)));
+    const has = Object.keys(next).filter(k => savedEntryCounts(next[k], now));
+    const added = has.filter(k => !had.has(k));
+    const removed = [...had].filter(k => !has.includes(k));
+    if (added.length > 0 || removed.length > 0) {
+      await log("info",
+        `Saved streaks from desktop: now ${has.length}` +
+        (added.length ? `, added ${added.join(", ")}` : "") +
+        (removed.length ? `, no longer saved ${removed.join(", ")}` : "")
+      );
+    }
+
+    const atRisk = await loadAtRiskStreaks();
+    const cleared = has.filter(k => atRisk[k] && saveSettlesRow(next[k], atRisk[k], fetchStartedAt));
+    if (cleared.length > 0) {
+      for (const k of cleared) delete atRisk[k];
+      await saveAtRiskStreaks(atRisk);
+      await refreshStreakBadge(atRisk);
+      await log("info", `Cleared at-risk row(s) for ${cleared.join(", ")}: streak already saved`);
+    }
+  });
+}
+
+// The already_saved payload the desktop expects, or null when the report
+// has no usable login or count. A detection time in the future (clock
+// jumped back) becomes now.
+function alreadySavedPayload(event) {
+  const streamer = String((event && event.streamer) || "").toLowerCase();
+  const count = event ? event.count : undefined;
+  if (!SAVED_STREAK_LOGIN_RE.test(streamer) || !Number.isInteger(count) || count < 0) return null;
+  const now = Date.now();
+  const seen = Date.parse(event.detected_at);
+  return {
+    status: "already_saved",
+    streamer,
+    count,
+    detected_at: new Date(isNaN(seen) || seen > now ? now : seen).toISOString(),
+    page_url: typeof event.page_url === "string" ? event.page_url : "",
+  };
+}
+
+// POSTs one already_saved report. A 2xx marks that detection delivered;
+// anything else leaves it pending for the next successful /config.
+async function deliverSavedStreak(payload) {
+  const ok = await forwardStreakEvent(payload);
+  if (!ok) return false;
+  await withStreakState(async () => {
+    const map = await loadSavedStreaks();
+    const entry = map[payload.streamer];
+    // A newer detection may have replaced this one while the POST was out.
+    if (!entry || entry.source !== "local" || !entry.pending || entry.at !== payload.detected_at) return;
+    entry.pending = false;
+    entry.deliveredAt = Date.now();
+    await saveSavedStreaks(map);
+  });
+  return true;
+}
+
+// Only one re-send pass at a time; concurrent config ticks share it.
+// In-memory is enough: a recycle ends the pass anyway, and the pending
+// entries it works from live in storage.local.
+let savedStreakResendInFlight = null;
+
+function resendPendingSavedStreaks() {
+  if (savedStreakResendInFlight) return savedStreakResendInFlight;
+  savedStreakResendInFlight = (async () => {
+    try {
+      const map = await loadSavedStreaks();
+      const now = Date.now();
+      for (const [streamer, entry] of Object.entries(map)) {
+        if (!entry || entry.source !== "local" || !entry.pending) continue;
+        if (!savedEntryCounts(entry, now) || !Number.isInteger(entry.count)) continue;
+        await log("info", `Re-sending already_saved for ${streamer}: the desktop has not acknowledged it yet`);
+        await deliverSavedStreak({
+          status: "already_saved",
+          streamer,
+          count: entry.count,
+          detected_at: entry.at,
+          page_url: typeof entry.page_url === "string" ? entry.page_url : "",
+        });
+      }
+    } finally {
+      savedStreakResendInFlight = null;
+    }
+  })();
+  return savedStreakResendInFlight;
+}
+
+async function handleStreakAlreadySaved(event, tabId) {
+  const payload = alreadySavedPayload(event);
+  if (!payload) {
+    await log("warn", "Ignoring an already_saved report without a valid login and count");
+    return;
+  }
+  const streamer = payload.streamer;
+  await withStreakState(async () => {
+    const map = await loadSavedStreaks();
+    const save = {
+      at: payload.detected_at,
+      source: "local",
+      count: payload.count,
+      page_url: payload.page_url,
+      pending: true,
+    };
+    map[streamer] = save;
+    await saveSavedStreaks(map);
+    // Not at risk after all: drop the badge entry, unless its card shows a
+    // higher count than this page, which makes it a newer break.
+    const atRisk = await loadAtRiskStreaks();
+    if (atRisk[streamer] && !cardOutgrowsSave(atRisk[streamer], save)) {
+      delete atRisk[streamer];
+      await saveAtRiskStreaks(atRisk);
+      await refreshStreakBadge(atRisk);
+    }
+  });
+  await log("info", `Streak already saved for ${streamer} (${payload.count}-stream); nothing to rescue`);
+  // Free the tab first; the POST can take up to its 5 s timeout.
+  if (tabId !== null && tabId !== undefined) await releaseSaveStreakTab(tabId, streamer);
+  await deliverSavedStreak(payload);
+}
+
+// The page has nothing to watch, so a tab Stream Monitor opened as this
+// streamer's save-streak page is closed. For a rescue slot that ends its
+// turn now instead of after RESCUE_ROTATE_MINUTES (closing the tab frees
+// the slot through onTabRemoved). The saveStreak flag is set when tracking
+// starts, while the URL still has sm=1 (Twitch strips it soon after). Left
+// alone: a rescue slot opened for a live stream (the save only covers the
+// broadcasts before the one it is there to watch), a tab the user opened,
+// and a tracked channel tab the user navigated to the save-streak page.
+async function releaseSaveStreakTab(tabId, streamer) {
+  const tabKey = String(tabId);
+  const { trackedTabs } = await loadState();
+  const tracked = trackedTabs[tabKey];
+  if (!tracked || !tracked.saveStreak || tracked.originalStreamer !== streamer) {
+    await log("info", tracked && tracked.rescue && tracked.originalStreamer === streamer
+      ? `Rescue: leaving tab ${tabKey} on ${streamer}; its turn is for the live stream`
+      : `Leaving tab ${tabKey} open for ${streamer}: Stream Monitor did not open it as that save-streak page`);
+    return;
+  }
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    await log("info", `Save-streak tab ${tabKey} for ${streamer} is already closed`);
+    return;
+  }
+  // The path survives the query strip; a tab that has since moved to
+  // another page is not closed.
+  const m = tab && tab.url ? tab.url.match(SAVE_STREAK_URL_PATTERN) : null;
+  if (!m || m[1].toLowerCase() !== streamer) {
+    await log("info", `Leaving tab ${tabKey} open for ${streamer}: it is no longer on the save-streak page`);
+    return;
+  }
+  const session = await loadRescueSession();
+  const inRotation = !!(session && session.active &&
+    session.slots.some(s => s.tabKey === tabKey && s.streamer === streamer));
+  try {
+    await chrome.tabs.remove(tabId);
+    await log("info", inRotation
+      ? `Rescue: ${streamer} was already saved; ended its turn early (tab ${tabKey})`
+      : `Closed save-streak tab ${tabKey} for ${streamer}: already saved`);
+  } catch (e) {
+    await log("warn", `Could not close save-streak tab ${tabKey}:`, e?.message || String(e));
+  }
+}
+
+function acknowledgeAtRiskStreak(streamer) {
+  if (!streamer) return Promise.resolve();
+  const key = streamer.toLowerCase();
+  return withStreakState(async () => {
+    const map = await loadAtRiskStreaks();
+    if (!map[key]) return;
+    map[key].acknowledged_at = new Date().toISOString();
+    await saveAtRiskStreaks(map);
+    await refreshStreakBadge(map);
+  });
+}
+
+function dismissAtRiskStreak(streamer) {
+  if (!streamer) return Promise.resolve();
+  const key = streamer.toLowerCase();
+  return withStreakState(async () => {
+    const map = await loadAtRiskStreaks();
+    if (!map[key]) return;
+    delete map[key];
+    await saveAtRiskStreaks(map);
+    await refreshStreakBadge(map);
+  });
+}
+
+function clearAcknowledgedStreaks() {
+  return withStreakState(async () => {
+    const map = await loadAtRiskStreaks();
+    let changed = false;
+    for (const key of Object.keys(map)) {
+      if (map[key].acknowledged_at) {
+        delete map[key];
+        changed = true;
+      }
+    }
+    if (changed) {
+      await saveAtRiskStreaks(map);
+      await refreshStreakBadge(map);
+    }
+  });
 }
 
 async function refreshStreakBadge(mapOpt) {
@@ -999,6 +1392,23 @@ async function checkTrackedTabLoaded(tabKey, streamer) {
 // The rotation alarm is a one-shot re-armed after every step so a slow
 // step can't pile up ticks. All state lives in storage; service-worker
 // recycles re-arm the alarm and reconcile slots on startup.
+//
+// Every read-modify-write of rescueSession runs as one step of this chain.
+// The config tick, the rotation alarm, tab events and the startup
+// reconcile can all change the session in the same instant, and a writer
+// holding an old copy across an await brings back a slot another writer
+// just freed. Slow work (the stagger between opens, the sweep's messages
+// to every Twitch tab) stays outside the steps, and a step must never wait
+// on another withRescueSession call, or the chain deadlocks. In-memory by
+// design, like _streakStateQueue.
+let _rescueSessionQueue = Promise.resolve();
+
+function withRescueSession(fn) {
+  const run = _rescueSessionQueue.then(fn);
+  // Keep the chain going after a failed step; the caller still sees it.
+  _rescueSessionQueue = run.catch(() => {});
+  return run;
+}
 
 async function loadRescueSession() {
   const result = await chrome.storage.local.get("rescueSession");
@@ -1034,8 +1444,8 @@ async function rescuePendingStreamerFor(url) {
 
 async function maybeStartRescueFromConfig(rescueOffer) {
   if (!rescueOffer || !rescueOffer.id || !Array.isArray(rescueOffer.candidates)) return;
-  let session = await loadRescueSession();
-  if (session && Array.isArray(session.sourceIds) && session.sourceIds.includes(rescueOffer.id)) {
+  const current = await loadRescueSession();
+  if (current && Array.isArray(current.sourceIds) && current.sourceIds.includes(rescueOffer.id)) {
     return; // already absorbed this offer
   }
 
@@ -1067,42 +1477,64 @@ async function maybeStartRescueFromConfig(rescueOffer) {
   // again by the time the pause lifted). Watching the live stream saves
   // the streak, so the live entry wins; exact repeats collapse too.
   const liveNow = new Set(raw.filter(e => e.kind === "live").map(e => e.streamer));
+  // An ended stream whose streak Twitch already confirmed as kept needs no
+  // turn (an older desktop does not filter them). Live entries stay:
+  // watching a live stream is never wasted.
+  const saved = await savedStreakSet();
+  const skipped = [];
   const seen = new Set();
   const entries = [];
   for (const e of raw) {
     if (e.kind === "ended" && liveNow.has(e.streamer)) continue;
+    if (e.kind === "ended" && saved.has(e.streamer)) {
+      if (!skipped.includes(e.streamer)) skipped.push(e.streamer);
+      continue;
+    }
     if (seen.has(e.streamer)) continue;
     seen.add(e.streamer);
     entries.push(e);
   }
-
-  if (!session || !session.active) {
-    session = {
-      active: true,
-      sourceIds: [rescueOffer.id],
-      queue: entries,
-      slots: [],
-      rescued: [],
-      pendingOpens: {},
-      sweepDone: false,
-      startedAt: new Date().toISOString(),
-    };
-  } else {
-    // A second offer arrived mid-session (the user went live again and
-    // ended again). Merge new candidates, dedup against everything the
-    // session already knows about.
-    session.sourceIds.push(rescueOffer.id);
-    const known = new Set([
-      ...session.queue.map(e => e.streamer),
-      ...session.slots.map(s => s.streamer),
-      ...session.rescued,
-    ]);
-    for (const e of entries) {
-      if (!known.has(e.streamer)) session.queue.push(e);
-    }
-    session.sweepDone = false; // new material, sweep again at next drain
+  if (skipped.length > 0) {
+    await log("info", `Rescue offer ${rescueOffer.id}: skipped ${skipped.join(", ")}, streak already saved`);
   }
-  await saveRescueSession(session);
+
+  const session = await withRescueSession(async () => {
+    let s = await loadRescueSession();
+    if (s && s.active) {
+      // Absorbed by a concurrent config tick while the ack was out.
+      if (Array.isArray(s.sourceIds) && s.sourceIds.includes(rescueOffer.id)) return null;
+      // A second offer arrived mid-session (the user went live again and
+      // ended again). Merge new candidates, dedup against everything the
+      // session already knows about.
+      s.sourceIds.push(rescueOffer.id);
+      const known = new Set([
+        ...s.queue.map(e => e.streamer),
+        ...s.slots.map(slot => slot.streamer),
+        ...s.rescued,
+      ]);
+      for (const e of entries) {
+        if (!known.has(e.streamer)) s.queue.push(e);
+      }
+      s.sweepDone = false; // new material, sweep again at next drain
+    } else if (entries.length === 0) {
+      await log("info", `Rescue offer ${rescueOffer.id}: nothing left to rotate`);
+      return null;
+    } else {
+      s = {
+        active: true,
+        sourceIds: [rescueOffer.id],
+        queue: entries,
+        slots: [],
+        rescued: [],
+        pendingOpens: {},
+        sweepDone: false,
+        startedAt: new Date().toISOString(),
+      };
+    }
+    await saveRescueSession(s);
+    return s;
+  });
+  if (!session) return;
   const total = session.queue.length + session.slots.length;
   await log("info",
     `Rescue session: absorbed offer ${rescueOffer.id} (${entries.length} candidate(s)); queue=${session.queue.length}, slots=${session.slots.length}`
@@ -1115,6 +1547,8 @@ async function maybeStartRescueFromConfig(rescueOffer) {
   await ensureRescueAlarm();
 }
 
+// Runs inside a withRescueSession step (openNextRescueSlot), which saves
+// the session it changes.
 async function openRescueTab(session, entry) {
   let url = entry.url;
   try {
@@ -1156,6 +1590,7 @@ async function openRescueTab(session, entry) {
     raidHopCount: existing.raidHopCount || 0,
     openedAt: Date.now(),
     rescue: true,
+    saveStreak: SAVE_STREAK_URL_PATTERN.test(url),
   };
   await saveTrackedTabs(trackedTabs);
   delete session.pendingOpens[url];
@@ -1170,10 +1605,9 @@ async function openRescueTab(session, entry) {
 
 // Only one top-up loop may run at a time. The config alarm and an
 // event-page wake can fire in the same instant (both fetch config and
-// both reach here); two concurrent loops each hold a stale session
-// copy, overwrite each other's saves, and open every candidate at once
-// with duplicate slot numbers instead of RESCUE_BATCH_SIZE on a timer.
-// Concurrent callers coalesce onto the in-flight loop.
+// both reach here); two concurrent loops would open every candidate at
+// once instead of RESCUE_BATCH_SIZE on a timer. Concurrent callers
+// coalesce onto the in-flight loop.
 let rescueTopUpInFlight = null;
 
 async function topUpRescueSlots() {
@@ -1189,21 +1623,43 @@ async function topUpRescueSlots() {
 }
 
 async function topUpRescueSlotsLoop() {
-  let session = await loadRescueSession();
-  if (!session || !session.active) return;
-  while (session.slots.length < RESCUE_BATCH_SIZE && session.queue.length > 0) {
-    const entry = session.queue.shift();
-    await openRescueTab(session, entry);
-    await saveRescueSession(session);
-    if (session.slots.length < RESCUE_BATCH_SIZE && session.queue.length > 0) {
-      // Stagger consecutive opens so the players start cleanly. If the
-      // service worker dies mid-stagger, the next config tick's top-up
-      // resumes where this left off.
+  for (;;) {
+    const step = await openNextRescueSlot();
+    if (!step || !step.more) return;
+    if (step.tried) {
+      // Stagger consecutive opens so the players start cleanly. The wait
+      // is outside the chain, so tab events and the rotation go on
+      // meanwhile. If the service worker dies mid-stagger, the next
+      // config tick's top-up resumes where this left off.
       await new Promise(r => setTimeout(r, RESCUE_OPEN_STAGGER_MS));
-      session = await loadRescueSession();
-      if (!session || !session.active) return;
     }
   }
+}
+
+// One chain step: takes the next queued entry and opens it, or drops it
+// when its streak is already saved. Resolves to null when there is nothing
+// to do (no active session, no free slot, or an empty queue), otherwise to
+// {tried, more}: whether a tab open was attempted, and whether another
+// entry is due.
+function openNextRescueSlot() {
+  return withRescueSession(async () => {
+    const session = await loadRescueSession();
+    if (!session || !session.active) return null;
+    if (session.slots.length >= RESCUE_BATCH_SIZE || session.queue.length === 0) return null;
+    const entry = session.queue.shift();
+    let tried = false;
+    // Saved after it was queued (for example its bell card was opened by
+    // hand): drop the ended entry instead of opening a page with nothing
+    // to watch. Live entries still open.
+    if (entry.kind === "ended" && (await isStreakSaved(entry.streamer))) {
+      await log("info", `Rescue: skipped ${entry.streamer}, streak already saved`);
+    } else {
+      await openRescueTab(session, entry);
+      tried = true;
+    }
+    await saveRescueSession(session);
+    return { tried, more: session.slots.length < RESCUE_BATCH_SIZE && session.queue.length > 0 };
+  });
 }
 
 // Sweep for leftover streak-rescue targets: the sidebar "Save your
@@ -1215,6 +1671,8 @@ async function sweepForSaveStreakTargets(session) {
     ...session.slots.map(s => s.streamer),
     ...session.rescued,
   ]);
+  // Streaks Twitch already confirmed as kept are not targets either.
+  for (const name of await savedStreakSet()) known.add(name);
   const found = new Map();
 
   try {
@@ -1262,72 +1720,111 @@ async function sweepForSaveStreakTargets(session) {
 }
 
 async function rotateRescue() {
-  const session = await loadRescueSession();
-  if (!session || !session.active) {
+  const snapshot = await loadRescueSession();
+  if (!snapshot || !snapshot.active) {
     await chrome.alarms.clear(RESCUE_ROTATE_ALARM);
     return;
   }
 
-  // Queue drained: sweep for stragglers before winding down.
-  if (session.queue.length === 0 && !session.sweepDone) {
-    const found = await sweepForSaveStreakTargets(session);
-    if (found.length > 0) {
-      session.queue.push(...found);
-      await log("info", `Rescue sweep found ${found.length} additional streak target(s)`);
-      notifyUser(
-        "Stream Monitor",
-        `Streak sweep found ${found.length} more stream(s) to rescue; continuing the rotation.`
-      );
-    } else {
-      session.sweepDone = true;
-      await log("info", "Rescue sweep found nothing further; winding down");
-    }
-    await saveRescueSession(session);
-  }
+  // Queue drained: sweep for stragglers before winding down. The sweep
+  // messages every Twitch tab, so it runs on a snapshot outside the chain;
+  // the step below merges its finds into the session as it is by then.
+  const swept = snapshot.queue.length === 0 && !snapshot.sweepDone
+    ? await sweepForSaveStreakTargets(snapshot)
+    : null;
 
-  // The oldest slot's turn is over.
-  if (session.slots.length > 0) {
-    const oldest = session.slots.shift();
-    session.rescued.push(oldest.streamer);
+  const turn = await withRescueSession(async () => {
+    const session = await loadRescueSession();
+    if (!session || !session.active) return null;
+    let found = null;
+    if (swept) {
+      const known = new Set([
+        ...session.queue.map(e => e.streamer),
+        ...session.slots.map(s => s.streamer),
+        ...session.rescued,
+      ]);
+      const fresh = swept.filter(e => !known.has(e.streamer));
+      if (fresh.length > 0) {
+        session.queue.push(...fresh);
+        found = fresh.length;
+      } else if (session.queue.length === 0) {
+        session.sweepDone = true;
+        found = 0;
+      }
+    }
+    // The oldest slot's turn is over.
+    const oldest = session.slots.shift() || null;
+    if (oldest) session.rescued.push(oldest.streamer);
     await saveRescueSession(session);
+    return { found, oldest };
+  });
+  if (!turn) return;
+
+  if (turn.found > 0) {
+    await log("info", `Rescue sweep found ${turn.found} additional streak target(s)`);
+    notifyUser(
+      "Stream Monitor",
+      `Streak sweep found ${turn.found} more stream(s) to rescue; continuing the rotation.`
+    );
+  } else if (turn.found === 0) {
+    await log("info", "Rescue sweep found nothing further; winding down");
+  }
+  if (turn.oldest) {
+    // Already out of the slots, so the onTabRemoved this causes finds
+    // nothing to free.
     try {
-      await chrome.tabs.remove(Number(oldest.tabKey));
-      await log("info", `Rescue: closed ${oldest.streamer} (tab ${oldest.tabKey}) after its rotation turn`);
+      await chrome.tabs.remove(Number(turn.oldest.tabKey));
+      await log("info", `Rescue: closed ${turn.oldest.streamer} (tab ${turn.oldest.tabKey}) after its rotation turn`);
     } catch (e) {
-      await log("warn", `Rescue: failed to close tab ${oldest.tabKey}:`, e?.message || String(e));
+      await log("warn", `Rescue: failed to close tab ${turn.oldest.tabKey}:`, e?.message || String(e));
     }
   }
 
   await topUpRescueSlots();
 
-  const after = await loadRescueSession();
-  if (!after || !after.active) return;
-  if (after.slots.length === 0 && after.queue.length === 0 && after.sweepDone) {
-    await log("info", `Rescue session complete: ${after.rescued.length} stream(s) watched`);
-    notifyUser("Stream Monitor", `Streak rescue complete: watched ${after.rescued.length} stream(s).`);
-    await clearRescueSession();
-  } else {
-    await chrome.alarms.create(RESCUE_ROTATE_ALARM, { delayInMinutes: RESCUE_ROTATE_MINUTES });
+  const watched = await endRescueSessionIfDone(true);
+  if (watched !== null) {
+    await log("info", `Rescue session complete: ${watched} stream(s) watched`);
+    notifyUser("Stream Monitor", `Streak rescue complete: watched ${watched} stream(s).`);
   }
+}
+
+// A chain step: ends the session once nothing is open, queued or left to
+// sweep, and resolves to the number of streams watched; otherwise null,
+// after re-arming the one-shot rotation alarm when rearm is set.
+function endRescueSessionIfDone(rearm = false) {
+  return withRescueSession(async () => {
+    const session = await loadRescueSession();
+    if (!session || !session.active) return null;
+    if (session.slots.length === 0 && session.queue.length === 0 && session.sweepDone) {
+      await clearRescueSession();
+      return session.rescued.length;
+    }
+    if (rearm) await chrome.alarms.create(RESCUE_ROTATE_ALARM, { delayInMinutes: RESCUE_ROTATE_MINUTES });
+    return null;
+  });
 }
 
 // A rescue tab vanished outside the rotation (user closed it, raid close,
 // navigate-away untrack). Free the slot, count the streamer as done, and
 // pull the next target forward.
 async function handleRescueTabGone(tabKey) {
-  const session = await loadRescueSession();
-  if (!session || !session.active) return;
-  const idx = session.slots.findIndex(s => s.tabKey === tabKey);
-  if (idx === -1) return;
-  const [slot] = session.slots.splice(idx, 1);
-  session.rescued.push(slot.streamer);
-  await saveRescueSession(session);
+  const slot = await withRescueSession(async () => {
+    const session = await loadRescueSession();
+    if (!session || !session.active) return null;
+    const idx = session.slots.findIndex(s => s.tabKey === tabKey);
+    if (idx === -1) return null;
+    const [gone] = session.slots.splice(idx, 1);
+    session.rescued.push(gone.streamer);
+    await saveRescueSession(session);
+    return gone;
+  });
+  if (!slot) return;
   await log("info", `Rescue: tab ${tabKey} (${slot.streamer}) closed externally; slot freed`);
   await topUpRescueSlots();
-  const after = await loadRescueSession();
-  if (after && after.active && after.slots.length === 0 && after.queue.length === 0 && after.sweepDone) {
-    notifyUser("Stream Monitor", `Streak rescue complete: watched ${after.rescued.length} stream(s).`);
-    await clearRescueSession();
+  const watched = await endRescueSessionIfDone();
+  if (watched !== null) {
+    notifyUser("Stream Monitor", `Streak rescue complete: watched ${watched} stream(s).`);
   }
 }
 
@@ -1364,14 +1861,45 @@ function isStreamMonitorTab(url) {
 // Config fetching — uses fetch() (XHR is not available in service workers)
 // ---------------------------------------------------------------------------
 
+// The desktop's /config as parsed JSON; throws when it does not answer 2xx.
+async function getDesktopConfig() {
+  const response = await fetch(CONFIG_URL, { signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response.json();
+}
+
+// /config's saved_streaks (v1.11.2), or null from an older desktop.
+function desktopSavedStreaks(data) {
+  const saves = data && data.saved_streaks;
+  return saves && typeof saves === "object" && !Array.isArray(saves) ? saves : null;
+}
+
+// Re-reads only the desktop's saved streaks. Resolves true when the desktop
+// answered with a list and it was merged. Like every successful /config,
+// it also re-sends reports still owed to the desktop (not waited for).
+async function refreshSavedStreaksFromDesktop() {
+  try {
+    const fetchStartedAt = Date.now();
+    const saves = desktopSavedStreaks(await getDesktopConfig());
+    if (!saves) return false;
+    await mergeSavedStreaksFromDesktop(saves, fetchStartedAt);
+    resendPendingSavedStreaks().catch(logStreakStateError);
+    return true;
+  } catch (e) {
+    await log("info", "Saved-streak refresh failed:", e?.message || String(e));
+    return false;
+  }
+}
+
 async function fetchConfig() {
   const hasPerm = await chrome.permissions.contains({ origins: ["http://127.0.0.1/*"] });
   await log("info", "Host permission granted:", hasPerm);
 
   try {
-    const response = await fetch(CONFIG_URL, { signal: AbortSignal.timeout(5000) });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = await response.json();
+    // Taken before the request: a saved-streak report delivered after this
+    // moment may be missing from the answer without having been judged.
+    const fetchStartedAt = Date.now();
+    const data = await getDesktopConfig();
 
     if (data?.streamers && Array.isArray(data.streamers)) {
       const monitored = data.streamers.map(s => s.toLowerCase());
@@ -1390,6 +1918,18 @@ async function fetchConfig() {
         await chrome.storage.local.set({ liveStreamers: data.live_streamers });
       }
 
+      // Streaks the desktop counts as already saved (v1.11.2). Older
+      // desktops send nothing here: our own detections then stand on
+      // their TTL and are not re-sent, since those desktops refuse them.
+      const desktopSaves = desktopSavedStreaks(data);
+      if (desktopSaves) {
+        try {
+          await mergeSavedStreaksFromDesktop(desktopSaves, fetchStartedAt);
+        } catch (e) {
+          await log("warn", "Saved-streak merge failed:", e?.message || String(e));
+        }
+      }
+
       // Streak-rescue offer from the desktop (published when the user's
       // own stream ends). Also use the tick to self-heal an active
       // session whose slots dropped below capacity.
@@ -1402,6 +1942,16 @@ async function fetchConfig() {
         }
       } catch (e) {
         await log("warn", "Rescue config handling failed:", e?.message || String(e));
+      }
+
+      // The desktop is answering: deliver any already_saved report it has
+      // not acknowledged yet, with its original detection time.
+      if (desktopSaves) {
+        try {
+          await resendPendingSavedStreaks();
+        } catch (e) {
+          await log("warn", "Saved-streak re-send failed:", e?.message || String(e));
+        }
       }
 
       await log("info", `Config loaded: ${monitored.length} monitored, ${pinned.length} pinned`);
@@ -1435,12 +1985,19 @@ async function scanExistingTabs() {
   // Add Twitch tabs opened by Stream Monitor (sm=1) that aren't tracked yet.
   // We don't know when the tab was originally opened, so stamp openedAt with
   // the current time. This conservatively gives a fresh grace window rather
-  // than guessing a past timestamp.
+  // than guessing a past timestamp. saveStreak records, while sm=1 is still
+  // in the URL, that the tab was opened as a save-streak page (see
+  // releaseSaveStreakTab).
   const twitchTabs = await chrome.tabs.query({ url: "*://*.twitch.tv/*" });
   for (const tab of twitchTabs) {
     const streamer = getStreamerFromUrl(tab.url);
     if (streamer && monitoredStreamers.has(streamer) && isStreamMonitorTab(tab.url) && !trackedTabs[String(tab.id)]) {
-      trackedTabs[String(tab.id)] = { originalStreamer: streamer, raidHopCount: 0, openedAt: Date.now() };
+      trackedTabs[String(tab.id)] = {
+        originalStreamer: streamer,
+        raidHopCount: 0,
+        openedAt: Date.now(),
+        saveStreak: SAVE_STREAK_URL_PATTERN.test(tab.url),
+      };
       const muted = await muteTabIfEnabled(tab.id, streamer);
       activatePlayerControl(tab.id);
       await log("info", `Scan: tracking tab ${tab.id} for ${streamer}${muted ? " (muted)" : ""}`);
@@ -1475,6 +2032,7 @@ async function onTabCreated(tab) {
       originalStreamer: streamer,
       raidHopCount: 0,
       openedAt: Date.now(),
+      saveStreak: SAVE_STREAK_URL_PATTERN.test(tab.url),
       ...(viaRescue ? { rescue: true } : {}),
     };
     await saveTrackedTabs(trackedTabs);
@@ -1528,7 +2086,20 @@ async function onTabUpdated(tabId, changeInfo, tab) {
 
   if (tracked) {
     // This tab is being tracked
-    if (newStreamer && newStreamer !== tracked.originalStreamer) {
+    if (newStreamer && newStreamer !== tracked.originalStreamer &&
+        SAVE_STREAK_URL_PATTERN.test(changeInfo.url)) {
+      // Another streamer's save-streak page: the owner followed a "Save
+      // your streak" link (bell card, sidebar entry) in this tab. A raid
+      // lands on /<channel>, never here, so leave the tab open and stop
+      // tracking it, the same as navigating away.
+      await log("info", `Tab ${tabId} moved to ${newStreamer}'s save-streak page (not a raid), untracking`);
+      delete trackedTabs[tabKey];
+      await saveTrackedTabs(trackedTabs);
+      await cancelPendingSwapsForTab(tabKey);
+      await cancelPendingExpirationForTab(tabKey);
+      await clearLoadRecoveryForTab(tabKey);
+      await handleRescueTabGone(tabKey);
+    } else if (newStreamer && newStreamer !== tracked.originalStreamer) {
       // URL changed to a different streamer — raid detected
       if (extensionPaused) {
         await log("info", `Raid detected: ${tracked.originalStreamer} -> ${newStreamer} (paused, not closing tab ${tabId})`);
@@ -1542,6 +2113,8 @@ async function onTabUpdated(tabId, changeInfo, tab) {
         tracked.originalStreamer = newStreamer;
         tracked.raidHopCount = 1;
         tracked.openedAt = Date.now();
+        // Not opened as the new streamer's save-streak page.
+        delete tracked.saveStreak;
         await saveTrackedTabs(trackedTabs);
         await log("info", `Raid follow-through: ${tracked.originalStreamer} -> ${newStreamer}, staying on tab ${tabId}`);
         return;
@@ -1578,6 +2151,7 @@ async function onTabUpdated(tabId, changeInfo, tab) {
       originalStreamer: newStreamer,
       raidHopCount: 0,
       openedAt: now,
+      saveStreak: SAVE_STREAK_URL_PATTERN.test(changeInfo.url),
       ...(viaRescue ? { rescue: true } : {}),
     };
     await saveTrackedTabs(trackedTabs);
@@ -1833,16 +2407,22 @@ chrome.runtime.onInstalled.addListener((details) => {
 
   // Reconcile an in-flight rescue session: drop slots whose tabs are
   // gone (counting them as done), make sure the rotation alarm exists,
-  // and refill open slots from the queue.
-  const rescueSession = await loadRescueSession();
-  if (rescueSession && rescueSession.active) {
-    const gone = rescueSession.slots.filter(s => !liveTabIds.has(s.tabKey));
+  // and refill open slots from the queue. The tab list is read inside the
+  // step, so a slot another step opened just before is not taken for gone.
+  const rescueActive = await withRescueSession(async () => {
+    const rescueSession = await loadRescueSession();
+    if (!rescueSession || !rescueSession.active) return false;
+    const openTabIds = new Set((await chrome.tabs.query({})).map(t => String(t.id)));
+    const gone = rescueSession.slots.filter(s => !openTabIds.has(s.tabKey));
     if (gone.length > 0) {
-      rescueSession.slots = rescueSession.slots.filter(s => liveTabIds.has(s.tabKey));
+      rescueSession.slots = rescueSession.slots.filter(s => openTabIds.has(s.tabKey));
       rescueSession.rescued.push(...gone.map(s => s.streamer));
       await saveRescueSession(rescueSession);
       await log("info", `Rescue: reconciled ${gone.length} missing slot tab(s) on startup`);
     }
+    return true;
+  });
+  if (rescueActive) {
     await ensureRescueAlarm();
     await topUpRescueSlots();
   }

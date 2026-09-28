@@ -19,8 +19,9 @@ import webbrowser
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import Optional, Callable
+from dataclasses import dataclass, asdict, field
+from urllib.parse import quote as url_quote
+from typing import Optional, Callable, NamedTuple
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import certifi
@@ -48,7 +49,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 GITHUB_REPO = "caedicious/stream-monitor"
 
 # Anonymous install counter (v1.9.0): a random install id, the version, and
@@ -92,9 +93,166 @@ LOG_FILE = CONFIG_DIR / "stream_monitor.log"
 STREAM_ACTIVITY_FILE = CONFIG_DIR / "stream_activity.jsonl"
 
 
+# ---------------------------------------------------------------------------
+# Secret redaction
+#
+# The Twitch app credentials used to travel in the token request's URL, and
+# requests puts the full URL in HTTPError and ConnectionError text, so a
+# failed token request could write the client secret into the debug log,
+# which the desktop serves at /debug.log and /debug.log.json and users share
+# in issues. The request now sends them in the form body. These patterns are
+# the safety net for any secret that still reaches a log line, and they also
+# clean lines written before the fix.
+# ---------------------------------------------------------------------------
+REDACTED = "REDACTED"
+_SECRET_KEYS = "client_secret|access_token|refresh_token"
+# No pattern crosses a line break: the filter sees one record at a time, and
+# the served log and the startup scrub work line by line, so all of them
+# agree and a rewrite can never merge or drop lines.
+_SECRET_PATTERNS = [
+    # client_secret=abc, access_token: abc, refresh_token='abc' and the
+    # URL-encoded client_secret%3Dabc, in URLs, form bodies, reprs and text.
+    (re.compile(r"(?i)\b(" + _SECRET_KEYS + r")([ \t]*(?:=|%3D|:)[ \t]*)(\\?[\"']?)[^&\s\"'<>\\,;)}\]]+"),
+     r"\1\2\3" + REDACTED),
+    # "client_secret": "abc" in JSON (also escaped inside a JSON string),
+    # 'client_secret': 'abc' in Python reprs.
+    (re.compile(r"(?i)(\\?[\"'](?:" + _SECRET_KEYS + r")\\?[\"'][ \t]*:[ \t]*\\?[\"'])[^\"'\\\r\n]*"),
+     r"\1" + REDACTED),
+    # Authorization: Bearer <token> and OAuth <token>, only when a token-shaped
+    # value follows (Twitch app tokens are 30 characters), so "Bearer of the
+    # Curse" in a stream title stays as it is.
+    (re.compile(r"(?i)\b(Bearer|OAuth)[ \t]+(?=[A-Za-z0-9._~+/=-]{20,})[A-Za-z0-9._~+/=-]+"),
+     r"\1 " + REDACTED),
+]
+# Live secret values (the client secret, the current app token), removed
+# wherever they appear, including where no key names them: a bare log
+# argument, a repr, a traceback. Values under 16 characters are not kept,
+# since they could match ordinary text.
+_SECRET_VALUES_MAX = 8
+_secret_values: list = []
+_secret_values_lock = threading.Lock()
+
+
+def register_secret(value) -> None:
+    """Remember a live secret value for redact_secrets (see above)."""
+    if not isinstance(value, str) or len(value) < 16:
+        return
+    with _secret_values_lock:
+        if value in _secret_values:
+            return
+        _secret_values.append(value)
+        del _secret_values[:-_SECRET_VALUES_MAX]
+
+
+def redact_secrets(text: str) -> str:
+    """Replace the live secret values, and any client secret, access or
+    refresh token, or bearer token found by the patterns above, with
+    REDACTED. Idempotent."""
+    with _secret_values_lock:
+        values = list(_secret_values)
+    for value in values:
+        for form in (value, url_quote(value, safe="")):
+            text = text.replace(form, REDACTED)
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _redact_bytes(data: bytes) -> bytes:
+    """redact_secrets for file contents, line by line (see above).
+    surrogateescape keeps any bytes that are not valid UTF-8 exactly as they
+    were."""
+    text = data.decode("utf-8", "surrogateescape")
+    return "".join(redact_secrets(line) for line in text.splitlines(keepends=True)).encode(
+        "utf-8", "surrogateescape")
+
+
+def _redact_value(value, key=None):
+    """redact_secrets applied to a structure before it is serialized: a
+    value under a secret-named key becomes REDACTED, strings are redacted,
+    dicts and lists are walked."""
+    if key is not None and re.fullmatch(r"(?i)" + _SECRET_KEYS, str(key)):
+        return REDACTED
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, dict):
+        return {k: _redact_value(v, k) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(v) for v in value]
+    return value
+
+
+def _token_failure_summary(error: Exception) -> str:
+    """"HTTPError (HTTP 400)" or "ConnectionError": the exception type and,
+    when Twitch answered, the HTTP status. Never the exception text, which
+    for requests includes the request URL."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    return f"{type(error).__name__} (HTTP {status})" if status else type(error).__name__
+
+
+class SecretRedactingFilter(logging.Filter):
+    """Handler filter: rewrites a record's message, traceback text and stack
+    text with redact_secrets before any handler formats it."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = redact_secrets(message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = None
+        if record.exc_info and not record.exc_text:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        if record.exc_text:
+            record.exc_text = redact_secrets(record.exc_text)
+        if record.stack_info:
+            record.stack_info = redact_secrets(record.stack_info)
+        return True
+
+
+def scrub_secrets_from_logs(log_file: Optional[Path] = None) -> list:
+    """Redact secrets in the debug log and its rotations (stream_monitor.log,
+    stream_monitor.log.1 and so on) once, at startup. It runs before the file
+    handler opens the log, because Windows cannot replace a file that is
+    open. A file is rewritten only when it holds a match, through a temporary
+    file that is flushed to disk before os.replace, so an interruption or a
+    power loss never loses it. Never raises (it runs at import, and the app
+    must start regardless): a file it cannot rewrite is still redacted when
+    served. Returns the paths it rewrote."""
+    base = LOG_FILE if log_file is None else log_file
+    name_re = re.compile(re.escape(base.name) + r"(\.\d+)?")
+    rewritten = []
+    try:
+        candidates = sorted(p for p in base.parent.iterdir() if name_re.fullmatch(p.name))
+    except Exception:
+        return rewritten
+    for path in candidates:
+        tmp = path.with_name("." + path.name + ".scrub-tmp")
+        try:
+            data = path.read_bytes()
+            cleaned = _redact_bytes(data)
+            if cleaned == data:
+                continue
+            with open(tmp, "wb") as f:
+                f.write(cleaned)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            rewritten.append(path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return rewritten
+
+
 def setup_logging():
     """Set up file logging with rotation."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    scrubbed = scrub_secrets_from_logs(LOG_FILE)
 
     logger = logging.getLogger("StreamMonitor")
     logger.setLevel(logging.DEBUG)
@@ -108,7 +266,11 @@ def setup_logging():
         "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
     handler.setFormatter(formatter)
+    handler.addFilter(SecretRedactingFilter())
     logger.addHandler(handler)
+    if scrubbed:
+        logger.info("Redacted secrets in %d earlier log file(s): %s",
+                    len(scrubbed), ", ".join(p.name for p in scrubbed))
 
     return logger
 
@@ -135,7 +297,10 @@ def log_activity(event: str, **fields):
     Wrapped in a try/except: a failure here must never crash the monitor.
     """
     try:
-        record = {"ts": _activity_timestamp(), "event": event, **fields}
+        # Error text is stored verbatim (api_error), so apply the same safety
+        # net as the debug log (/activity.json serves this file). Values are
+        # redacted before serializing, so a line always stays valid JSON.
+        record = {"ts": _activity_timestamp(), "event": event, **_redact_value(fields)}
         line = json.dumps(record, separators=(",", ":")) + "\n"
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with _activity_lock:
@@ -306,15 +471,386 @@ def set_rescue_ack_handler(fn: Callable[[str], bool]) -> None:
 # Per-streak dedup keyed by (status, streamer, count) so a refresh of the
 # notifications page doesn't re-notify the same broken streak twice. Reset
 # on app restart, which is fine: the activity log persists across restarts
-# so the user still has a record.
+# so the user still has a record. A recorded "already saved" also forgets
+# the card keys it covers (see _handle_already_saved).
 _streak_event_seen: set = set()
 _streak_event_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Saved-streak memory (v1.11.2).
+#
+# Twitch keeps a "your N-stream streak on X broke" card in the bell inbox
+# after the streak has already been kept, and the card's own "Save your
+# streak" link then lands on "No Content Eligible: You've already maintained
+# your N-stream streak with X". The extension reports that page as an
+# "already_saved" streak event, stamped with the moment the page was seen.
+# While the save counts, later "broke" and "in danger" cards for X are
+# logged but not notified, and no save-streak tab is queued, flushed or
+# offered for rescue for X.
+#
+# A save stops counting at the first of:
+#   - X goes live (Helix started_at) after it: a new broadcast is a new
+#     chance to break the streak;
+#   - the broadcast already running when it was seen ends, if Stream
+#     Monitor did not have it open (skipped for a pause, or over before a
+#     fresh start looked): Twitch's answer could only speak for the
+#     broadcasts before that one, and the owner missed this one. A
+#     broadcast it had open keeps the save until the next go-live;
+#   - a card for X with a higher count arrives: the streak grew since the
+#     save, so the card is about a newer break;
+#   - 24 hours pass when the monitor does not poll X (no go-live of X can
+#     ever be seen), or 7 days pass in any case (bounds a broadcast the
+#     desktop missed while it was off).
+# Persisted in streak_state.json next to config.json so a restart does not
+# forget.
+# ---------------------------------------------------------------------------
+STREAK_STATE_MAX_AGE_SECONDS = 30 * 24 * 3600
+SAVED_STREAK_UNPOLLED_TTL_SECONDS = 24 * 3600
+SAVED_STREAK_MAX_AGE_SECONDS = 7 * 24 * 3600
+# A stored save dated further ahead than this is distrusted: the clock was
+# stepped back since it was recorded, so its real time is unknown.
+STREAK_CLOCK_SKEW_SECONDS = 10 * 60
+_streak_state_lock = threading.Lock()
+
+
+def _empty_streak_state() -> dict:
+    # "saved": {streamer: {"at": ISO 8601, "count": int}}. "last_live" and
+    # "last_offline": {streamer: ISO 8601}, the latest broadcast start and
+    # the latest broadcast end the monitor observed. "missed_end": the
+    # latest end of a broadcast Stream Monitor did not have open; only that
+    # end also ends a save seen during the broadcast.
+    return {"saved": {}, "last_live": {}, "last_offline": {}, "missed_end": {}}
+
+
+_streak_state: dict = _empty_streak_state()
+# Logins the monitor polls on Helix (set when it starts). A save for any
+# other login can never be ended by a go-live, so it only lasts 24 hours.
+_polled_streamers: frozenset = frozenset()
+
+
+def _streak_clock() -> float:
+    """Wall-clock seconds for the saved-streak rules (tests pin it)."""
+    return time.time()
+
+
+def _epoch_to_iso(epoch: float) -> str:
+    """ISO 8601 UTC with milliseconds, the shape _activity_timestamp uses."""
+    dt = datetime.fromtimestamp(epoch, timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _streak_state_path() -> Path:
+    return CONFIG_DIR / "streak_state.json"
+
+
+def _iso_to_epoch(value) -> Optional[float]:
+    """Epoch seconds for an ISO 8601 timestamp (Z or offset), else None.
+    One without an offset is read as UTC: local-time conversion raises
+    OSError on Windows for early dates, and a hand-edited state file must
+    not stop the app from starting."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def load_streak_state(now_epoch: Optional[float] = None) -> None:
+    """Read streak_state.json into memory, dropping malformed entries,
+    entries older than STREAK_STATE_MAX_AGE_SECONDS, and saves dated more
+    than STREAK_CLOCK_SKEW_SECONDS ahead of now. A broadcast time ahead of
+    now is pulled back to now, so it cannot hide every later save. A missing
+    or unreadable file means an empty state."""
+    global _streak_state
+    now = _streak_clock() if now_epoch is None else now_epoch
+    try:
+        raw = json.loads(_streak_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    cutoff = now - STREAK_STATE_MAX_AGE_SECONDS
+    state = _empty_streak_state()
+    raw_saved = raw.get("saved") if isinstance(raw.get("saved"), dict) else {}
+    for name, entry in raw_saved.items():
+        if not (isinstance(name, str) and _OPEN_TABS_LOGIN_RE.match(name) and isinstance(entry, dict)):
+            continue
+        at = _iso_to_epoch(entry.get("at"))
+        if at is None or at < cutoff or at > now + STREAK_CLOCK_SKEW_SECONDS:
+            continue
+        count = entry.get("count")
+        state["saved"][name] = {"at": entry["at"], "count": count if isinstance(count, int) else 0}
+    for key in ("last_live", "last_offline", "missed_end"):
+        raw_times = raw.get(key) if isinstance(raw.get(key), dict) else {}
+        for name, at_iso in raw_times.items():
+            if not (isinstance(name, str) and _OPEN_TABS_LOGIN_RE.match(name)):
+                continue
+            at = _iso_to_epoch(at_iso)
+            if at is None or at < cutoff:
+                continue
+            state[key][name] = at_iso if at <= now else _epoch_to_iso(now)
+    with _streak_state_lock:
+        _streak_state = state
+        _publish_saved_streaks_locked(now)
+
+
+def _write_streak_state_locked() -> None:
+    """Persist the in-memory state. The caller holds _streak_state_lock.
+    Never raises: losing this file only costs a stale notification."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        path = _streak_state_path()
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(_streak_state, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        log.warning("Could not write %s: %s", _streak_state_path(), e)
+
+
+def _broadcast_boundary_locked(name: str) -> Optional[float]:
+    """Epoch of the latest broadcast start, or end of a missed broadcast, on
+    record for the streamer: a save seen at or before it no longer counts.
+    The caller holds _streak_state_lock."""
+    times = [
+        t for t in (_iso_to_epoch(_streak_state["last_live"].get(name)),
+                    _iso_to_epoch(_streak_state["missed_end"].get(name)))
+        if t is not None
+    ]
+    return max(times) if times else None
+
+
+def _save_counts_locked(name: str, entry: dict, now: float) -> bool:
+    """Whether a save still counts at `now`, under the rules in the block
+    comment above. The caller holds _streak_state_lock."""
+    saved_at = _iso_to_epoch(entry.get("at"))
+    if saved_at is None or saved_at > now + STREAK_CLOCK_SKEW_SECONDS:
+        return False
+    age = now - saved_at
+    if age > SAVED_STREAK_MAX_AGE_SECONDS:
+        return False
+    if age > SAVED_STREAK_UNPOLLED_TTL_SECONDS and name not in _polled_streamers:
+        return False
+    boundary = _broadcast_boundary_locked(name)
+    return boundary is None or boundary < saved_at
+
+
+def _saved_streaks_locked(now: float) -> dict:
+    return {
+        name: entry["at"]
+        for name, entry in _streak_state["saved"].items()
+        if _save_counts_locked(name, entry, now)
+    }
+
+
+def _publish_saved_streaks_locked(now: Optional[float] = None) -> None:
+    """Put the saves that count in /config. Every publish happens under
+    _streak_state_lock, so publishes from the HTTP threads and the monitor
+    thread land in the order the state changed and an older snapshot can
+    never overwrite a newer one."""
+    ConfigRequestHandler.config_data["saved_streaks"] = _saved_streaks_locked(
+        _streak_clock() if now is None else now
+    )
+
+
+def publish_saved_streaks() -> None:
+    """Refresh /config's saved_streaks; saves also run out with time."""
+    with _streak_state_lock:
+        _publish_saved_streaks_locked()
+
+
+def saved_streaks_for_config(now_epoch: Optional[float] = None) -> dict:
+    """{streamer: saved_at} for every save that counts right now, as /config
+    publishes it to the extension."""
+    with _streak_state_lock:
+        return _saved_streaks_locked(_streak_clock() if now_epoch is None else now_epoch)
+
+
+def set_polled_streamers(names) -> None:
+    """Record the logins the monitor polls on Helix (see _polled_streamers)."""
+    global _polled_streamers
+    polled = frozenset(n.lower() for n in names if isinstance(n, str))
+    with _streak_state_lock:
+        _polled_streamers = polled
+        _publish_saved_streaks_locked()
+
+
+def record_stream_live(streamer: str, at: Optional[str] = None, *,
+                       fallback_to_now: bool = True,
+                       now_epoch: Optional[float] = None) -> bool:
+    """Remember when a streamer's broadcast started: Helix started_at, or
+    now when that is missing or implausible (in the future, or older than
+    this state is ever kept). With fallback_to_now=False such a start
+    records nothing: a poll of a stream that stayed live cannot tell when
+    a new broadcast would have begun. A save seen before the start stops
+    counting. A relaunch, a tray Start or a one-poll gap re-records the
+    same start, so a save seen during the broadcast survives them; an end
+    recorded at or after the start was that gap, not a real end, and is
+    dropped. Returns True when the start on record changed."""
+    name = streamer.lower()
+    if not _OPEN_TABS_LOGIN_RE.match(name):
+        return False
+    now = _streak_clock() if now_epoch is None else now_epoch
+    live_epoch = _iso_to_epoch(at)
+    if live_epoch is None or not now - STREAK_STATE_MAX_AGE_SECONDS <= live_epoch <= now:
+        if not fallback_to_now:
+            return False
+        at = _epoch_to_iso(now)
+        live_epoch = _iso_to_epoch(at)
+    with _streak_state_lock:
+        new_start = _streak_state["last_live"].get(name) != at
+        changed = new_start
+        _streak_state["last_live"][name] = at
+        for key in ("last_offline", "missed_end"):
+            end = _iso_to_epoch(_streak_state[key].get(name))
+            if end is not None and end >= live_epoch:
+                del _streak_state[key][name]
+                changed = True
+        # The new broadcast makes an older "already saved" moot; drop it so
+        # the file stays small.
+        entry = _streak_state["saved"].get(name)
+        if entry and (_iso_to_epoch(entry.get("at")) or 0) <= live_epoch:
+            del _streak_state["saved"][name]
+            changed = True
+        if changed:
+            _write_streak_state_locked()
+            _publish_saved_streaks_locked(now)
+    return new_start
+
+
+def record_stream_offline(streamer: str, *, missed: bool = True,
+                          only_if_open: bool = False,
+                          now_epoch: Optional[float] = None) -> bool:
+    """Remember, as of now, that the streamer's broadcast has ended. With
+    missed (Stream Monitor skipped it for a pause, or a fresh start finds it
+    over) the end also ends a save seen during that broadcast. Without it
+    Stream Monitor had the broadcast open, so such a save lasts until the
+    next go-live; the end is still noted, so a later fresh start does not
+    take it for an end it never saw. With only_if_open (a fresh start,
+    which cannot have seen an end that happened before it) this acts only
+    when a go-live is on record with no end after it, so it is cheap to
+    call on every poll. Returns True if an end was recorded."""
+    name = streamer.lower()
+    if not _OPEN_TABS_LOGIN_RE.match(name):
+        return False
+    now = _streak_clock() if now_epoch is None else now_epoch
+    with _streak_state_lock:
+        live_iso = _streak_state["last_live"].get(name)
+        live = _iso_to_epoch(live_iso)
+        ends = [
+            t for t in (_iso_to_epoch(_streak_state["last_offline"].get(name)),
+                        _iso_to_epoch(_streak_state["missed_end"].get(name)))
+            if t is not None
+        ]
+        if only_if_open and (live is None or (ends and max(ends) >= live)):
+            return False
+        # Never before the start, even with a clock stepped back.
+        at = live_iso if live is not None and now <= live + 1 else _epoch_to_iso(now)
+        _streak_state["last_offline"][name] = at
+        if missed:
+            _streak_state["missed_end"][name] = at
+        _write_streak_state_locked()
+        _publish_saved_streaks_locked(now)
+    return True
+
+
+class SaveReport(NamedTuple):
+    """What record_streak_saved did with a report (see its docstring)."""
+    outcome: str
+    at: Optional[str] = None
+    boundary: Optional[str] = None
+
+
+def record_streak_saved(streamer: str, count: int, at: Optional[str] = None, *,
+                        now_epoch: Optional[float] = None) -> SaveReport:
+    """Remember that Twitch reported the streak as already kept. `at` is the
+    moment the page was seen; a missing, unreadable or future value becomes
+    now. The outcome is one of:
+      "recorded"            stored as the streamer's save
+      "older"               a later save is already stored and stays
+      "superseded_by_live"  a broadcast start or end (`boundary`) is at or
+                            after `at`, so the report no longer holds
+      "expired"             already too old to count
+      "bad_login"           not a Twitch login; nothing stored
+    """
+    name = streamer.strip().lower() if isinstance(streamer, str) else ""
+    if not _OPEN_TABS_LOGIN_RE.match(name):
+        return SaveReport("bad_login")
+    now = _streak_clock() if now_epoch is None else now_epoch
+    at_epoch = _iso_to_epoch(at)
+    if at_epoch is None or at_epoch > now:
+        at = _epoch_to_iso(now)
+        at_epoch = _iso_to_epoch(at)
+    report = {"at": at, "count": int(count)}
+    with _streak_state_lock:
+        boundary = _broadcast_boundary_locked(name)
+        if boundary is not None and at_epoch <= boundary:
+            return SaveReport("superseded_by_live", at, _epoch_to_iso(boundary))
+        if not _save_counts_locked(name, report, now):
+            return SaveReport("expired", at)
+        stored = _streak_state["saved"].get(name)
+        # Keep the later of the two, but only while the stored one still
+        # counts: one dated ahead of a stepped-back clock must not block
+        # every new report.
+        if (stored and _save_counts_locked(name, stored, now)
+                and _iso_to_epoch(stored.get("at")) > at_epoch):
+            outcome = "older"
+        else:
+            _streak_state["saved"][name] = report
+            _write_streak_state_locked()
+            outcome = "recorded"
+        _publish_saved_streaks_locked(now)
+    return SaveReport(outcome, at)
+
+
+def _end_saved_streak(name: str, at: str, reason: str, **fields) -> bool:
+    """End the save recorded at `at`. A newer save stored meanwhile stays.
+    Returns True if the save was removed."""
+    with _streak_state_lock:
+        entry = _streak_state["saved"].get(name)
+        if not entry or entry.get("at") != at:
+            return False
+        del _streak_state["saved"][name]
+        _write_streak_state_locked()
+        _publish_saved_streaks_locked()
+    log_activity("streak_save_ended", streamer=name, reason=reason, saved_at=at, **fields)
+    log.info("Save for %s seen at %s ended: %s", name, at, reason)
+    return True
+
+
+def _counted_save(name: str, now_epoch: Optional[float] = None) -> Optional[dict]:
+    """A copy of the streamer's save if it counts right now, else None."""
+    now = _streak_clock() if now_epoch is None else now_epoch
+    with _streak_state_lock:
+        entry = _streak_state["saved"].get(name)
+        if entry and _save_counts_locked(name, entry, now):
+            return dict(entry)
+    return None
+
+
+def streak_saved_since_last_live(streamer: str, now_epoch: Optional[float] = None) -> Optional[str]:
+    """The saved-at timestamp if the streamer's streak counts as saved right
+    now (the rules in the block comment above), else None."""
+    entry = _counted_save(streamer.lower(), now_epoch)
+    return entry["at"] if entry else None
 
 
 def set_tray_notifier(fn: Callable[[str, str], None]) -> None:
     """Register the callable used to raise tray notifications."""
     global _tray_notifier
     _tray_notifier = fn
+
+
+def _notify_tray(title: str, msg: str) -> None:
+    if _tray_notifier:
+        try:
+            _tray_notifier(title, msg)
+        except Exception as e:
+            log.warning("Tray notifier raised on streak event: %s", e)
 
 
 def _format_streak_message(event: dict) -> tuple:
@@ -330,15 +866,79 @@ def _format_streak_message(event: dict) -> tuple:
     return title, msg
 
 
+def _handle_already_saved(name: str, count: int, payload: dict) -> None:
+    """Evaluate every report, with no session dedup on recording: a save
+    ended by a broadcast must be recordable again from the same page text.
+    Only the toast and the streak_already_saved activity entry are deduped,
+    per streamer and count for the session."""
+    page_url = payload.get("page_url")
+    key = ("already_saved", name, count)
+    announced = False
+    # Recorded under the lock a card is judged under (handle_streak_event),
+    # so no card can add its key between the save and the forgetting below.
+    with _streak_event_lock:
+        result = record_streak_saved(name, count, payload.get("detected_at"))
+        if result.outcome == "recorded":
+            # The stale card that led here was usually announced before the
+            # save. A real break once the save ends reads exactly the same,
+            # so forget the cards this save covers (its count or lower).
+            _streak_event_seen.difference_update([
+                seen for seen in _streak_event_seen
+                if seen[0] in ("broke", "in_danger") and seen[1] == name and seen[2] <= count
+            ])
+            announced = key in _streak_event_seen
+            _streak_event_seen.add(key)
+    if result.outcome in ("superseded_by_live", "expired"):
+        extra = {"superseded_at": result.boundary} if result.boundary else {}
+        log_activity(
+            "streak_event_ignored",
+            streamer=name,
+            status="already_saved",
+            count=count,
+            reason=result.outcome,
+            detected_at=result.at,
+            page_url=page_url,
+            **extra,
+        )
+        log.info(
+            "Ignoring already_saved for %s seen at %s: %s", name, result.at,
+            f"the broadcast start or end at {result.boundary} came after it"
+            if result.boundary else "too old to count",
+        )
+        return
+    if result.outcome != "recorded":
+        log.info("already_saved for %s seen at %s: a later save is on record", name, result.at)
+        return
+    if announced:
+        log.info("Save for %s recorded again at %s (already announced this session)", name, result.at)
+        return
+    log_activity(
+        "streak_already_saved",
+        streamer=name,
+        count=count,
+        saved_at=result.at,
+        page_url=page_url,
+    )
+    title = f"{name}: {count}-stream streak is already safe"
+    msg = "Twitch says it was kept. Nothing to rescue for now."
+    log.info("Streak event: %s - %s", title, msg)
+    _notify_tray(title, msg)
+
+
 def handle_streak_event(payload: dict) -> None:
-    """Validate, dedup, log, and notify on an incoming streak event."""
+    """Validate, dedup, log, and notify on an incoming streak event. Raises
+    ValueError for a malformed payload (POST /streak_event answers 400).
+
+    "broke" and "in_danger" come from Twitch's notification cards.
+    "already_saved" comes from a save-streak page that says the streak was
+    already kept; see the saved-streak memory above for what it changes."""
     if not isinstance(payload, dict):
         raise ValueError("payload not a dict")
     status = payload.get("status")
-    if status not in ("broke", "in_danger"):
+    if status not in ("broke", "in_danger", "already_saved"):
         raise ValueError(f"unknown status: {status!r}")
     streamer = payload.get("streamer")
-    if not isinstance(streamer, str) or not streamer:
+    if not isinstance(streamer, str) or not streamer.strip():
         raise ValueError("missing streamer")
     count = payload.get("count")
     if not isinstance(count, int) or count < 0 or count > 100000:
@@ -349,17 +949,60 @@ def handle_streak_event(payload: dict) -> None:
     ):
         raise ValueError(f"bad deadline_hours: {deadline_hours!r}")
 
-    key = (status, streamer.lower(), int(count))
+    name = streamer.strip().lower()
+    count = int(count)
+    if status == "already_saved":
+        # The save is stored under this name and published to the
+        # extension, so it must be a real login. Card names are left alone:
+        # they can be display names parsed from the card text.
+        if not _OPEN_TABS_LOGIN_RE.match(name):
+            raise ValueError(f"bad streamer login: {streamer[:64]!r}")
+        _handle_already_saved(name, count, payload)
+        return
+
+    key = (status, name, count)
+    # Judged under the lock a save is recorded under (_handle_already_saved),
+    # so a card cannot add its key just after a save forgot the keys it
+    # covers.
     with _streak_event_lock:
-        if key in _streak_event_seen:
-            log.debug("Streak event %s already seen this session, skipping", key)
-            return
-        _streak_event_seen.add(key)
+        saved = _counted_save(name)
+        covered = saved is not None and count <= saved["count"]
+        announced = not covered and key in _streak_event_seen
+        if not covered:
+            _streak_event_seen.add(key)
+    if covered:
+        # A stale card for a streak Twitch has since confirmed as kept.
+        # Not deduped: once the save ends, this identical card is judged
+        # afresh.
+        log_activity(
+            "streak_event_ignored",
+            streamer=name,
+            status=status,
+            count=count,
+            reason="already_saved",
+            saved_at=saved["at"],
+            detected_at=payload.get("detected_at"),
+        )
+        log.info(
+            "Ignoring %s card for %s: streak already saved at %s and no broadcast since",
+            status, name, saved["at"],
+        )
+        return
+    if saved:
+        # The streak grew after the save, so this card is about a newer
+        # break: end the save and handle the card like any other.
+        _end_saved_streak(
+            name, saved["at"], "count_grew",
+            saved_count=saved["count"], card_status=status, card_count=count,
+        )
+    if announced:
+        log.debug("Streak event %s already seen this session, skipping", key)
+        return
 
     event_name = "streak_broke" if status == "broke" else "streak_in_danger"
     log_activity(
         event_name,
-        streamer=streamer.lower(),
+        streamer=name,
         count=int(count),
         deadline_hours=int(deadline_hours) if deadline_hours is not None else None,
         detected_at=payload.get("detected_at"),
@@ -367,11 +1010,7 @@ def handle_streak_event(payload: dict) -> None:
     )
     title, msg = _format_streak_message(payload)
     log.info("Streak event: %s - %s", title, msg)
-    if _tray_notifier:
-        try:
-            _tray_notifier(title, msg)
-        except Exception as e:
-            log.warning("Tray notifier raised on streak event: %s", e)
+    _notify_tray(title, msg)
 
 
 # Cap on entries served by /activity.json. The activity file is append-only
@@ -438,7 +1077,8 @@ def parse_debug_log() -> list:
 
     Multi-line entries (e.g. tracebacks) are folded into the prior entry's
     msg field. Returns reverse-chronological (newest first) for symmetry with
-    read_activity_log().
+    read_activity_log(). Secrets are redacted line by line, so a line written
+    before the log filter existed is never served as it was.
     """
     if not LOG_FILE.exists():
         return []
@@ -447,7 +1087,7 @@ def parse_debug_log() -> list:
     try:
         with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                line = line.rstrip("\n")
+                line = redact_secrets(line.rstrip("\n"))
                 m = _DEBUG_LOG_LINE_RE.match(line)
                 if m:
                     if current:
@@ -464,18 +1104,123 @@ def parse_debug_log() -> list:
     return entries
 
 
+# Refusal logging budget. Any web page the user visits can send requests
+# that the server refuses (a foreign Host, a web Origin, a non-JSON body), as
+# fast as it likes and with attacker-chosen values. One line per refusal
+# would let it flood the debug log and rotate its history away, and a budget
+# for the whole process would let one burst hide every later refusal. So
+# each distinct refusal is logged once per window, at most
+# REFUSAL_LOG_LIMIT of them; the rest are counted, and the count is logged
+# when the next window starts.
+REFUSAL_LOG_WINDOW_SECONDS = 3600
+REFUSAL_LOG_LIMIT = 50
+_refusal_clock = time.monotonic
+_refusal_log_lock = threading.Lock()
+
+
+def _new_refusal_window(start: float) -> dict:
+    return {"start": start, "keys": set(), "suppressed": 0, "cap_noted": False}
+
+
+_refusal_log = _new_refusal_window(float("-inf"))
+
+
+def _log_refusal(key: str, message: str, *args) -> None:
+    """log.warning(message, *args) the first time `key` is refused in the
+    current window, within the budget above. Keys and arguments must
+    already be bounded in length by the caller."""
+    global _refusal_log
+    now = _refusal_clock()
+    with _refusal_log_lock:
+        state = _refusal_log
+        carried = 0
+        if now - state["start"] >= REFUSAL_LOG_WINDOW_SECONDS:
+            carried = state["suppressed"]
+            state = _refusal_log = _new_refusal_window(now)
+        if key in state["keys"]:
+            state["suppressed"] += 1
+            emit = None
+        elif len(state["keys"]) >= REFUSAL_LOG_LIMIT:
+            state["suppressed"] += 1
+            emit = None if state["cap_noted"] else "cap"
+            state["cap_noted"] = True
+        else:
+            state["keys"].add(key)
+            emit = "line"
+    if carried:
+        log.warning("Refused %d more request(s) in the previous hour without logging each one", carried)
+    if emit == "line":
+        log.warning(message, *args)
+    elif emit == "cap":
+        log.warning("Refused requests of %d different kinds this hour; counting the rest instead of logging them",
+                    REFUSAL_LOG_LIMIT)
+
+
 class ConfigRequestHandler(BaseHTTPRequestHandler):
     """Simple HTTP handler to serve config and about page."""
 
     config_data = {}
 
+    def parse_request(self) -> bool:
+        """Parse as usual, then refuse any request whose Host is not this
+        server's own address, before any method runs (GET, POST, OPTIONS,
+        and unsupported methods alike).
+
+        DNS rebinding: a page at http://x.attacker.example:52832 whose name
+        first resolves to the attacker's server and then to 127.0.0.1 is
+        same origin with its own requests, so the browser delivers them here
+        and lets the page read every answer without any CORS header, and its
+        JSON POSTs need no preflight and can carry "Origin: null". The
+        browser always sends the page's own hostname as Host, and a page
+        cannot change or remove that header, so the Host check stops it.
+
+        Accepted: 127.0.0.1, localhost and [::1] with the bound port,
+        compared case-insensitively. Every legitimate caller uses
+        http://127.0.0.1:52832 (both extensions, their popups, the tray's
+        /about and /logs links, the updater's curl), and logs.html fetches
+        relative paths, so it inherits the Host it was opened with. A
+        request with no Host header at all (any HTTP version) is allowed:
+        no browser sends a request without one, so it cannot come from a
+        rebinding page, and any other program on this PC could just as well
+        send an allowed Host, so refusing it would stop nothing.
+        """
+        if not super().parse_request():
+            return False
+        hosts = self.headers.get_all("Host") or []
+        if not hosts:
+            return True
+        port = self.server.server_address[1]
+        allowed = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+        if len(hosts) == 1 and hosts[0].strip().lower() in allowed:
+            return True
+        # Bounded before logging or storing: every value here is the sender's.
+        host = ", ".join(h.strip() for h in hosts)[:100]
+        _log_refusal(f"host {host}", "Refused %s %s for host %r: not this app's address (DNS rebinding?)",
+                     self.command[:16], self.path[:64], host)
+        self._discard_body()
+        self.close_connection = True
+        self.send_response(403)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        return False
+
     def do_GET(self):
+        # No GET answer carries Access-Control-Allow-Origin. Without it a web
+        # page on another site can still send the request but cannot read the
+        # answer, which holds the watch list, the activity history and the
+        # debug log. The readers that matter need no CORS header: both
+        # extensions read /config from their background scripts with the
+        # http://127.0.0.1/* host permission, and logs.html reads the JSON
+        # endpoints from the page the desktop itself serves (same origin).
+        # A page that makes itself same origin through DNS rebinding never
+        # gets here: parse_request refuses its Host first.
         if self.path == "/config":
             note_extension_contact()
+            # Saves also run out with time, not only on a poll or an event.
+            publish_saved_streaks()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "moz-extension://*")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(self.config_data).encode())
         elif self.path.startswith("/about"):
@@ -503,10 +1248,10 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b"logs.html not found")
         elif self.path == "/activity.json":
-            # Parsed activity events as JSON, reverse-chronological
+            # Parsed activity events as JSON, reverse-chronological, for
+            # logs.html only (same origin, so no CORS header).
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(read_activity_log()).encode("utf-8"))
         elif self.path == "/activity.jsonl":
@@ -528,12 +1273,14 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
             )
             self.end_headers()
             if LOG_FILE.exists():
-                self.wfile.write(LOG_FILE.read_bytes())
+                # Redacted like /debug.log.json, for lines written before
+                # the log filter existed.
+                self.wfile.write(_redact_bytes(LOG_FILE.read_bytes()))
         elif self.path == "/debug.log.json":
-            # Parsed debug log entries as JSON, reverse-chronological
+            # Parsed debug log entries as JSON, reverse-chronological, for
+            # logs.html only (same origin, so no CORS header).
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(json.dumps(parse_debug_log()).encode("utf-8"))
         else:
@@ -550,7 +1297,40 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
         /open_tabs: the monitored streamers with a Stream Monitor tab open
         in that browser (see record_extension_open_tabs).
         /rescue_ack: the extension claims the published rescue offer.
+
+        Every route answers 403 to a web page. Browsers put the page's
+        http(s) origin on a cross-site POST, and a text/plain body needs no
+        preflight, so without this any site could write streak, tab or
+        rescue state. A page can also send "null" instead (a sandboxed
+        frame, a no-referrer request, an https page posting to http), so
+        every route also needs Content-Type application/json, which both
+        extensions send: a page can only send that after a CORS preflight,
+        and do_OPTIONS refuses a page's preflight. The extension's own
+        requests carry no Origin, an extension origin, or "null", and need
+        no preflight (host permission). A DNS-rebound page, which is same
+        origin and can send "null" with a JSON body, is refused earlier by
+        the Host check in parse_request.
         """
+        origin = self.headers.get("Origin") or ""
+        if origin.strip().lower().startswith(("http://", "https://")):
+            _log_refusal(f"origin POST {self.path[:64]} {origin[:100]}",
+                         "Refused POST %s from a web page (Origin %s)", self.path[:64], origin[:100])
+            self._discard_body()
+            self.send_response(403)
+            self.end_headers()
+            return
+        if not self._has_json_content_type():
+            content_type = (self.headers.get("Content-Type") or "")[:100]
+            _log_refusal(
+                f"content-type POST {self.path[:64]} {content_type}",
+                "Refused POST %s: Content-Type %r is not application/json",
+                self.path[:64], content_type,
+            )
+            self._discard_body()
+            self.send_response(415)
+            self.end_headers()
+            return
+
         if self.path == "/streak_event":
             length = int(self.headers.get("Content-Length", "0") or 0)
             if length <= 0 or length > 8192:
@@ -568,6 +1348,12 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 handle_streak_event(payload)
+            except ValueError as e:
+                log.warning("Rejected streak event: %s", e)
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(f"bad streak event: {e}".encode("utf-8"))
+                return
             except Exception as e:
                 log.warning("Streak event handler raised: %s", e)
                 self.send_response(500)
@@ -627,8 +1413,36 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def _discard_body(self, limit: int = 16384) -> None:
+        """Read a small unused request body before answering, so closing the
+        connection does not reset it before the client reads the reply."""
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            return
+        if 0 < length <= limit:
+            self.rfile.read(length)
+
+    def _has_json_content_type(self) -> bool:
+        """Whether the request declares a JSON body. Only the media type
+        counts, so "text/plain; x=application/json" is not JSON."""
+        media_type = (self.headers.get("Content-Type") or "").split(";", 1)[0]
+        return media_type.strip().lower() == "application/json"
+
     def do_OPTIONS(self):
-        """Handle CORS preflight."""
+        """Handle CORS preflight. A web page's preflight (an http(s) origin,
+        or "null" from an opaque one such as a sandboxed frame) is refused,
+        so a page never gets to send the JSON body every POST route needs.
+        The extension's requests skip the preflight (host permission); one
+        from an extension origin is still answered as before."""
+        origin = (self.headers.get("Origin") or "").strip().lower()
+        if origin == "null" or origin.startswith(("http://", "https://")):
+            _log_refusal(f"preflight {self.path[:64]} {origin[:100]}",
+                         "Refused a preflight for %s from a web page (Origin %s)",
+                         self.path[:64], origin[:100])
+            self.send_response(403)
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -653,7 +1467,8 @@ class _SingletonHTTPServer(ThreadingHTTPServer):
     request (a large /activity.json read, a wedged client) from blocking
     every other endpoint behind it. The handlers are safe for this: the
     activity log writes go through _activity_lock, streak events through
-    _streak_event_lock, and config_data reads are GIL-atomic dict lookups.
+    _streak_event_lock, saved streaks and their /config publish through
+    _streak_state_lock, and config_data reads are GIL-atomic dict lookups.
     """
     allow_reuse_address = False
     daemon_threads = True
@@ -673,6 +1488,7 @@ def create_config_server(config: "Config") -> Optional[HTTPServer]:
         "paused": config.paused,
         "auto_paused": False,
         "rescue": None,
+        "saved_streaks": saved_streaks_for_config(),
     }
     try:
         return _SingletonHTTPServer(("127.0.0.1", CONFIG_SERVER_PORT), ConfigRequestHandler)
@@ -695,7 +1511,8 @@ def run_config_server(server: HTTPServer):
 @dataclass
 class Config:
     client_id: str = ""
-    client_secret: str = ""
+    # repr=False: printing a Config (a log line, a traceback) never shows it.
+    client_secret: str = field(default="", repr=False)
     streamers: list = None
     # Subset of `streamers` marked as "Keep Open" by the user. Tabs for these
     # streamers are protected from being closed when max_tabs is hit; they
@@ -904,9 +1721,12 @@ class TwitchMonitor:
     def _get_oauth_token(self) -> bool:
         try:
             log.info("Requesting OAuth token")
+            register_secret(self.config.client_secret)
+            # Credentials go in the form body, never the URL: requests puts
+            # the request URL in HTTPError and ConnectionError text.
             response = self._http.post(
                 self.TOKEN_URL,
-                params={
+                data={
                     "client_id": self.config.client_id,
                     "client_secret": self.config.client_secret,
                     "grant_type": "client_credentials"
@@ -915,14 +1735,17 @@ class TwitchMonitor:
             )
             response.raise_for_status()
             self.oauth_token = response.json().get("access_token")
+            register_secret(self.oauth_token)
             if self.oauth_token:
                 log.info("OAuth token obtained successfully")
             else:
                 log.error("OAuth response OK but no access_token in body")
             return bool(self.oauth_token)
         except requests.RequestException as e:
-            log.error("OAuth token request failed: %s", e)
-            self.status_callback(f"Auth error: {e}")
+            # Type and HTTP status only, never the exception text.
+            failure = _token_failure_summary(e)
+            log.error("OAuth token request failed: %s", failure)
+            self.status_callback(f"Auth error: {failure}")
             return False
     
     def _get_headers(self) -> dict:
@@ -978,6 +1801,12 @@ class TwitchMonitor:
                     "game": stream.get("game_name", ""),
                     "viewers": stream.get("viewer_count", 0),
                 }
+                # The broadcast's own start (UTC). Recorded as the go-live
+                # instead of the poll time, so a relaunch or a one-poll gap
+                # mid-broadcast does not look like a new broadcast.
+                started_at = stream.get("started_at")
+                if isinstance(started_at, str) and started_at:
+                    new_meta[login]["started_at"] = started_at
             self.live_stream_meta = new_meta
 
             if live_set:
@@ -1044,13 +1873,17 @@ class TwitchMonitor:
         """
         if not self.queued_vods:
             return 0
+        self._drop_saved_queued_vods()
         items = list(self.queued_vods.items())
+        self.queued_vods.clear()
+        ConfigRequestHandler.config_data["queued_vods"] = {}
+        if not items:
+            return 0
         for streamer, entry in items:
             self._enqueue_tab_open(
                 "vod", streamer, entry["url"],
                 from_queue=True, queue_reason=reason,
             )
-        self.queued_vods.clear()
         count = len(items)
         log.info("Flushed %d queued VOD(s) into the paced open queue (reason=%s)", count, reason)
         self.notify_callback(
@@ -1060,6 +1893,26 @@ class TwitchMonitor:
             f"Opening queued VOD for {items[0][0]}"
         )
         return count
+
+    def _drop_saved_queued_vods(self) -> None:
+        """Take save-streak links out of the VOD queue for streaks Twitch has
+        since confirmed as kept (the page would only say "No Content
+        Eligible"), log each as vod_skipped, and republish the queue. Runs
+        before every flush and rescue offer, so no path leaves such a link
+        waiting in the queue or the tray menu."""
+        dropped = False
+        for streamer in list(self.queued_vods):
+            saved_at = streak_saved_since_last_live(streamer)
+            if not saved_at:
+                continue
+            self.queued_vods.pop(streamer, None)
+            dropped = True
+            log.info("Dropping queued save-streak link for %s: streak already saved at %s",
+                     streamer, saved_at)
+            log_activity("vod_skipped", streamer=streamer, reason="streak_already_saved",
+                         saved_at=saved_at)
+        if dropped:
+            ConfigRequestHandler.config_data["queued_vods"] = dict(self.queued_vods)
 
     def _list_rank(self, name: str) -> int:
         """Position of a streamer in the settings list (0 = top). The list
@@ -1088,16 +1941,16 @@ class TwitchMonitor:
         # queued) and live again by the time the pause lifted. Watching
         # the live stream saves the streak, so the live candidate wins
         # and the save-streak candidate is dropped.
-        ended = [
-            {
+        ended = []
+        for streamer, entry in self.queued_vods.items():
+            if streamer in live_name_set:
+                continue
+            ended.append({
                 "streamer": streamer,
                 "url": entry["url"],
                 "kind": "ended",
                 "ended_at": entry.get("ended_at"),
-            }
-            for streamer, entry in self.queued_vods.items()
-            if streamer not in live_name_set
-        ]
+            })
         ended.sort(key=lambda c: (self._list_rank(c["streamer"]), c.get("ended_at") or ""))
         live = [
             {
@@ -1115,6 +1968,9 @@ class TwitchMonitor:
         Ownership of queued_vods / missed_while_paused entries stays with
         the desktop until the extension acks; _maybe_fallback_rescue opens
         everything the old way if no ack arrives in time."""
+        # A kept streak's link would land on "No Content Eligible" and waste
+        # a rotation slot; it leaves the queue instead of lingering there.
+        self._drop_saved_queued_vods()
         candidates = self._build_rescue_candidates(live_set)
         if not candidates:
             return
@@ -1273,6 +2129,7 @@ class TwitchMonitor:
         # Surface the queue so the extension popup and any future UI can
         # show which VODs are waiting for the pause to lift.
         ConfigRequestHandler.config_data["queued_vods"] = dict(self.queued_vods)
+        publish_saved_streaks()
 
         # List order is the priority when several streamers go live on the
         # same poll: opens are enqueued top-of-list first.
@@ -1290,6 +2147,10 @@ class TwitchMonitor:
                     # Activity log: structured record of the live transition
                     meta = self.live_stream_meta.get(username, {})
                     log_activity("stream_live", streamer=username, **meta)
+                    # A new broadcast: an "already saved" verdict from before
+                    # it no longer covers this streamer's streak. The Helix
+                    # start keeps a relaunch mid-broadcast from counting as one.
+                    record_stream_live(username, meta.get("started_at"))
 
                     # Desktop notification for all live events
                     self.notify_callback(
@@ -1329,9 +2190,21 @@ class TwitchMonitor:
                         self.status_callback(f"{username} went LIVE!")
                         self.open_stream(username)
                         state.browser_opened = True
-                elif is_live and state.was_live:
-                    log.debug("Already tracking %s as live (was_live=%s, browser_opened=%s)",
-                              username, state.was_live, state.browser_opened)
+                else:
+                    if state.was_live:
+                        log.debug("Already tracking %s as live (was_live=%s, browser_opened=%s)",
+                                  username, state.was_live, state.browser_opened)
+                    # A broadcast can also start without the transition
+                    # above: an end and a restart between two polls, or a
+                    # go-live with browser_opened left set (a late rescue
+                    # ack). A changed Helix start is a new broadcast (the
+                    # same start writes nothing); back from offline, it is
+                    # a go-live even without one.
+                    started_at = self.live_stream_meta.get(username, {}).get("started_at")
+                    if record_stream_live(username, started_at,
+                                          fallback_to_now=not state.was_live):
+                        log.info("New broadcast start on record for %s: %s",
+                                 username, started_at or "now")
                 state.was_live = True
             else:
                 if state.was_live:
@@ -1352,6 +2225,13 @@ class TwitchMonitor:
                     # and applies the same auto-mute / low-quality /
                     # player-keepalive treatment as a normal stream tab.
                     was_skipped_due_to_pause = username in self.missed_while_paused
+                    # An "already maintained" seen while a broadcast skipped
+                    # for a pause ran could only speak for the broadcasts
+                    # before it, and the owner missed this one, so that save
+                    # stops counting now and the save-streak logic below runs
+                    # as usual. A broadcast Stream Monitor had open keeps the
+                    # save until the next go-live, the owner's rule.
+                    record_stream_offline(username, missed=was_skipped_due_to_pause)
                     if was_skipped_due_to_pause:
                         # Always leave the missed-while-paused list on the
                         # offline transition, even when VOD fallback is off.
@@ -1389,6 +2269,13 @@ class TwitchMonitor:
 
                     state.was_live = False
                     state.browser_opened = False
+                else:
+                    # A fresh start (relaunch, tray Start) cannot see an end
+                    # that happened while it was not running; if a go-live
+                    # is on record with no end after it, the broadcast is
+                    # over now. Nobody knows if it was watched, so it counts
+                    # as missed: a lost alert costs more than a stale one.
+                    record_stream_offline(username, only_if_open=True)
 
         if self.auto_paused:
             if live_count > 0:
@@ -1510,6 +2397,7 @@ class TwitchMonitor:
             for name in self.config.streamers
         }
         log.info("Monitoring %d streamer(s): %s", len(self.streamers), list(self.streamers.keys()))
+        set_polled_streamers(self.streamers)
         if not preserve_state:
             self._seed_startup_open_tabs()
 
@@ -1636,12 +2524,16 @@ def create_icon_image(color="green"):
 class StreamMonitorApp:
     def __init__(self):
         self.config = Config.load()
+        register_secret(self.config.client_secret)
         self._ensure_install_id()
         self.monitor: Optional[TwitchMonitor] = None
         self.icon: Optional[pystray.Icon] = None
         self.status = "Starting..."
-        
+
     def update_status(self, status: str):
+        # The tooltip is on screen, and the owner streams: same safety net
+        # as the log.
+        status = redact_secrets(status)
         self.status = status
         if self.icon:
             # Windows tray tooltip is limited to 128 characters
@@ -1652,6 +2544,7 @@ class StreamMonitorApp:
 
     def send_notification(self, title: str, message: str):
         """Send a system tray notification."""
+        title, message = redact_secrets(title), redact_secrets(message)
         log.info("Notification: [%s] %s", title, message)
         if self.icon:
             try:
@@ -2140,9 +3033,11 @@ class StreamMonitorApp:
             test_label.config(text="Testing...", foreground="gray")
             dialog.update()
             try:
+                # Form body, not the URL: exception text shown below would
+                # otherwise carry the secret onto the screen.
                 resp = requests.post(
                     "https://id.twitch.tv/oauth2/token",
-                    params={"client_id": cid, "client_secret": csec, "grant_type": "client_credentials"},
+                    data={"client_id": cid, "client_secret": csec, "grant_type": "client_credentials"},
                     timeout=10
                 )
                 if resp.status_code == 200:
@@ -2150,7 +3045,8 @@ class StreamMonitorApp:
                 else:
                     test_label.config(text="Authentication failed. Check credentials.", foreground="red")
             except Exception as e:
-                test_label.config(text=f"Connection error: {e}", foreground="red")
+                # Type and status only: this label is on screen.
+                test_label.config(text=f"Connection error: {_token_failure_summary(e)}", foreground="red")
 
         ttk.Button(main_frame, text="Test Connection", command=test_connection).pack(pady=(10, 0))
         test_label.pack(pady=(5, 10))
@@ -2218,6 +3114,13 @@ class StreamMonitorApp:
             interval=self.config.check_interval,
         )
 
+        # Streaks Twitch already confirmed as kept, and broadcast times, from
+        # the previous run: /config publishes them from its first answer.
+        # The monitor starts a moment later; until then the configured list
+        # stands in for the polled set, so listed streamers' saves are not
+        # cut to the 24-hour limit for logins nobody polls.
+        set_polled_streamers(self.config.streamers)
+        load_streak_state()
         # Single-instance enforcement: try to bind the config server port
         # synchronously. If another Stream Monitor instance is already
         # running (e.g. the installer's CloseApplications missed a
