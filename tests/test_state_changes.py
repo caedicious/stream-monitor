@@ -344,7 +344,7 @@ def test_rescue_ack_drops_vod_for_live_candidate(monitor):
 
 
 def test_rescue_fallback_waits_while_extension_polls(monitor, monkeypatch):
-    """Past the 180s soft deadline with the extension still polling /config,
+    """Past the 180s soft deadline with the extension still reporting,
     the desktop holds the offer (logging rescue_ack_overdue once) instead of
     flooding. The hard deadline flushes even if polls continue: this is the
     v1.7.2 incident where a live extension failed every ack."""
@@ -376,7 +376,7 @@ def test_rescue_fallback_waits_while_extension_polls(monitor, monkeypatch):
 
 
 def test_rescue_fallback_immediate_when_no_polls(monitor, monkeypatch):
-    """With nothing polling /config (browser closed), the 180s fallback
+    """With nothing reporting (browser closed), the 180s fallback
     fires exactly as pre-1.7.3."""
     import stream_monitor_tray as sm
 

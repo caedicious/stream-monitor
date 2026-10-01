@@ -62,6 +62,28 @@ def test_write_config_keeps_fields_the_wizard_does_not_ask_about(tmp_path, monke
     }
 
 
+def test_c01_write_config_keeps_the_slot_mode_keys(tmp_path, monkeypatch):
+    # 1.12.0: the wizard merges into the saved file, so running it again
+    # keeps the Slot mode settings it does not ask about.
+    cfg = _redirect(tmp_path, monkeypatch)
+    slot = {
+        "slot_mode": True,
+        "keep_open_slots": 1,
+        "cycle_slots": 2,
+        "slot_minutes": 45,
+        "auto_save_streaks": True,
+    }
+    cfg.write_text(json.dumps({
+        "client_id": "old", "client_secret": "old", "streamers": ["alice"],
+        "check_interval": 30, **slot,
+    }), encoding="utf-8")
+    sw.write_config(["alice", "bob"], "new", "newsec")
+    saved = json.loads(cfg.read_text(encoding="utf-8"))
+    assert {key: saved[key] for key in slot} == slot
+    assert saved["streamers"] == ["alice", "bob"]
+    assert saved["client_id"] == "new"
+
+
 def test_installer_settings_shortcut_targets_the_settings_editor():
     iss = (ROOT / "installer.iss").read_text(encoding="utf-8")
     line = next(l for l in iss.splitlines() if 'Settings"; Filename:' in l)

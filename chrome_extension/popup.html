@@ -20,9 +20,19 @@
       margin: 0 0 10px 0;
     }
     .section-title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
       color: #3498db;
       font-size: 12px;
       margin: 10px 0 4px 0;
+    }
+    /* The short rules on both sides of a title, drawn in its own color. */
+    .section-title::before,
+    .section-title::after {
+      content: "";
+      width: 12px;
+      border-top: 1px solid currentColor;
     }
     .state-block {
       background: #16213e;
@@ -51,6 +61,12 @@
       margin-right: 6px;
     }
     button:hover { background: #8e44ad; }
+    button:disabled,
+    button:disabled:hover {
+      background: #444;
+      color: #888;
+      cursor: default;
+    }
     .controls { margin-bottom: 10px; }
     .setting {
       display: flex;
@@ -210,6 +226,44 @@
       color: #666;
       font-size: 10px;
     }
+    .at-risk-requested {
+      font-size: 10px;
+      color: #2ecc71;
+      flex-shrink: 0;
+    }
+    .at-risk-message {
+      padding: 2px 8px 6px 8px;
+      font-size: 10px;
+      color: #f39c12;
+    }
+    .slots-block,
+    .stream-window-block {
+      background: #16213e;
+      padding: 8px;
+      border-radius: 4px;
+      margin-bottom: 8px;
+      line-height: 1.5;
+    }
+    .slots-status {
+      margin-top: 4px;
+      color: #9b59b6;
+    }
+    .slots-note {
+      font-size: 10px;
+      color: #f39c12;
+      margin-top: 2px;
+    }
+    .stream-window-buttons {
+      margin-top: 6px;
+    }
+    .stream-window-buttons button {
+      margin-bottom: 4px;
+    }
+    .stream-window-line {
+      font-size: 10px;
+      color: #f39c12;
+      margin-top: 2px;
+    }
     .sound-warning {
       background: #3a1418;
       border: 1px solid #dc3545;
@@ -302,7 +356,7 @@
   <div id="sound-warning" class="sound-warning" style="display:none">
     <div class="sound-warning-title">Twitch audio is blocked</div>
     Chrome's site-level Sound permission for <code>twitch.tv</code> is set to <b>Block</b>. The
-    extension's tab-mute strategy cannot work — Twitch's player runs in a degraded state and
+    extension's tab-mute strategy cannot work: Twitch's player runs in a degraded state and
     viewer counting may not register.
     <div style="margin-top:6px">
       <b>Fix:</b> open <a href="#" id="sound-warning-link">Chrome's site settings for twitch.tv</a>,
@@ -311,17 +365,42 @@
   </div>
 
   <div id="at-risk-section" style="display:none">
-    <div class="section-title" style="color:#dc3545">— Streaks at Risk —</div>
+    <div class="section-title" style="color:#dc3545">Streaks at Risk</div>
     <div id="at-risk-list" class="at-risk-list"></div>
+    <div id="at-risk-message" class="at-risk-message" style="display:none"></div>
     <div id="at-risk-clear-acked" class="at-risk-clear-acked" style="display:none">
       <a href="#" id="at-risk-clear-acked-link">Clear acknowledged</a>
     </div>
   </div>
 
-  <div class="section-title">— Streamers —</div>
+  <div id="slots-section" style="display:none">
+    <div class="section-title">Slots</div>
+    <div class="slots-block">
+      <div id="slots-keep"></div>
+      <div id="slots-rotating"></div>
+      <div id="slots-next"></div>
+      <div id="slots-watched"></div>
+      <div id="slots-status" class="slots-status"></div>
+      <div id="slots-paused-note" class="slots-note" style="display:none">Pause extension is on: this browser makes no slot changes until you turn it off.</div>
+    </div>
+  </div>
+
+  <div class="section-title">Streamers</div>
   <div id="streamer-list" class="streamer-list">(loading...)</div>
 
-  <div class="section-title">— Settings —</div>
+  <div class="section-title">Stream window</div>
+  <div class="stream-window-block">
+    <div id="stream-window-status">Checking...</div>
+    <div class="stream-window-buttons">
+      <button id="stream-window-use">Use this window for streams</button>
+      <button id="stream-window-stop" style="display:none">Stop using a stream window</button>
+    </div>
+    <div id="stream-window-private" class="stream-window-line" style="display:none">Private windows can't hold stream tabs.</div>
+    <div id="stream-window-message" class="stream-window-line" style="display:none"></div>
+  </div>
+  <div class="setting-note">Works best on a screen you are not working on: a covered or minimized window plays its streams as hidden tabs.</div>
+
+  <div class="section-title">Settings</div>
   <div class="setting">
     <label for="extension-paused">Pause extension</label>
     <div class="toggle">
@@ -329,7 +408,7 @@
       <label class="slider" for="extension-paused"></label>
     </div>
   </div>
-  <div class="setting-note">Stops raid-closing while enabled</div>
+  <div class="setting-note">Stops raid-closing; in Slot mode also stops slot changes.</div>
   <div class="setting">
     <label for="auto-mute">Auto-mute opened tabs</label>
     <div class="toggle">
@@ -345,7 +424,7 @@
       <label class="slider" for="auto-focus"></label>
     </div>
   </div>
-  <div class="setting-note">Pull the new tab to the front when a stream opens</div>
+  <div class="setting-note">Pull the new tab to the front when a stream opens (inside the stream window when one is set).</div>
   <div class="setting">
     <label for="low-quality">Low quality mode</label>
     <div class="toggle">
@@ -370,11 +449,19 @@
     </div>
   </div>
   <div class="setting-note" id="auto-claim-bonus-note">Clicks the channel points chest when it appears, on any Twitch tab</div>
+  <div class="setting">
+    <label for="bell-check-on-open">Check notifications when a stream opens</label>
+    <div class="toggle">
+      <input type="checkbox" id="bell-check-on-open">
+      <label class="slider" for="bell-check-on-open"></label>
+    </div>
+  </div>
+  <div class="setting-note">Looks for broken-streak cards in Twitch's notifications when a stream tab opens</div>
   <div class="setting-input">
     <label for="max-tabs">Max open streams</label>
     <input type="number" id="max-tabs" min="0" max="20" value="0">
   </div>
-  <div class="setting-note">0 = unlimited</div>
+  <div class="setting-note">0 = unlimited. Not used while Slot mode runs in this browser.</div>
   <div class="setting">
     <label for="notifications-enabled">Desktop notifications</label>
     <div class="toggle">
@@ -384,9 +471,9 @@
   </div>
   <div class="setting-note">Toast when tabs are auto-closed (grants the notifications permission)</div>
 
-  <div class="section-title">— State —</div>
+  <div class="section-title">State</div>
   <div id="state" class="state-block">Loading...</div>
-  <div class="section-title">— Recent Log —</div>
+  <div class="section-title">Recent Log</div>
   <div id="log">Loading...</div>
 
   <div class="credit">

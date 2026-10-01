@@ -136,7 +136,7 @@ def test_a_foreign_host_is_refused_on_every_get_route(port, acks, path, host):
     assert status == 403
     assert body == b""
     assert not any(name.startswith("access-control-") for name in headers)
-    _no_state_changed(acks)  # /config would have noted extension contact
+    _no_state_changed(acks)  # a refused GET changes no state
 
 
 @pytest.mark.parametrize("path", sorted(REQUESTS))
@@ -166,7 +166,7 @@ def test_this_apps_own_addresses_work_on_every_route(port, acks, host):
         status, _, _ = _send(port, "GET", path, host)
         assert status == 200, path
     for path in sorted(REQUESTS):
-        assert _post(port, path, host, origin="null") == 204, path
+        assert _post(port, path, host, origin="null") == (200 if path == "/streak_event" else 204), path
     assert sm.streak_saved_since_last_live("alice") == DETECTED_AT
     assert sm.extension_open_tabs_snapshot()["chrome"]["streamers"] == frozenset({"alice"})
     assert acks == ["rescue-1"]
