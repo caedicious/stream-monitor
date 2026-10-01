@@ -8,7 +8,7 @@ This policy covers both the desktop application and the companion browser
 extensions for Chrome (and Chromium-based browsers such as Brave, Edge, and
 Opera) and Firefox.
 
-_Last updated: 24 September 2026._
+_Last updated: 30 September 2026._
 
 ## What data is handled
 
@@ -19,9 +19,13 @@ your browser's built-in extension storage (`chrome.storage.local` /
 - The list of Twitch streamers you have configured in the desktop app.
 - The IDs of browser tabs that were opened by the desktop app, along with the
   streamer each tab was opened for.
+- The position and size of the browser window you chose for streams.
+- A random identifier for this browser profile, created on your device and
+  sent only to the Stream Monitor desktop app on this computer (`127.0.0.1`),
+  so the app can tell your browsers apart.
 - Your extension preferences (auto-mute tabs, low-quality playback,
   raid-follow-through, maximum tab count).
-- A small rotating log (up to 200 entries) of the extension's own activity,
+- A small rotating log (up to 2000 entries) of the extension's own activity,
   used for troubleshooting. You can clear this at any time from the
   extension's debug page.
 

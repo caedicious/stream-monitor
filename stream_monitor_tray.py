@@ -31,6 +31,12 @@ import pystray
 from pystray import MenuItem as Item
 from PIL import Image, ImageDraw
 
+# Slot mode and automatic streak saves (1.12.0). Pure modules: this file
+# does their I/O, threads and logging. Static imports, so PyInstaller
+# bundles them.
+import slot_scheduler
+import streak_saves
+
 # Fix for PyInstaller --onefile: the _MEI temp extraction folder can be cleaned
 # up by Windows or a new exe instance while this process is still running. This
 # breaks certifi's CA bundle path. Copy it to a stable location at startup.
@@ -49,7 +55,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.11.2"
+VERSION = "1.12.0"
 GITHUB_REPO = "caedicious/stream-monitor"
 
 # Anonymous install counter (v1.9.0): a random install id, the version, and
@@ -77,6 +83,45 @@ TAB_OPEN_SPACING_SECONDS = 10
 # before deciding the browser is gone and opening the skipped streams.
 STARTUP_OPEN_TABS_MAX_AGE_SECONDS = 10 * 60
 STARTUP_FRESH_REPORT_TIMEOUT_SECONDS = 90
+
+# Slot mode (1.12.0). The scheduler re-evaluates at least this often between
+# polls, so turns end on time and the published plan stays fresh (the
+# extension treats a plan older than 300 s as inactive).
+SLOT_TICK_MAX_GAP_SECONDS = 30
+# How long an HTTP handler waits for the monitor thread to replan after a
+# streak event or a tab report that changes the plan (a gone entry, a busy
+# change), before answering anyway.
+SLOT_REPLAN_WAIT_SECONDS = 2.0
+# slot_state.json is rewritten at least this often while the monitor ticks
+# (and when a running monitor stops), not only on a change, so its saved_at
+# measures how long the desktop was down: a quick restart then keeps the
+# slots and the executor (DESIGN 6.1, rule 38).
+SLOT_STATE_REFRESH_SECONDS = 300
+# Failed polls for longer than max(3 x check_interval, this) end the run of
+# unbroken watching the card verdict relies on (_watch_start).
+WATCH_GAP_MIN_SECONDS = 180
+# Helix accepts at most 100 user_login parameters per request.
+HELIX_MAX_LOGINS = 100
+# Streak cards seen this run are remembered this long after their last
+# sighting (the per-run dedup).
+STREAK_DEDUP_TTL_SECONDS = 48 * 3600
+# A claimant that acked a rescue offer gets 204 again for this long when it
+# re-sends the ack (its first answer may have been lost).
+RESCUE_REACK_WINDOW_SECONDS = 600
+LAST_ACKED_OFFER_TTL_SECONDS = 24 * 3600
+# On Windows a reader that holds a file open (antivirus, the search indexer,
+# a backup tool) makes os.replace onto it fail with PermissionError
+# (WinError 5) until it lets go. Atomic writes retry that for this long in
+# all, sleeping 50 ms at first and doubling up to 250 ms between tries.
+# The startup log scrub (scrub_secrets_from_logs) is the one os.replace left
+# outside the retry: it runs at import, where a retry would hold up startup
+# by up to REPLACE_RETRY_SECONDS for each of the 4 log files, and a log that
+# another running instance holds open stays refused for as long as it runs.
+# The scrub skips a file it cannot replace, which is still redacted when
+# served.
+REPLACE_RETRY_SECONDS = 2.0
+REPLACE_RETRY_FIRST_DELAY = 0.05
+REPLACE_RETRY_MAX_DELAY = 0.25
 
 # Configuration paths
 APP_NAME = "StreamMonitor"
@@ -212,6 +257,44 @@ class SecretRedactingFilter(logging.Filter):
         return True
 
 
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """os.replace(src, dst) for an atomic write, retried on PermissionError
+    until REPLACE_RETRY_SECONDS have passed on the wall clock or in its own
+    sleeps, whichever comes first. When it gives up, or on any other
+    OSError, it tries once to remove src and raises that error, so the
+    caller keeps its own give-up path. That removal is best effort: a src
+    that a scanner holds open refuses it too, and stays until the next
+    write of that name overwrites it. Holds no lock of its own: a caller
+    that holds one keeps it through the retries, and callers that share a
+    src name must hold one, or a give-up removes another writer's src."""
+    deadline = time.monotonic() + REPLACE_RETRY_SECONDS
+    slept = 0.0
+    delay = REPLACE_RETRY_FIRST_DELAY
+    while True:
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            left = min(deadline - time.monotonic(), REPLACE_RETRY_SECONDS - slept)
+            if left <= 0:
+                _discard_temp_file(src)
+                raise
+            pause = min(delay, left)
+            time.sleep(pause)
+            slept += pause
+            delay = min(delay * 2, REPLACE_RETRY_MAX_DELAY)
+        except OSError:
+            _discard_temp_file(src)
+            raise
+
+
+def _discard_temp_file(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def scrub_secrets_from_logs(log_file: Optional[Path] = None) -> list:
     """Redact secrets in the debug log and its rotations (stream_monitor.log,
     stream_monitor.log.1 and so on) once, at startup. It runs before the file
@@ -286,9 +369,12 @@ _activity_lock = threading.Lock()
 
 
 def _activity_timestamp() -> str:
-    """ISO 8601 UTC with millisecond precision, e.g. 2026-04-17T18:30:05.123Z."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
-        f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    """ISO 8601 UTC with millisecond precision, e.g. 2026-04-17T18:30:05.123Z.
+
+    The seconds and the milliseconds come from the same clock reading.
+    """
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
 def log_activity(event: str, **fields):
@@ -330,12 +416,15 @@ _tray_notifier: Optional[Callable[[str, str], None]] = None
 RESCUE_ACK_TIMEOUT_SECONDS = 180
 
 # The 180s window assumes the extension is absent (browser closed, old
-# version). If the extension is demonstrably alive (it polls GET /config
-# every minute) but the ack has not arrived (transient POST failure, an
-# extension-side bug), flushing at 180s floods the browser for nothing.
-# While polls keep arriving the offer stays published until the hard
-# deadline below; the blind 180s fallback applies only when nothing has
-# polled recently.
+# version). If the extension is demonstrably alive but the ack has not
+# arrived (transient POST failure, an extension-side bug), flushing at 180s
+# floods the browser for nothing. Only a guarded POST proves the extension
+# is alive: a stored /open_tabs report (1.10 and newer send one after every
+# config fetch), a parsed /rescue_ack or a valid /streak_event, each past
+# the Origin and Content-Type guard. A GET /config does not, because any web
+# page the browser lets reach loopback can send that GET. While guarded
+# POSTs keep arriving the offer stays published until the hard deadline
+# below; the blind 180s fallback applies when none has arrived recently.
 RESCUE_ACK_HARD_TIMEOUT_SECONDS = 600
 EXTENSION_ALIVE_WINDOW_SECONDS = 150
 
@@ -344,20 +433,129 @@ _extension_seen_lock = threading.Lock()
 
 
 def note_extension_contact() -> None:
-    """Record that something (the browser extension) just fetched /config."""
+    """Record that the browser extension just made a guarded POST (a stored
+    /open_tabs report, a parsed /rescue_ack or a valid /streak_event). A
+    GET /config never calls this: any web page can send that GET."""
     global _extension_last_seen_monotonic
     with _extension_seen_lock:
         _extension_last_seen_monotonic = time.monotonic()
 
 
 def extension_seen_within(seconds: float) -> bool:
-    """True if /config was fetched within the last `seconds` seconds."""
+    """True if the extension made a guarded POST within the last `seconds`
+    seconds (see note_extension_contact); a /config poll does not count."""
     with _extension_seen_lock:
         last = _extension_last_seen_monotonic
     return last is not None and (time.monotonic() - last) <= seconds
 
 
 _rescue_ack_handler: Optional[Callable[[str], bool]] = None
+# 1.12.0: POST /rescue_ack calls this with (offer_id, claimant) when set,
+# else the one-argument handler above. The claimant is "<browser>-<instance>"
+# from the ack body, or None.
+_rescue_claim_handler: Optional[Callable[[str, Optional[str]], bool]] = None
+
+
+def set_rescue_claim_handler(fn: Optional[Callable[[str, Optional[str]], bool]]) -> None:
+    """Register the two-argument /rescue_ack handler (offer id, claimant)."""
+    global _rescue_claim_handler
+    _rescue_claim_handler = fn
+
+
+def _rescue_claimant(payload: dict) -> Optional[str]:
+    """"<browser>-<instance>" from a /rescue_ack body when both are valid,
+    else None. Only a named claimant can re-ack an offer (A11)."""
+    browser = payload.get("browser")
+    instance = payload.get("instance")
+    if not isinstance(browser, str) or not isinstance(instance, str):
+        return None
+    browser = browser.strip().lower()
+    instance = instance.strip().lower()
+    if not _OPEN_TABS_BROWSER_RE.match(browser) or not _OPEN_TABS_INSTANCE_RE.match(instance):
+        return None
+    return f"{browser}-{instance}"
+
+
+# ---------------------------------------------------------------------------
+# The monitor inbox (1.12.0).
+#
+# HTTP handler threads never touch the scheduler, the save items or, in Slot
+# mode, queued_vods. They put an item on the monitor's inbox through the
+# registered submitter and, when the monitor loop is running, wait up to
+# SLOT_REPLAN_WAIT_SECONDS for it to drain the inbox and replan, so the
+# extension's answer already reflects the new plan. A submit always enqueues;
+# with the monitor stopped the item waits for the next start.
+# ---------------------------------------------------------------------------
+
+
+class _InboxItem:
+    """One inbox entry: kind "streak_item", "item_done" or "report", its
+    payload, and the event the monitor sets once it has processed the item
+    and replanned. result is True when the item created, merged or completed
+    something."""
+
+    __slots__ = ("kind", "payload", "done", "result", "waitable")
+
+    def __init__(self, kind: str, payload: dict, waitable: bool = False):
+        self.kind = kind
+        self.payload = payload
+        self.done = threading.Event()
+        self.result: Optional[bool] = None
+        self.waitable = waitable
+
+
+_monitor_submitter: Optional[Callable[[str, dict], Optional[_InboxItem]]] = None
+# Returns the epoch at which the current unbroken run of successful polls
+# that included a login began, or None (TwitchMonitor._watch_start).
+_watch_start_provider: Optional[Callable[[str], Optional[float]]] = None
+
+
+def set_monitor_submitter(fn: Optional[Callable[[str, dict], Optional[_InboxItem]]]) -> None:
+    """Register the callable HTTP handlers use to reach the monitor inbox."""
+    global _monitor_submitter
+    _monitor_submitter = fn
+
+
+def set_watch_start_provider(fn: Optional[Callable[[str], Optional[float]]]) -> None:
+    """Register the callable the card verdict reads _watch_start through."""
+    global _watch_start_provider
+    _watch_start_provider = fn
+
+
+def _watch_start_for(name: str) -> Optional[float]:
+    provider = _watch_start_provider
+    if provider is None:
+        return None
+    try:
+        value = provider(name)
+    except Exception as e:
+        log.warning("Watch-start provider raised: %s", e)
+        return None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _submit_to_monitor(kind: str, payload: dict) -> Optional[_InboxItem]:
+    """Put an item on the monitor inbox. Waits up to
+    SLOT_REPLAN_WAIT_SECONDS when the monitor loop is running with a current
+    loop generation (A6); otherwise answers at once. None when no monitor is
+    registered. Never called with a lock held (A34)."""
+    submitter = _monitor_submitter
+    if submitter is None:
+        return None
+    try:
+        item = submitter(kind, payload)
+    except Exception as e:
+        log.warning("Monitor submitter raised on %s: %s", kind, e)
+        return None
+    if item is not None and item.waitable:
+        item.done.wait(SLOT_REPLAN_WAIT_SECONDS)
+    return item
+
+
+def _monitor_changed(item: Optional[_InboxItem]) -> bool:
+    """Whether the monitor reported, within the wait, that the item created,
+    merged or completed something."""
+    return item is not None and item.done.is_set() and item.result is True
 
 
 # ---------------------------------------------------------------------------
@@ -374,63 +572,199 @@ _rescue_ack_handler: Optional[Callable[[str], bool]] = None
 OPEN_TABS_MAX_STREAMERS = 500
 _OPEN_TABS_BROWSER_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 _OPEN_TABS_LOGIN_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+# 1.12.0 report fields: a per-profile instance id, the plan seq the
+# extension applied (its presence marks a Slot-mode-capable extension), the
+# slot tabs that went away since the last report, and whether the profile
+# is paused.
+_OPEN_TABS_INSTANCE_RE = re.compile(r"^[0-9a-f]{8}$")
+OPEN_TABS_PLAN_SEQ_MAX = 2147483647
+OPEN_TABS_GONE_MAX = 100
+OPEN_TABS_GONE_REASONS = frozenset(slot_scheduler.GONE_REASONS)
+# Bounds for the gone queue while the monitor is not draining it, and for
+# the memory that drops a re-sent gone entry.
+_OPEN_TABS_GONE_QUEUE_MAX = 1000
+_OPEN_TABS_GONE_MEMORY_SECONDS = 24 * 3600
 _open_tabs_lock = threading.Lock()
-# browser -> {"streamers": frozenset[str], "epoch": float, "mono": float}
+# Held through the extension_tabs.json write and its replace retries. POST
+# /open_tabs handler threads write it at the same time through one temp
+# file. Taken after _open_tabs_lock is released, never inside it.
+_open_tabs_persist_lock = threading.Lock()
+# key -> {"streamers": frozenset[str], "epoch": float, "mono": float,
+#         "browser": str, "instance": str or None, "plan_seq": int or None,
+#         "busy": "paused" or None}. The key is the browser, or
+# "<browser>-<instance>" when the report carries a valid instance.
 _open_tabs_reports: dict[str, dict] = {}
+# Valid gone entries not yet drained by the monitor thread:
+# [{"key", "streamer", "reason", "at"}], and the (key, streamer, reason, at)
+# tuples already queued, with the time each was queued.
+_open_tabs_gone: list = []
+_open_tabs_gone_keys: dict = {}
 
 
 def _extension_tabs_path() -> Path:
     return CONFIG_DIR / "extension_tabs.json"
 
 
-def record_extension_open_tabs(browser, streamers, reason: str = "", *,
-                               now_epoch: Optional[float] = None,
-                               now_mono: Optional[float] = None) -> bool:
-    """Store one report. Returns False (storing nothing) for a malformed
-    payload; malformed streamer names inside a good payload are dropped."""
+def _valid_gone_entries(gone) -> list:
+    """The valid entries of a report's gone list (plan 3.4); a bad entry is
+    dropped and a non-list is ignored."""
+    if not isinstance(gone, list):
+        return []
+    out = []
+    for raw in gone[:OPEN_TABS_GONE_MAX]:
+        if not isinstance(raw, dict):
+            continue
+        streamer = raw.get("streamer")
+        reason = raw.get("reason")
+        at = raw.get("at")
+        if not isinstance(streamer, str):
+            continue
+        streamer = streamer.strip().lower()
+        if not _OPEN_TABS_LOGIN_RE.match(streamer):
+            continue
+        if reason not in OPEN_TABS_GONE_REASONS:
+            continue
+        if not isinstance(at, int) or isinstance(at, bool):
+            continue
+        out.append({"streamer": streamer, "reason": reason, "at": at})
+    return out
+
+
+def _record_open_tabs(browser, streamers, reason: str = "", *,
+                      now_epoch: Optional[float] = None,
+                      now_mono: Optional[float] = None,
+                      instance=None, plan_seq=None, gone=None, busy=None) -> tuple:
+    """Store one report. Returns (stored, replan): stored is False (nothing
+    stored) for a malformed payload; replan is True when the report carried
+    a valid gone entry or its busy state differs from the previous report
+    under the same key, so the monitor should replan before the answer."""
     if not isinstance(browser, str) or not isinstance(streamers, list):
-        return False
+        return False, False
     browser = browser.strip().lower()
     if not _OPEN_TABS_BROWSER_RE.match(browser):
-        return False
+        return False, False
     names = set()
     for raw in streamers[:OPEN_TABS_MAX_STREAMERS]:
         if isinstance(raw, str):
             name = raw.strip().lower()
             if _OPEN_TABS_LOGIN_RE.match(name):
                 names.add(name)
+    inst = instance.strip().lower() if isinstance(instance, str) else None
+    if inst is not None and not _OPEN_TABS_INSTANCE_RE.match(inst):
+        inst = None
+    seq = plan_seq if (isinstance(plan_seq, int) and not isinstance(plan_seq, bool)
+                       and 0 <= plan_seq <= OPEN_TABS_PLAN_SEQ_MAX) else None
+    busy_value = "paused" if busy == "paused" else None
+    key = f"{browser}-{inst}" if inst else browser
+    entries = _valid_gone_entries(gone)
     epoch = time.time() if now_epoch is None else now_epoch
     mono = time.monotonic() if now_mono is None else now_mono
+    report = {"streamers": frozenset(names), "epoch": epoch, "mono": mono,
+              "browser": browser, "instance": inst, "plan_seq": seq, "busy": busy_value}
     with _open_tabs_lock:
-        previous = _open_tabs_reports.get(browser)
-        _open_tabs_reports[browser] = {"streamers": frozenset(names), "epoch": epoch, "mono": mono}
+        previous = _open_tabs_reports.get(key)
+        _open_tabs_reports[key] = report
         snapshot = {b: dict(rep) for b, rep in _open_tabs_reports.items()}
+        _queue_gone_entries_locked(key, entries)
     if previous is None or previous["streamers"] != frozenset(names):
-        log.info("Open-tabs report from %s (%s): %s", browser, reason or "update",
+        log.info("Open-tabs report from %s (%s): %s", key, reason or "update",
                  ", ".join(sorted(names)) or "none")
+    for entry in entries:
+        log.info("Open-tabs report from %s: %s gone (%s)", key, entry["streamer"], entry["reason"])
+    previous_busy = previous.get("busy") if previous is not None else None
     _persist_open_tabs_reports(snapshot)
-    return True
+    return True, bool(entries) or previous_busy != busy_value
+
+
+def record_extension_open_tabs(browser, streamers, reason: str = "", *,
+                               now_epoch: Optional[float] = None,
+                               now_mono: Optional[float] = None,
+                               instance=None, plan_seq=None, gone=None, busy=None) -> bool:
+    """Store one report. Returns False (storing nothing) for a malformed
+    payload; malformed streamer names inside a good payload are dropped, and
+    so are malformed optional 1.12 fields (instance, plan_seq, gone, busy)."""
+    stored, _ = _record_open_tabs(browser, streamers, reason, now_epoch=now_epoch,
+                                  now_mono=now_mono, instance=instance, plan_seq=plan_seq,
+                                  gone=gone, busy=busy)
+    return stored
+
+
+def _queue_gone_entries_locked(key: str, entries: list) -> None:
+    """Append valid gone entries for the monitor, dropping one already
+    queued with the same (key, streamer, reason, at). The caller holds
+    _open_tabs_lock."""
+    now = time.time()
+    for stale in [k for k, t in _open_tabs_gone_keys.items()
+                  if now - t > _OPEN_TABS_GONE_MEMORY_SECONDS]:
+        del _open_tabs_gone_keys[stale]
+    for entry in entries:
+        ident = (key, entry["streamer"], entry["reason"], entry["at"])
+        if ident in _open_tabs_gone_keys:
+            continue
+        _open_tabs_gone_keys[ident] = now
+        _open_tabs_gone.append(dict(entry, key=key))
+    if len(_open_tabs_gone) > _OPEN_TABS_GONE_QUEUE_MAX:
+        del _open_tabs_gone[:len(_open_tabs_gone) - _OPEN_TABS_GONE_QUEUE_MAX]
+
+
+def drain_open_tabs_gone() -> list:
+    """The gone entries reported since the last drain (monitor thread)."""
+    with _open_tabs_lock:
+        entries = list(_open_tabs_gone)
+        del _open_tabs_gone[:]
+    return entries
 
 
 def _persist_open_tabs_reports(snapshot: dict[str, dict]) -> None:
     """Mirror the reports to disk (best effort, atomic replace) so the next
-    process can seed its start from them."""
+    process can seed its start from them. plan_seq is written only when the
+    report carried one. Report threads run this at the same time, so the
+    write and the replace retries hold _open_tabs_persist_lock: a writer
+    that gives up removes only its own temp file, never a newer report's."""
     path = _extension_tabs_path()
-    data = {b: {"ts": rep["epoch"], "streamers": sorted(rep["streamers"])}
-            for b, rep in snapshot.items()}
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError as e:
-        log.debug("Could not persist the open-tabs report: %s", e)
+    data = {}
+    for b, rep in snapshot.items():
+        entry = {"ts": rep["epoch"], "streamers": sorted(rep["streamers"])}
+        if rep.get("plan_seq") is not None:
+            entry["plan_seq"] = rep["plan_seq"]
+        data[b] = entry
+    with _open_tabs_persist_lock:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            _replace_with_retry(tmp, path)
+        except OSError as e:
+            log.debug("Could not persist the open-tabs report: %s", e)
 
 
 def extension_open_tabs_snapshot() -> dict[str, dict]:
-    """Copy of the latest report per browser received by this process."""
+    """Copy of the latest report per key received by this process."""
     with _open_tabs_lock:
         return {b: dict(rep) for b, rep in _open_tabs_reports.items()}
+
+
+def persisted_capable_report_within(max_age_seconds: float,
+                                    now_epoch: Optional[float] = None) -> bool:
+    """Whether extension_tabs.json holds a report at most max_age_seconds
+    old that carried a plan_seq (a Slot-mode-capable extension, A24)."""
+    try:
+        data = json.loads(_extension_tabs_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    now = time.time() if now_epoch is None else now_epoch
+    for rep in data.values():
+        if not isinstance(rep, dict):
+            continue
+        ts = rep.get("ts")
+        seq = rep.get("plan_seq")
+        if (isinstance(ts, (int, float)) and not isinstance(ts, bool)
+                and isinstance(seq, int) and not isinstance(seq, bool)
+                and now - ts <= max_age_seconds):
+            return True
+    return False
 
 
 def load_persisted_open_tabs(max_age_seconds: float,
@@ -473,8 +807,70 @@ def set_rescue_ack_handler(fn: Callable[[str], bool]) -> None:
 # on app restart, which is fine: the activity log persists across restarts
 # so the user still has a record. A recorded "already saved" also forgets
 # the card keys it covers (see _handle_already_saved).
+#
+# 1.12.0 (card identity, plan 3.5.3): a key stands for one card only while
+# the cards read under it can be the same card. _streak_event_seen_at keeps
+# a record {seen_at, break_at, unit, deadline_at} per key; a card whose
+# possible posting time lies after the record's is a newer card and is
+# announced again. Records drive the 48-hour prune, counted from the last
+# sighting. _streak_item_keys holds the card that produced a save item this
+# run, with the latest escalated deadline, so a card whose item is done
+# never makes a second one. Its records have no clock of their own: they go
+# only with their card's seen record (the prune), at a go-live, when a save
+# covers them, or when a card ends the save. Link events use
+# ("broke", login, None).
 _streak_event_seen: set = set()
+_streak_event_seen_at: dict = {}
+_streak_item_keys: dict = {}
 _streak_event_lock = threading.Lock()
+_CARD_STATUSES = ("broke", "in_danger")
+
+
+def _prune_streak_dedup_locked(now: float) -> None:
+    """Forget card keys last seen more than STREAK_DEDUP_TTL_SECONDS ago,
+    with their item records. An item record is never pruned on its own: its
+    seen_at is the time the item was made, and a card still being read
+    would then make a second item (plan 3.5.3). The caller holds
+    _streak_event_lock."""
+    cutoff = now - STREAK_DEDUP_TTL_SECONDS
+    for key in [k for k, rec in _streak_event_seen_at.items() if rec.get("seen_at", now) < cutoff]:
+        _streak_event_seen_at.pop(key, None)
+        _streak_event_seen.discard(key)
+        _streak_item_keys.pop(key, None)
+
+
+def _forget_card_keys_locked(name: str, keep=None) -> None:
+    """Forget a streamer's card keys (not the already_saved toast key), all
+    but `keep`. The caller holds _streak_event_lock."""
+    for store in (_streak_event_seen, _streak_event_seen_at, _streak_item_keys):
+        for key in [k for k in store
+                    if k != keep and k[0] in _CARD_STATUSES and k[1] == name]:
+            if isinstance(store, set):
+                store.discard(key)
+            else:
+                store.pop(key, None)
+
+
+def _announce_card_locked(key: tuple, record: dict, now: float) -> bool:
+    """Whether a card was already announced this run under its key (the
+    incoming card is the same card as the key's record, or an older one; a
+    key with no record counts as the same card). Adds the key; a newer card
+    replaces the record, the same or an older one refreshes its sighting and
+    takes an escalated deadline. The caller holds _streak_event_lock."""
+    existing = _streak_event_seen_at.get(key)
+    announced = False
+    relation = None
+    if key in _streak_event_seen:
+        relation = streak_saves.card_relation(existing, record) if existing else "same"
+        announced = relation in ("same", "older")
+    _streak_event_seen.add(key)
+    if existing is None or not announced:
+        _streak_event_seen_at[key] = dict(record)
+    else:
+        if streak_saves.is_escalation(existing, record):
+            existing["deadline_at"] = record["deadline_at"]
+        existing["seen_at"] = now
+    return announced
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +894,9 @@ _streak_event_lock = threading.Lock()
 #     broadcasts before that one, and the owner missed this one. A
 #     broadcast it had open keeps the save until the next go-live;
 #   - a card for X with a higher count arrives: the streak grew since the
-#     save, so the card is about a newer break;
+#     save, so the card is about a newer break; or (1.12.0) a card whose
+#     age shows it was posted after the save (the card verdict,
+#     streak_saves.card_verdict);
 #   - 24 hours pass when the monitor does not poll X (no go-live of X can
 #     ever be seen), or 7 days pass in any case (bounds a broadcast the
 #     desktop missed while it was off).
@@ -599,15 +997,34 @@ def load_streak_state(now_epoch: Optional[float] = None) -> None:
         _publish_saved_streaks_locked(now)
 
 
+def _prune_streak_state_locked(now: float) -> None:
+    """Drop entries older than STREAK_STATE_MAX_AGE_SECONDS from the
+    in-memory state, the rule load_streak_state applies at start, so the
+    file stays bounded in a process that runs for weeks. The caller holds
+    _streak_state_lock."""
+    cutoff = now - STREAK_STATE_MAX_AGE_SECONDS
+    for name, entry in list(_streak_state["saved"].items()):
+        at = _iso_to_epoch(entry.get("at")) if isinstance(entry, dict) else None
+        if at is None or at < cutoff:
+            del _streak_state["saved"][name]
+    for key in ("last_live", "last_offline", "missed_end"):
+        for name, at_iso in list(_streak_state[key].items()):
+            at = _iso_to_epoch(at_iso)
+            if at is None or at < cutoff:
+                del _streak_state[key][name]
+
+
 def _write_streak_state_locked() -> None:
-    """Persist the in-memory state. The caller holds _streak_state_lock.
-    Never raises: losing this file only costs a stale notification."""
+    """Persist the in-memory state, after the load-time prune. The caller
+    holds _streak_state_lock. Never raises: losing this file only costs a
+    stale notification."""
+    _prune_streak_state_locked(_streak_clock())
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         path = _streak_state_path()
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(_streak_state, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        _replace_with_retry(tmp, path)
     except OSError as e:
         log.warning("Could not write %s: %s", _streak_state_path(), e)
 
@@ -719,6 +1136,11 @@ def record_stream_live(streamer: str, at: Optional[str] = None, *,
         if changed:
             _write_streak_state_locked()
             _publish_saved_streaks_locked(now)
+    if new_start:
+        # A new broadcast: this streamer's cards are judged afresh. Taken
+        # after _streak_state_lock is released (the card lock comes first).
+        with _streak_event_lock:
+            _forget_card_keys_locked(name)
     return new_start
 
 
@@ -832,6 +1254,49 @@ def _counted_save(name: str, now_epoch: Optional[float] = None) -> Optional[dict
     return None
 
 
+def _lapsed_save(name: str, now_epoch: Optional[float] = None) -> Optional[dict]:
+    """A copy of the streamer's stored save when it no longer counts only
+    because of the age caps (SAVED_STREAK_MAX_AGE_SECONDS, or
+    SAVED_STREAK_UNPOLLED_TTL_SECONDS): no broadcast start or missed end
+    came after it and its time is not distrusted. Such a save still feeds
+    the card verdict (A4). None otherwise, and None while it still counts."""
+    now = _streak_clock() if now_epoch is None else now_epoch
+    with _streak_state_lock:
+        entry = _streak_state["saved"].get(name)
+        if not entry or _save_counts_locked(name, entry, now):
+            return None
+        saved_at = _iso_to_epoch(entry.get("at"))
+        if saved_at is None or saved_at > now + STREAK_CLOCK_SKEW_SECONDS:
+            return None
+        boundary = _broadcast_boundary_locked(name)
+        if boundary is not None and boundary >= saved_at:
+            return None
+        return dict(entry)
+
+
+def _counting_saves(now_epoch: Optional[float] = None) -> dict:
+    """{login: {"at": epoch, "count": int}} for every save that counts right
+    now: the scheduler's `saves` input."""
+    now = _streak_clock() if now_epoch is None else now_epoch
+    out = {}
+    with _streak_state_lock:
+        for name, entry in _streak_state["saved"].items():
+            if _save_counts_locked(name, entry, now):
+                out[name] = {"at": _iso_to_epoch(entry.get("at")), "count": entry.get("count", 0)}
+    return out
+
+
+def _verdict_save(entry: Optional[dict]) -> Optional[dict]:
+    """A stored save {at: ISO, count} in the shape card_verdict, save_covers
+    and queued_vod_covered take: {at: epoch, count}."""
+    if not entry:
+        return None
+    at = _iso_to_epoch(entry.get("at"))
+    if at is None:
+        return None
+    return {"at": at, "count": entry.get("count")}
+
+
 def streak_saved_since_last_live(streamer: str, now_epoch: Optional[float] = None) -> Optional[str]:
     """The saved-at timestamp if the streamer's streak counts as saved right
     now (the rules in the block comment above), else None."""
@@ -853,24 +1318,46 @@ def _notify_tray(title: str, msg: str) -> None:
             log.warning("Tray notifier raised on streak event: %s", e)
 
 
-def _format_streak_message(event: dict) -> tuple:
+def _format_streak_message(event: dict, deadline_at: Optional[float] = None,
+                           age_unit_s: int = 0, now: Optional[float] = None) -> tuple:
+    """Toast title and message for a card. Titles are unchanged since 1.6;
+    a link event (no count) reads "<login>: streak broke". With deadline_at
+    the message states the hours actually left (A37); without it (a card
+    whose login is not verified) the message is the one 1.11 showed."""
     streamer = event.get("streamer", "unknown")
     count = event.get("count", 0)
-    if event.get("status") == "broke":
+    broke = event.get("status") == "broke"
+    if count is None:
+        title = f"{streamer}: streak broke" if broke else f"{streamer}: streak in danger"
+    elif broke:
         title = f"{streamer}: {count}-stream streak broke"
-        msg = f"Watch a clip, VOD or stream within 24h to save it."
     else:
-        hours = event.get("deadline_hours", "?")
         title = f"{streamer}: {count}-stream streak in danger"
+    if deadline_at is None:
+        if broke:
+            msg = "Watch a clip, VOD or stream within 24h to save it."
+        else:
+            msg = f"Ends in ~{event.get('deadline_hours', '?')}h. Watch to keep the streak alive."
+        return title, msg
+    now = _streak_clock() if now is None else now
+    left = deadline_at + (age_unit_s or 0) - now
+    hours = max(1, int(left // 3600))
+    if broke:
+        if left <= 0:
+            msg = "Its save window may already be over."
+        else:
+            msg = f"Watch a clip, VOD or stream within ~{hours}h to save it."
+    else:
         msg = f"Ends in ~{hours}h. Watch to keep the streak alive."
     return title, msg
 
 
-def _handle_already_saved(name: str, count: int, payload: dict) -> None:
+def _handle_already_saved(name: str, count: int, payload: dict) -> SaveReport:
     """Evaluate every report, with no session dedup on recording: a save
     ended by a broadcast must be recordable again from the same page text.
     Only the toast and the streak_already_saved activity entry are deduped,
-    per streamer and count for the session."""
+    per streamer and count for the session. Returns what record_streak_saved
+    did."""
     page_url = payload.get("page_url")
     key = ("already_saved", name, count)
     announced = False
@@ -881,11 +1368,18 @@ def _handle_already_saved(name: str, count: int, payload: dict) -> None:
         if result.outcome == "recorded":
             # The stale card that led here was usually announced before the
             # save. A real break once the save ends reads exactly the same,
-            # so forget the cards this save covers (its count or lower).
-            _streak_event_seen.difference_update([
-                seen for seen in _streak_event_seen
-                if seen[0] in ("broke", "in_danger") and seen[1] == name and seen[2] <= count
-            ])
+            # so forget the cards this save covers (its count or lower). A
+            # link event's key has no count and is not covered.
+            covered = [
+                seen for seen in list(_streak_event_seen) + list(_streak_event_seen_at)
+                + list(_streak_item_keys)
+                if seen[0] in _CARD_STATUSES and seen[1] == name
+                and isinstance(seen[2], int) and not isinstance(seen[2], bool) and seen[2] <= count
+            ]
+            for seen in covered:
+                _streak_event_seen.discard(seen)
+                _streak_event_seen_at.pop(seen, None)
+                _streak_item_keys.pop(seen, None)
             announced = key in _streak_event_seen
             _streak_event_seen.add(key)
     if result.outcome in ("superseded_by_live", "expired"):
@@ -905,13 +1399,13 @@ def _handle_already_saved(name: str, count: int, payload: dict) -> None:
             f"the broadcast start or end at {result.boundary} came after it"
             if result.boundary else "too old to count",
         )
-        return
+        return result
     if result.outcome != "recorded":
         log.info("already_saved for %s seen at %s: a later save is on record", name, result.at)
-        return
+        return result
     if announced:
         log.info("Save for %s recorded again at %s (already announced this session)", name, result.at)
-        return
+        return result
     log_activity(
         "streak_already_saved",
         streamer=name,
@@ -923,15 +1417,22 @@ def _handle_already_saved(name: str, count: int, payload: dict) -> None:
     msg = "Twitch says it was kept. Nothing to rescue for now."
     log.info("Streak event: %s - %s", title, msg)
     _notify_tray(title, msg)
+    return result
 
 
-def handle_streak_event(payload: dict) -> None:
-    """Validate, dedup, log, and notify on an incoming streak event. Raises
-    ValueError for a malformed payload (POST /streak_event answers 400).
+def handle_streak_event(payload: dict) -> dict:
+    """Validate, judge, dedup, log and notify on an incoming streak event,
+    and hand any save item to the monitor. Returns the answer body
+    {"verdict", "item"} (plan 3.5). Raises ValueError for a malformed
+    payload (POST /streak_event answers 400).
 
-    "broke" and "in_danger" come from Twitch's notification cards.
-    "already_saved" comes from a save-streak page that says the streak was
-    already kept; see the saved-streak memory above for what it changes."""
+    "broke" and "in_danger" come from Twitch's notification cards, a
+    save-streak link event (source "link", no count; /config no longer
+    lists "link", so the extensions send none, plan A41) or a Streaks at
+    Risk row in the popup (source "manual"). "already_saved" comes from a
+    save-streak page, or the dialog Twitch shows after moving it on, that
+    says the streak was already kept; see the saved-streak memory above
+    for what it changes."""
     if not isinstance(payload, dict):
         raise ValueError("payload not a dict")
     status = payload.get("status")
@@ -941,7 +1442,19 @@ def handle_streak_event(payload: dict) -> None:
     if not isinstance(streamer, str) or not streamer.strip():
         raise ValueError("missing streamer")
     count = payload.get("count")
-    if not isinstance(count, int) or count < 0 or count > 100000:
+    source = payload.get("source")
+    if count is None:
+        # A link event carries no count (then it is a broke event), and
+        # neither does a popup row made from one.
+        if source == "link":
+            if status != "broke":
+                raise ValueError(f"a link event must be broke, not {status!r}")
+        elif source == "manual":
+            if status not in _CARD_STATUSES:
+                raise ValueError(f"bad manual status: {status!r}")
+        else:
+            raise ValueError("bad count: None")
+    elif not isinstance(count, int) or count < 0 or count > 100000:
         raise ValueError(f"bad count: {count!r}")
     deadline_hours = payload.get("deadline_hours")
     if deadline_hours is not None and (
@@ -950,67 +1463,195 @@ def handle_streak_event(payload: dict) -> None:
         raise ValueError(f"bad deadline_hours: {deadline_hours!r}")
 
     name = streamer.strip().lower()
-    count = int(count)
+    count = int(count) if count is not None else None
+    now = _streak_clock()
+    extras = streak_saves.parse_card_extras(payload, now)
     if status == "already_saved":
         # The save is stored under this name and published to the
         # extension, so it must be a real login. Card names are left alone:
         # they can be display names parsed from the card text.
         if not _OPEN_TABS_LOGIN_RE.match(name):
             raise ValueError(f"bad streamer login: {streamer[:64]!r}")
-        _handle_already_saved(name, count, payload)
-        return
+        result = _handle_already_saved(name, count, payload)
+        item = False
+        if result.outcome in ("recorded", "older"):
+            # The streamer's save turn is done: the monitor completes the
+            # item and frees its slot before this answer (DESIGN 12.3).
+            submitted = _submit_to_monitor("item_done", {
+                "login": name, "reason": "already_saved", "saved_at": result.at,
+            })
+            item = _monitor_changed(submitted)
+        return {"verdict": "saved", "item": item}
+    if extras["source"] == "manual":
+        return _handle_manual_streak_event(name, status, count, payload, extras, now)
+    return _handle_streak_card(name, status, count, deadline_hours, payload, extras, now)
 
-    key = (status, name, count)
+
+def _card_detected_at(payload: dict, now: float) -> float:
+    """The card's detected_at as an epoch; now when it is missing,
+    unreadable or later than now."""
+    detected = _iso_to_epoch(payload.get("detected_at"))
+    if detected is None or detected > now:
+        return now
+    return detected
+
+
+def _handle_manual_streak_event(name: str, status: str, count, payload: dict,
+                                extras: dict, now: float) -> dict:
+    """A Streaks at Risk row the owner clicked (A12, O16): always accepted
+    for a real login, whatever the auto-save setting; no card verdict, no
+    toast, no activity line and no dedup key. The monitor logs the item."""
+    if not streak_saves.login_ok(name):
+        log.debug("Manual save for %r not taken: not a Twitch login", name[:64])
+        return {"verdict": "fresh", "item": False}
+    item = streak_saves.make_manual_item(name, status, count, _card_detected_at(payload, now),
+                                         extras["deadline_at"], now)
+    submitted = _submit_to_monitor("streak_item", {"item": item, "merge_only": False})
+    return {"verdict": "fresh", "item": submitted is not None}
+
+
+def _card_activity(status: str, name: str, count, deadline_hours, payload: dict,
+                   extras: dict, verified: bool, deadline_at: float, verdict: str) -> None:
+    log_activity(
+        "streak_broke" if status == "broke" else "streak_in_danger",
+        streamer=name,
+        count=count,
+        deadline_hours=int(deadline_hours) if deadline_hours is not None else None,
+        detected_at=payload.get("detected_at"),
+        page_url=payload.get("page_url"),
+        login_verified=verified,
+        source=extras["source"],
+        card_age_s=extras["card_age_s"],
+        card_age_unit_s=extras["card_age_unit_s"],
+        deadline_at=_epoch_to_iso(deadline_at),
+        verdict=verdict,
+    )
+
+
+def _handle_streak_card(name: str, status: str, count, deadline_hours, payload: dict,
+                        extras: dict, now: float) -> dict:
+    """A broke or in-danger card (or a link event), per plan 3.5.1 step 5."""
+    detected = _card_detected_at(payload, now)
+    card = {"detected_at": detected, "card_age_s": extras["card_age_s"],
+            "card_age_unit_s": extras["card_age_unit_s"], "count": count}
+    item = streak_saves.make_card_item(name, status, count, detected, deadline_hours, extras, now)
+    record = streak_saves.card_record(card, item["deadline_at"], now)
+    key = streak_saves.dedup_key(status, name, count)
+    event = {"status": status, "streamer": name, "count": count, "deadline_hours": deadline_hours}
+    auto_save = ConfigRequestHandler.config_data.get("auto_save_streaks") is True
+
+    verified = payload.get("login_verified") is not False and streak_saves.login_ok(name)
+    if not verified:
+        # Logged and toasted as in 1.11, never a save item (AUDIT P5).
+        with _streak_event_lock:
+            _prune_streak_dedup_locked(now)
+            announced = _announce_card_locked(key, record, now)
+        if announced:
+            log.debug("Streak event %s already seen this session, skipping", key)
+            return {"verdict": "fresh", "item": False}
+        _card_activity(status, name, count, deadline_hours, payload, extras, False,
+                       item["deadline_at"], "fresh")
+        title, msg = _format_streak_message(event)
+        log.info("Streak event (login not verified): %s - %s", title, msg)
+        _notify_tray(title, msg)
+        return {"verdict": "fresh", "item": False}
+
     # Judged under the lock a save is recorded under (_handle_already_saved),
     # so a card cannot add its key just after a save forgot the keys it
     # covers.
     with _streak_event_lock:
-        saved = _counted_save(name)
-        covered = saved is not None and count <= saved["count"]
-        announced = not covered and key in _streak_event_seen
-        if not covered:
-            _streak_event_seen.add(key)
-    if covered:
-        # A stale card for a streak Twitch has since confirmed as kept.
-        # Not deduped: once the save ends, this identical card is judged
-        # afresh.
+        _prune_streak_dedup_locked(now)
+        counted = _counted_save(name, now)
+        lapsed = _lapsed_save(name, now) if counted is None else None
+        entry = counted if counted is not None else lapsed
+        verdict, row = streak_saves.card_verdict(
+            card, _verdict_save(entry),
+            lapsed_by_age=counted is None and lapsed is not None,
+            watch_start=_watch_start_for(name),
+        )
+        announced = False
+        if verdict == "fresh":
+            announced = _announce_card_locked(key, record, now)
+        item_record = _streak_item_keys.get(key)
+        item_record = dict(item_record) if item_record is not None else None
+
+    if verdict in ("stale", "verify"):
+        # A card Twitch has since confirmed as kept (stale), or one only the
+        # save-streak page can settle (verify, O1 (c)). Exactly one activity
+        # event, no toast, and the key is not added: once the save ends, this
+        # identical card is judged afresh.
+        saved_at = entry["at"] if entry else None
         log_activity(
             "streak_event_ignored",
             streamer=name,
             status=status,
             count=count,
             reason="already_saved",
-            saved_at=saved["at"],
+            saved_at=saved_at,
             detected_at=payload.get("detected_at"),
+            verdict=verdict,
         )
-        log.info(
-            "Ignoring %s card for %s: streak already saved at %s and no broadcast since",
-            status, name, saved["at"],
-        )
-        return
-    if saved:
-        # The streak grew after the save, so this card is about a newer
-        # break: end the save and handle the card like any other.
-        _end_saved_streak(
-            name, saved["at"], "count_grew",
-            saved_count=saved["count"], card_status=status, card_count=count,
-        )
-    if announced:
-        log.debug("Streak event %s already seen this session, skipping", key)
-        return
+        log.info("Ignoring %s card for %s (%s): streak already saved at %s",
+                 status, name, verdict, saved_at)
+        changed = False
+        if verdict == "verify" and auto_save and item_record is None:
+            submitted = _submit_to_monitor("streak_item", {"item": dict(item, verify=True),
+                                                           "merge_only": False})
+            if submitted is not None:
+                with _streak_event_lock:
+                    _streak_item_keys[key] = dict(record)
+            changed = _monitor_changed(submitted)
+        return {"verdict": verdict, "item": changed}
 
-    event_name = "streak_broke" if status == "broke" else "streak_in_danger"
-    log_activity(
-        event_name,
-        streamer=name,
-        count=int(count),
-        deadline_hours=int(deadline_hours) if deadline_hours is not None else None,
-        detected_at=payload.get("detected_at"),
-        page_url=payload.get("page_url"),
-    )
-    title, msg = _format_streak_message(payload)
+    if row in (1, 3) and entry is not None:
+        # A break newer than the save (row 1), or a streak that grew since
+        # it (row 3): the save ends, and so do this streamer's other keys.
+        ended = _end_saved_streak(
+            name, entry["at"], "newer_card" if row == 1 else "count_grew",
+            saved_count=entry.get("count"), card_status=status, card_count=count,
+        )
+        if ended:
+            with _streak_event_lock:
+                _forget_card_keys_locked(name, keep=key)
+
+    if announced:
+        # The same card (or an older one) as one already announced this run.
+        changed = False
+        if auto_save:
+            if item_record is None:
+                # First seen while automatic saves were off.
+                submitted = _submit_to_monitor("streak_item", {"item": item, "merge_only": False})
+                if submitted is not None:
+                    with _streak_event_lock:
+                        _streak_item_keys[key] = dict(record)
+                changed = _monitor_changed(submitted)
+            elif streak_saves.is_escalation(item_record, record):
+                # A shorter deadline: merge it into the pending item, never
+                # create one (the item may be done).
+                submitted = _submit_to_monitor("streak_item", {"item": item, "merge_only": True})
+                if submitted is not None:
+                    with _streak_event_lock:
+                        stored = _streak_item_keys.get(key)
+                        if stored is not None:
+                            stored["deadline_at"] = record["deadline_at"]
+                            stored["seen_at"] = now
+                changed = _monitor_changed(submitted)
+        log.debug("Streak event %s already seen this session, skipping", key)
+        return {"verdict": "duplicate", "item": changed}
+
+    _card_activity(status, name, count, deadline_hours, payload, extras, True,
+                   item["deadline_at"], "fresh")
+    title, msg = _format_streak_message(event, item["deadline_at"], item["age_unit_s"], now)
     log.info("Streak event: %s - %s", title, msg)
     _notify_tray(title, msg)
+    changed = False
+    if auto_save:
+        submitted = _submit_to_monitor("streak_item", {"item": item, "merge_only": False})
+        if submitted is not None:
+            with _streak_event_lock:
+                _streak_item_keys[key] = dict(record)
+        changed = _monitor_changed(submitted)
+    return {"verdict": "fresh", "item": changed}
 
 
 # Cap on entries served by /activity.json. The activity file is append-only
@@ -1216,8 +1857,9 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
         # A page that makes itself same origin through DNS rebinding never
         # gets here: parse_request refuses its Host first.
         if self.path == "/config":
-            note_extension_contact()
-            # Saves also run out with time, not only on a poll or an event.
+            # Not a sign of the extension: any web page can send this GET
+            # (see note_extension_contact). Saves also run out with time,
+            # not only on a poll or an event.
             publish_saved_streaks()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1293,10 +1935,14 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
         /streak_event: the extension detected a Twitch "your N-stream
         streak on X broke / ends in Yh" notification card in the page DOM
         (Twitch has no public API for viewing streaks, so the extension
-        scrapes them from the bell dropdown / notifications page).
+        scrapes them from the bell dropdown / notifications page). Answers
+        200 with {"verdict", "item"} (see handle_streak_event).
         /open_tabs: the monitored streamers with a Stream Monitor tab open
         in that browser (see record_extension_open_tabs).
         /rescue_ack: the extension claims the published rescue offer.
+
+        Only these guarded POSTs mark the extension as alive
+        (note_extension_contact), and only once they pass the checks below.
 
         Every route answers 403 to a web page. Browsers put the page's
         http(s) origin on a cross-site POST, and a text/plain body needs no
@@ -1347,7 +1993,7 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"invalid JSON: {e}".encode("utf-8"))
                 return
             try:
-                handle_streak_event(payload)
+                answer = handle_streak_event(payload)
             except ValueError as e:
                 log.warning("Rejected streak event: %s", e)
                 self.send_response(400)
@@ -1355,13 +2001,21 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"bad streak event: {e}".encode("utf-8"))
                 return
             except Exception as e:
+                note_extension_contact()
                 log.warning("Streak event handler raised: %s", e)
                 self.send_response(500)
                 self.end_headers()
                 return
-            self.send_response(204)
+            note_extension_contact()
+            # 200 with the verdict (plan 3.5); an extension older than 1.12
+            # only checks resp.ok, which a 200 satisfies.
+            body = json.dumps(answer).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.write(body)
             return
 
         if self.path == "/open_tabs":
@@ -1378,10 +2032,20 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(400)
                 self.end_headers()
                 return
-            ok = isinstance(payload, dict) and record_extension_open_tabs(
-                payload.get("browser"), payload.get("streamers"),
-                str(payload.get("reason", ""))[:32],
-            )
+            ok, replan = False, False
+            if isinstance(payload, dict):
+                ok, replan = _record_open_tabs(
+                    payload.get("browser"), payload.get("streamers"),
+                    str(payload.get("reason", ""))[:32],
+                    instance=payload.get("instance"), plan_seq=payload.get("plan_seq"),
+                    gone=payload.get("gone"), busy=payload.get("busy"),
+                )
+            if ok:
+                note_extension_contact()
+            if ok and replan:
+                # A tab the owner closed, or a pause in the browser, changes
+                # the plan now: the answer waits for the replan (9.4).
+                _submit_to_monitor("report", {})
             self.send_response(204 if ok else 400)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
@@ -1399,13 +2063,24 @@ class ConfigRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                offer_id = str(payload.get("id", ""))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 self.send_response(400)
                 self.end_headers()
                 return
-            handler = _rescue_ack_handler
-            accepted = bool(handler and offer_id and handler(offer_id))
+            if not isinstance(payload, dict):
+                self.send_response(400)
+                self.end_headers()
+                return
+            if isinstance(payload.get("id"), str):
+                note_extension_contact()
+            offer_id = str(payload.get("id", ""))
+            claimant = _rescue_claimant(payload)
+            claim_handler = _rescue_claim_handler
+            if claim_handler is not None:
+                accepted = bool(offer_id and claim_handler(offer_id, claimant))
+            else:
+                handler = _rescue_ack_handler
+                accepted = bool(handler and offer_id and handler(offer_id))
             self.send_response(204 if accepted else 409)
             self.end_headers()
             return
@@ -1469,6 +2144,9 @@ class _SingletonHTTPServer(ThreadingHTTPServer):
     activity log writes go through _activity_lock, streak events through
     _streak_event_lock, saved streaks and their /config publish through
     _streak_state_lock, and config_data reads are GIL-atomic dict lookups.
+    Save items, tab reports that change the plan and completed saves reach
+    the monitor only through its inbox (_submit_to_monitor); a handler
+    waiting up to SLOT_REPLAN_WAIT_SECONDS for the replan blocks nobody.
     """
     allow_reuse_address = False
     daemon_threads = True
@@ -1489,6 +2167,13 @@ def create_config_server(config: "Config") -> Optional[HTTPServer]:
         "auto_paused": False,
         "rescue": None,
         "saved_streaks": saved_streaks_for_config(),
+        # 1.12.0: the Slot mode plan (null while Slot mode is off; the
+        # monitor publishes it from its first tick), the automatic-save
+        # setting and the streak-event sources the extensions may send
+        # (no "link" since the 2026-10-01 live check, plan A41).
+        "slot_plan": None,
+        "auto_save_streaks": config.auto_save_streaks,
+        "streak_sources": list(streak_saves.STREAK_SOURCES),
     }
     try:
         return _SingletonHTTPServer(("127.0.0.1", CONFIG_SERVER_PORT), ConfigRequestHandler)
@@ -1534,13 +2219,49 @@ class Config:
     # turns the ping off entirely.
     install_id: str = ""
     usage_ping: bool = True
+    # Slot mode (1.12.0): at most K Keep Open slots and C rotating slots
+    # (K + C <= 3, C >= 1), M minutes per turn. Off by default.
+    slot_mode: bool = False
+    keep_open_slots: int = 2
+    cycle_slots: int = 1
+    slot_minutes: int = 30
+    # Save broken streaks automatically: a broke card, or a broadcast that
+    # ended before it was watched, gets one turn on the save-streak page.
+    auto_save_streaks: bool = False
 
     def __post_init__(self):
         if self.streamers is None:
             self.streamers = []
         if self.pinned_streamers is None:
             self.pinned_streamers = []
-    
+        self._clamp_slot_fields()
+
+    def _clamp_slot_fields(self) -> None:
+        """Coerce and clamp the Slot mode fields (plan 3.1): bools must be
+        bools, ints convert (a bool, or a value that does not convert, takes
+        the default), Rotating 1..3, Keep Open 0..2, K + C <= 3 (Keep Open
+        gives way), Minutes 5..120."""
+        defaults = {f.name: f.default for f in self.__dataclass_fields__.values()}
+        for name in ("slot_mode", "auto_save_streaks"):
+            if not isinstance(getattr(self, name), bool):
+                setattr(self, name, defaults[name])
+        for name in ("keep_open_slots", "cycle_slots", "slot_minutes"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                value = defaults[name]
+            else:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    value = defaults[name]
+            setattr(self, name, value)
+        total = slot_scheduler.SLOT_MAX_TOTAL
+        self.cycle_slots = min(max(self.cycle_slots, 1), total)
+        self.keep_open_slots = min(max(self.keep_open_slots, 0), total - 1)
+        if self.keep_open_slots + self.cycle_slots > total:
+            self.keep_open_slots = total - self.cycle_slots
+        self.slot_minutes = min(max(self.slot_minutes, 5), 120)
+
     @classmethod
     def load(cls) -> "Config":
         if CONFIG_FILE.exists():
@@ -1565,6 +2286,58 @@ class Config:
     
     def is_valid(self) -> bool:
         return bool(self.client_id and self.client_secret and self.streamers)
+
+
+def _slot_config_fields(config: "Config") -> dict:
+    """The five Slot mode config fields, for the config_loaded event."""
+    return {
+        "slot_mode": config.slot_mode,
+        "keep_open_slots": config.keep_open_slots,
+        "cycle_slots": config.cycle_slots,
+        "slot_minutes": config.slot_minutes,
+        "auto_save_streaks": config.auto_save_streaks,
+    }
+
+
+# ProgId prefixes of the https handler that mean the Chrome extension
+# (every Chromium browser reports itself as "chrome"), and of Firefox.
+_CHROMIUM_PROGIDS = ("ChromeHTML", "MSEdgeHTM", "BraveHTML", "BraveBHTML", "ChromiumHTM",
+                     "OperaStable", "OperaGX", "VivaldiHTM")
+_UNSET = object()
+_default_browser_family_cache = _UNSET
+
+
+def browser_family_for_progid(prog_id) -> Optional[str]:
+    """"firefox", "chrome" or None for the ProgId Windows opens https links
+    with."""
+    if not isinstance(prog_id, str):
+        return None
+    if prog_id.startswith("FirefoxURL"):
+        return "firefox"
+    if prog_id.startswith(_CHROMIUM_PROGIDS):
+        return "chrome"
+    return None
+
+
+def default_browser_family() -> Optional[str]:
+    """The extension family of the Windows default browser (the browser a
+    desktop open lands in): read once per process from the https
+    UserChoice ProgId. None on any error or an unknown browser. Slot mode
+    prefers a reporting profile of this browser as its executor (rule 37)."""
+    global _default_browser_family_cache
+    if _default_browser_family_cache is not _UNSET:
+        return _default_browser_family_cache
+    family = None
+    try:
+        import winreg
+        path = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+            prog_id, _ = winreg.QueryValueEx(key, "ProgId")
+        family = browser_family_for_progid(prog_id)
+    except Exception:
+        family = None
+    _default_browser_family_cache = family
+    return family
 
 
 @dataclass
@@ -1621,10 +2394,70 @@ class TwitchMonitor:
         self._rescue_offer_started_monotonic: float = 0.0
         self._rescue_overdue_logged: bool = False
         self._rescue_lock = threading.Lock()
+        # The last rescue offer acknowledged, {offer, claimant, acked_at},
+        # kept LAST_ACKED_OFFER_TTL_SECONDS: the same claimant may re-ack it
+        # for RESCUE_REACK_WINDOW_SECONDS, and Slot mode absorbs its
+        # unfinished save-streak entries when it becomes active. Guarded by
+        # _rescue_lock.
+        self._last_acked_offer: Optional[dict] = None
         # Per-streamer metadata captured on the latest "live" check, used to
         # enrich the activity log (title, game, viewer count at the moment
         # the offline->live transition was detected).
         self.live_stream_meta: dict[str, dict] = {}
+
+        # Slot mode (1.12.0). The scheduler holds every rule; this class
+        # feeds it (_slot_inputs), applies what it returns (_slot_tick) and
+        # owns every thread, lock and file around it. slot_state mirrors the
+        # scheduler state after each tick; slot_active is true in waiting,
+        # alive and absent, where the plan decides what opens and the 1.11
+        # opening paths stand down.
+        self.slot = slot_scheduler.SlotScheduler()
+        self.slot_state: str = "off"
+        # HTTP threads put work here (see _InboxItem); the monitor thread
+        # drains it. _wake interrupts the loop's waits. Both survive stop()
+        # and start(), so an item submitted while stopped waits for the
+        # next start.
+        self._inbox: queue.Queue = queue.Queue()
+        self._wake = threading.Event()
+        # Held by _slot_tick and the inbox drain (re-entrant: a drain ends
+        # with a replan).
+        self._slot_lock = threading.RLock()
+        # Every read or write of queued_vods, missed_while_paused and
+        # held_save_items, on every thread (acknowledge_rescue still pops
+        # the first two on an HTTP thread). Re-entrant: the flush and the
+        # offer call the drop helpers. Lock order: _slot_lock, _vod_lock,
+        # _rescue_lock, then the module locks.
+        self._vod_lock = threading.RLock()
+        # Incremented by every start(). A loop whose generation is no longer
+        # current (a restart that outlived stop()'s 2 s join) exits without
+        # polling or ticking.
+        self._loop_gen: int = 0
+        self._loop_alive_gen: Optional[int] = None
+        # When the current unbroken run of successful polls that included a
+        # login began (the card verdict's row 5, 12.5 C2).
+        self._watch_start: dict[str, float] = {}
+        self._last_poll_ok_mono: Optional[float] = None
+        # Saved streamers not on the list, polled so their saves lift at
+        # their go-live (12.5 C4).
+        self._saved_extra_logins: list[str] = []
+        # {login: started_at ISO} for every login live in the last successful
+        # poll; a login Helix gave no started_at for keeps the time of the
+        # first poll that saw it until it leaves the live set.
+        self.live_started_at: dict[str, str] = {}
+        self._live_as_of: Optional[float] = None
+        self._poll_authoritative: bool = False
+        # Normal-mode save items waiting for a live streamer's offline edge
+        # (DESIGN 11.5), persisted in slot_state.json as "held".
+        self.held_save_items: dict[str, dict] = {}
+        self._held_dirty: bool = False
+        # Seconds of sleep for the next tick to shift the slot clocks by.
+        self._pending_wake_gap: float = 0.0
+        self._seed_capable_pending: bool = False
+        self._last_slot_tick_mono: float = float("-inf")
+        # Desktop epoch of the last successful slot_state.json write.
+        self._last_slot_persist: Optional[float] = None
+        # The none_ever notice shows once per process (A36).
+        self._never_seen_notified: bool = False
 
         # Paced tab-open queue. Every stream/VOD tab open goes through this
         # queue so consecutive opens are spaced tab_open_spacing seconds
@@ -1773,20 +2606,32 @@ class TwitchMonitor:
         if not self.streamers:
             return {}
 
-        params = [("user_login", name) for name in self.streamers.keys()]
+        monitored = list(self.streamers.keys())
+        params = [("user_login", name) for name in monitored]
 
         # Also check user's own channel if "I'm live" pause is enabled
         own_channel = self.config.own_channel.lower().strip() if self.config.own_channel else ""
         if own_channel and self.config.im_live_pause:
             params.append(("user_login", own_channel))
 
+        # Saved streamers not on the list ride the same request (newest
+        # saves first, 100 logins at most), so their saves lift at their
+        # next go-live (12.5 C4). They never get a tab.
+        extras = self._saved_extra_logins_for_poll(len(params), own_channel)
+        params += [("user_login", name) for name in extras]
+        self._saved_extra_logins = extras
+        self._poll_authoritative = False
+
         try:
             log.debug("Checking streams for: %s", list(self.streamers.keys()))
             data = self._api_get(self.TWITCH_API_URL, params)
             if data is None:
+                # A failed re-auth: not a poll (rule 7), so the scheduler
+                # adds no offline strikes from it.
                 log.warning("API returned None, treating all streamers as offline")
                 return {name: False for name in self.streamers}
 
+            now = _streak_clock()
             live_set = set()
             new_meta: dict[str, dict] = {}
             for stream in data.get("data", []):
@@ -1814,6 +2659,10 @@ class TwitchMonitor:
             else:
                 log.debug("No monitored streamers are live")
 
+            polled = monitored + extras
+            self._note_successful_poll(now, polled, live_set, new_meta)
+            self._lift_saves_of_live_extras(extras, live_set, now)
+
             # Update auto-pause based on user's own channel
             if own_channel and self.config.im_live_pause:
                 was_auto_paused = self.auto_paused
@@ -1830,7 +2679,12 @@ class TwitchMonitor:
                     log_activity("auto_paused_ended", own_channel=own_channel)
                     # Only resume opening if no other pause keeps us paused
                     # (manual `paused` toggle still suppresses).
-                    if not self.paused:
+                    if self.slot_active:
+                        # Slot mode has no rescue offers: the plan resumes
+                        # opening on its own (rule 33).
+                        log.info("Auto-pause lifted in Slot mode: no rescue offer, the plan resumes")
+                        log_activity("rescue_skipped", reason="slot_mode")
+                    elif not self.paused:
                         # v1.7.0: instead of opening everything at once,
                         # publish a rescue offer for the extension's 3-slot
                         # rotation. Falls back to the open-everything path
@@ -1839,6 +2693,7 @@ class TwitchMonitor:
 
             # Update live streamers list for config server
             self.live_streamers = [name for name in self.streamers if name in live_set]
+            self._poll_authoritative = True
 
             return {name: name in live_set for name in self.streamers}
 
@@ -1848,6 +2703,66 @@ class TwitchMonitor:
             err_short = str(e)[:80]
             self.status_callback(f"API error: {err_short}")
             raise  # Let _monitor_loop handle error counting and notifications
+
+    def _saved_extra_logins_for_poll(self, used: int, own_channel: str) -> list:
+        """Saved streamers not on the list and not the own channel, newest
+        saves first, as many as fit next to `used` logins in one Helix
+        request (HELIX_MAX_LOGINS)."""
+        room = HELIX_MAX_LOGINS - used
+        if room <= 0:
+            return []
+        with _streak_state_lock:
+            saved = [(name, _iso_to_epoch(entry.get("at")) or 0.0)
+                     for name, entry in _streak_state["saved"].items() if isinstance(entry, dict)]
+        extras = [(name, at) for name, at in saved
+                  if name not in self.streamers and name != own_channel]
+        extras.sort(key=lambda pair: (-pair[1], pair[0]))
+        return [name for name, _ in extras[:room]]
+
+    def _note_successful_poll(self, now: float, polled: list, live_set: set,
+                              meta: dict) -> None:
+        """Bookkeeping after a successful poll: the polled set (the list plus
+        the extras actually sent), the broadcast starts the scheduler reads
+        (with a substitute when Helix gives none), and the runs of unbroken
+        watching (a run restarts after failed polls for longer than
+        max(3 x check_interval, WATCH_GAP_MIN_SECONDS))."""
+        mono = time.monotonic()
+        gap_limit = max(3 * self.config.check_interval, WATCH_GAP_MIN_SECONDS)
+        watch = self._watch_start
+        if self._last_poll_ok_mono is not None and mono - self._last_poll_ok_mono > gap_limit:
+            watch = {}
+        self._watch_start = {name: watch.get(name, now) for name in polled}
+        self._last_poll_ok_mono = mono
+        self._live_as_of = now
+        started = {}
+        for name in polled:
+            if name not in live_set:
+                continue
+            value = meta.get(name, {}).get("started_at")
+            if isinstance(value, str) and value:
+                started[name] = value
+            else:
+                started[name] = self.live_started_at.get(name) or _epoch_to_iso(now)
+        self.live_started_at = started
+        set_polled_streamers(polled)
+
+    def _lift_saves_of_live_extras(self, extras: list, live_set: set, now: float) -> None:
+        """A saved streamer not on the list who is live now starts a new
+        broadcast on record, which ends a save seen before it (12.5 C4)."""
+        for name in extras:
+            if name not in live_set:
+                continue
+            started = self.live_started_at.get(name)
+            counted_before = _counted_save(name, now) is not None
+            record_stream_live(name, started, fallback_to_now=False, now_epoch=now)
+            if counted_before and _counted_save(name, now) is None:
+                log.info("Save for %s lifted: live since %s", name, started)
+                log_activity("streak_save_lifted", streamer=name, started_at=started)
+
+    def watch_start_for(self, name: str) -> Optional[float]:
+        """When the current unbroken run of successful polls that included
+        `name` began, or None (the watch-start provider)."""
+        return self._watch_start.get(name)
 
     def open_stream(self, username: str):
         url = f"https://twitch.tv/{username}?sm=1"
@@ -1862,6 +2777,17 @@ class TwitchMonitor:
         """True if paused manually or auto-paused because user is live."""
         return self.paused or self.auto_paused
 
+    @property
+    def slot_active(self) -> bool:
+        """True while Slot mode runs the plan (waiting, alive or absent). In
+        none_ever, and with Slot mode off, every 1.11 path runs."""
+        return self.slot_state in ("waiting", "alive", "absent")
+
+    def _publish_queued_vods(self) -> None:
+        with self._vod_lock:
+            snapshot = dict(self.queued_vods)
+        ConfigRequestHandler.config_data["queued_vods"] = snapshot
+
     def _flush_queued_vods(self, reason: str = "unpause") -> int:
         """Hand every queued VOD to the paced open queue and clear the
         VOD queue. Returns the count enqueued.
@@ -1869,13 +2795,22 @@ class TwitchMonitor:
         Called when the pause that gated VOD-queueing lifts. The actual
         opens happen on the tab-open worker, spaced tab_open_spacing
         seconds apart, so a multi-VOD flush doesn't slam the browser
-        with simultaneous tabs.
+        with simultaneous tabs. In Slot mode the plan owns every open, so
+        nothing is flushed.
         """
-        if not self.queued_vods:
+        if self.slot_active:
+            with self._vod_lock:
+                pending = bool(self.queued_vods)
+            if pending:
+                log.info("Not flushing queued VODs (reason=%s): Slot mode runs the plan", reason)
             return 0
-        self._drop_saved_queued_vods()
-        items = list(self.queued_vods.items())
-        self.queued_vods.clear()
+        with self._vod_lock:
+            if not self.queued_vods:
+                return 0
+            self._drop_expired_queued_vods()
+            self._drop_saved_queued_vods()
+            items = list(self.queued_vods.items())
+            self.queued_vods.clear()
         ConfigRequestHandler.config_data["queued_vods"] = {}
         if not items:
             return 0
@@ -1894,25 +2829,50 @@ class TwitchMonitor:
         )
         return count
 
+    def _drop_expired_queued_vods(self) -> None:
+        """Take entries past their save window out of the VOD queue (A8).
+        Only an entry with a parseable deadline_at ever expires."""
+        now = _streak_clock()
+        dropped = False
+        with self._vod_lock:
+            for streamer, entry in list(self.queued_vods.items()):
+                if isinstance(entry, dict) and streak_saves.queued_vod_expired(entry, now):
+                    self.queued_vods.pop(streamer, None)
+                    dropped = True
+                    log.info("Dropping queued save-streak link for %s: its save window closed at %s",
+                             streamer, entry.get("deadline_at"))
+                    log_activity("streak_item_expired", streamer=streamer,
+                                 deadline_at=entry.get("deadline_at"))
+        if dropped:
+            self._publish_queued_vods()
+
     def _drop_saved_queued_vods(self) -> None:
         """Take save-streak links out of the VOD queue for streaks Twitch has
         since confirmed as kept (the page would only say "No Content
         Eligible"), log each as vod_skipped, and republish the queue. Runs
         before every flush and rescue offer, so no path leaves such a link
-        waiting in the queue or the tray menu."""
+        waiting in the queue or the tray menu. A link is covered by the save
+        per save_covers: a card's by its card, a missed broadcast's when the
+        save was seen after the broadcast ended."""
         dropped = False
-        for streamer in list(self.queued_vods):
-            saved_at = streak_saved_since_last_live(streamer)
-            if not saved_at:
-                continue
-            self.queued_vods.pop(streamer, None)
-            dropped = True
-            log.info("Dropping queued save-streak link for %s: streak already saved at %s",
-                     streamer, saved_at)
-            log_activity("vod_skipped", streamer=streamer, reason="streak_already_saved",
-                         saved_at=saved_at)
+        with self._vod_lock:
+            for streamer in list(self.queued_vods):
+                entry = self.queued_vods[streamer]
+                saved = _counted_save(streamer)
+                if not saved:
+                    continue
+                if not streak_saves.queued_vod_covered(
+                        entry if isinstance(entry, dict) else {}, _verdict_save(saved),
+                        self._watch_start.get(streamer)):
+                    continue
+                self.queued_vods.pop(streamer, None)
+                dropped = True
+                log.info("Dropping queued save-streak link for %s: streak already saved at %s",
+                         streamer, saved["at"])
+                log_activity("vod_skipped", streamer=streamer, reason="streak_already_saved",
+                             saved_at=saved["at"])
         if dropped:
-            ConfigRequestHandler.config_data["queued_vods"] = dict(self.queued_vods)
+            self._publish_queued_vods()
 
     def _list_rank(self, name: str) -> int:
         """Position of a streamer in the settings list (0 = top). The list
@@ -1931,27 +2891,31 @@ class TwitchMonitor:
         while we were paused first (save-streak URLs), then streams that
         are still live right now. Within each tier the settings list order
         is the priority (top of the list first), with earliest-ended as
-        the tiebreak for the ended tier."""
-        live_names = sorted(
-            (name for name in list(self.missed_while_paused) if name in live_set),
-            key=self._list_rank,
-        )
-        live_name_set = set(live_names)
-        # A streamer can be in both lists: ended during the pause (VOD
-        # queued) and live again by the time the pause lifted. Watching
-        # the live stream saves the streak, so the live candidate wins
-        # and the save-streak candidate is dropped.
-        ended = []
-        for streamer, entry in self.queued_vods.items():
-            if streamer in live_name_set:
-                continue
-            ended.append({
-                "streamer": streamer,
-                "url": entry["url"],
-                "kind": "ended",
-                "ended_at": entry.get("ended_at"),
-            })
-        ended.sort(key=lambda c: (self._list_rank(c["streamer"]), c.get("ended_at") or ""))
+        the tiebreak for the ended tier. Entries past their save window are
+        dropped first (A8). A candidate is exactly {streamer, url, kind,
+        ended_at}."""
+        with self._vod_lock:
+            self._drop_expired_queued_vods()
+            live_names = sorted(
+                (name for name in list(self.missed_while_paused) if name in live_set),
+                key=self._list_rank,
+            )
+            live_name_set = set(live_names)
+            # A streamer can be in both lists: ended during the pause (VOD
+            # queued) and live again by the time the pause lifted. Watching
+            # the live stream saves the streak, so the live candidate wins
+            # and the save-streak candidate is dropped.
+            ended = []
+            for streamer, entry in self.queued_vods.items():
+                if streamer in live_name_set:
+                    continue
+                ended.append({
+                    "streamer": streamer,
+                    "url": entry["url"],
+                    "kind": "ended",
+                    "ended_at": entry.get("ended_at"),
+                })
+            ended.sort(key=lambda c: (self._list_rank(c["streamer"]), c.get("ended_at") or ""))
         live = [
             {
                 "streamer": name,
@@ -1970,8 +2934,9 @@ class TwitchMonitor:
         everything the old way if no ack arrives in time."""
         # A kept streak's link would land on "No Content Eligible" and waste
         # a rotation slot; it leaves the queue instead of lingering there.
-        self._drop_saved_queued_vods()
-        candidates = self._build_rescue_candidates(live_set)
+        with self._vod_lock:
+            self._drop_saved_queued_vods()
+            candidates = self._build_rescue_candidates(live_set)
         if not candidates:
             return
         offer = {
@@ -1993,31 +2958,54 @@ class TwitchMonitor:
         )
         log_activity("rescue_offered", offer_id=offer["id"], count=len(candidates))
 
-    def acknowledge_rescue(self, offer_id: str) -> bool:
+    def acknowledge_rescue(self, offer_id: str, claimant: Optional[str] = None) -> bool:
         """Called from the HTTP thread when the extension POSTs /rescue_ack.
         Hands ownership of the offered candidates to the extension so the
-        desktop neither flushes them later nor re-opens the live ones."""
+        desktop neither flushes them later nor re-opens the live ones.
+
+        The last acknowledged offer is remembered with its claimant (the
+        "<browser>-<instance>" key, or None). The same named claimant may
+        ack it again within RESCUE_REACK_WINDOW_SECONDS (its first answer
+        may have been lost, AUDIT S7); anyone else gets False (409)."""
+        now = _streak_clock()
         with self._rescue_lock:
             offer = self.rescue_pending
-            if not offer or offer["id"] != offer_id:
-                return False
-            self.rescue_pending = None
-        for cand in offer["candidates"]:
-            name = cand["streamer"]
-            if cand["kind"] == "ended":
-                self.queued_vods.pop(name, None)
+            if offer and offer["id"] == offer_id:
+                self.rescue_pending = None
+                self._last_acked_offer = {"offer": offer, "claimant": claimant, "acked_at": now}
             else:
-                self.missed_while_paused.pop(name, None)
-                # A VOD queued for the same streamer (ended during the
-                # pause, live again now) is covered by the live tab the
-                # extension is about to open; drop it so it can't flush
-                # a duplicate save-streak tab later.
-                self.queued_vods.pop(name, None)
-                state = self.streamers.get(name)
-                if state is not None:
-                    state.browser_opened = True
+                last = self._last_acked_offer
+                reack = (
+                    claimant is not None and last is not None
+                    and last["offer"].get("id") == offer_id
+                    and last["claimant"] == claimant
+                    and now < last["acked_at"] + RESCUE_REACK_WINDOW_SECONDS
+                )
+                if not reack:
+                    return False
+                offer = None
+        if offer is None:
+            log.info("Rescue offer %s acknowledged again by %s", offer_id, claimant)
+            log_activity("rescue_reacked", offer_id=offer_id, claimant=claimant)
+            return True
+        with self._vod_lock:
+            for cand in offer["candidates"]:
+                name = cand["streamer"]
+                if cand["kind"] == "ended":
+                    self.queued_vods.pop(name, None)
+                else:
+                    self.missed_while_paused.pop(name, None)
+                    # A VOD queued for the same streamer (ended during the
+                    # pause, live again now) is covered by the live tab the
+                    # extension is about to open; drop it so it can't flush
+                    # a duplicate save-streak tab later.
+                    self.queued_vods.pop(name, None)
+                    state = self.streamers.get(name)
+                    if state is not None:
+                        state.browser_opened = True
+            queued = dict(self.queued_vods)
         ConfigRequestHandler.config_data["rescue"] = None
-        ConfigRequestHandler.config_data["queued_vods"] = dict(self.queued_vods)
+        ConfigRequestHandler.config_data["queued_vods"] = queued
         log.info(
             "Rescue offer %s acknowledged; extension is rotating %d stream(s)",
             offer_id, len(offer["candidates"]),
@@ -2034,9 +3022,11 @@ class TwitchMonitor:
         open everything the pre-1.7 way.
 
         The blind 180s deadline is meant for an absent extension (browser
-        closed, pre-1.7 version). If /config polls are still arriving the
-        extension is alive and merely failing to ack, so the offer stays
-        published (it will retry on every poll) until the hard deadline."""
+        closed, pre-1.7 version). If the extension is still making guarded
+        POSTs (its /open_tabs reports; a /config poll does not count, see
+        note_extension_contact) it is alive and merely failing to ack, so
+        the offer stays published (it will retry on every poll) until the
+        hard deadline."""
         offer_to_flush = None
         overdue_offer_id = None
         now = time.monotonic()
@@ -2056,7 +3046,7 @@ class TwitchMonitor:
                 offer_to_flush = offer
         if overdue_offer_id is not None:
             log.warning(
-                "Rescue offer %s unacked after %ds but the extension is still polling /config; "
+                "Rescue offer %s unacked after %ds but the extension is still reporting; "
                 "holding the offer up to %ds before falling back",
                 overdue_offer_id, RESCUE_ACK_TIMEOUT_SECONDS, RESCUE_ACK_HARD_TIMEOUT_SECONDS,
             )
@@ -2072,11 +3062,12 @@ class TwitchMonitor:
         opened_live = self._open_still_live_missed_streams(
             set(self.live_streamers), reason="rescue_fallback"
         )
-        for name in opened_live:
-            # Their live tab was just opened; a queued save-streak link
-            # for the same streamer would only open a duplicate tab.
-            if self.queued_vods.pop(name, None) is not None:
-                log.info("Dropped queued VOD for %s: their live stream was just opened", name)
+        with self._vod_lock:
+            for name in opened_live:
+                # Their live tab was just opened; a queued save-streak link
+                # for the same streamer would only open a duplicate tab.
+                if self.queued_vods.pop(name, None) is not None:
+                    log.info("Dropped queued VOD for %s: their live stream was just opened", name)
         self._flush_queued_vods(reason="rescue_fallback")
 
     def _open_still_live_missed_streams(self, live_set: set, reason: str = "unpause") -> list:
@@ -2093,16 +3084,25 @@ class TwitchMonitor:
         Streamers that are no longer live were already handled by the VOD
         fallback when they went offline during the pause (queued + flushed),
         so we only act on the still-live ones here. Opens route through the
-        paced queue. Returns the list of streamer names opened.
+        paced queue. Returns the list of streamer names opened. In Slot mode
+        the plan owns every open, so this opens nothing.
         """
-        if not self.missed_while_paused:
+        if self.slot_active:
+            with self._vod_lock:
+                pending = bool(self.missed_while_paused)
+            if pending:
+                log.info("Not opening missed live streams (reason=%s): Slot mode runs the plan", reason)
             return []
-        still_live = sorted(
-            (name for name in list(self.missed_while_paused) if name in live_set),
-            key=self._list_rank,
-        )
+        with self._vod_lock:
+            if not self.missed_while_paused:
+                return []
+            still_live = sorted(
+                (name for name in list(self.missed_while_paused) if name in live_set),
+                key=self._list_rank,
+            )
+            for name in still_live:
+                self.missed_while_paused.pop(name, None)
         for name in still_live:
-            self.missed_while_paused.pop(name, None)
             state = self.streamers.get(name)
             if state is not None:
                 state.browser_opened = True  # so process_state_changes won't re-open/skip-confuse
@@ -2120,6 +3120,149 @@ class TwitchMonitor:
             )
         return still_live
 
+    # -- normal-mode save items (DESIGN 11.5, A32) ----------------------------
+
+    def _live_with_tab(self, login: str) -> bool:
+        """The streamer is live and a report received within
+        SLOT_EXECUTOR_ALIVE_SECONDS lists their tab."""
+        if login not in self.live_streamers:
+            return False
+        mono = time.monotonic()
+        for rep in extension_open_tabs_snapshot().values():
+            if (mono - rep.get("mono", float("-inf")) <= slot_scheduler.SLOT_EXECUTOR_ALIVE_SECONDS
+                    and login in rep.get("streamers", ())):
+                return True
+        return False
+
+    @staticmethod
+    def _merge_queued_vod(existing: dict, item: dict, now: float) -> tuple:
+        """(entry, changed): a save item merged into a queued_vods entry,
+        the earlier open deadline winning. An entry with an embedded item
+        merges item by item (3.8); an entry without one (a VOD-fallback
+        link) takes the item, keeping its own deadline when that is earlier
+        and still open."""
+        login = item["login"]
+        embedded = streak_saves.clean_item(existing.get("item"), login) if isinstance(existing, dict) else None
+        if embedded is not None:
+            merged, _ = streak_saves.merge_items(embedded, item, now)
+            entry = streak_saves.item_to_queued_vod(merged)
+            return entry, entry != existing
+        entry = streak_saves.item_to_queued_vod(item)
+        old_deadline = _iso_to_epoch(existing.get("deadline_at")) if isinstance(existing, dict) else None
+        if (old_deadline is not None and old_deadline < item["deadline_at"]
+                and not streak_saves.queued_vod_expired(existing, now)):
+            entry["deadline_at"] = existing["deadline_at"]
+            entry["item"]["deadline_at"] = old_deadline
+        return entry, entry != existing
+
+    def _normal_save_item(self, item: dict, merge_only: bool = False, reason: str = "card",
+                          offer: bool = True) -> bool:
+        """Slot mode off (or no capable extension yet): a save item rides a
+        rescue offer (A32). Held until the offline edge while the streamer
+        is live with a tab; otherwise queued in queued_vods and offered
+        unless paused (a pending unacked offer is republished with a new
+        id; offer False leaves that to the caller). A held item whose
+        streamer is no longer live with a tab becomes its page check first,
+        and the incoming item merges into that entry. merge_only merges into
+        an existing entry or held item and never creates one. Returns True
+        when something was created or changed."""
+        now = _streak_clock()
+        login = item["login"]
+        if item.get("origin") != "manual" and not self.config.auto_save_streaks:
+            return False
+        if streak_saves.item_expired(item, now):
+            log_activity("streak_item_expired", streamer=login,
+                         deadline_at=_epoch_to_iso(item["deadline_at"]))
+            return False
+        saved = _counted_save(login, now)
+        if streak_saves.save_covers(item, _verdict_save(saved), self._watch_start.get(login)):
+            log_activity("vod_skipped", streamer=login, reason="streak_already_saved",
+                         saved_at=saved["at"])
+            return False
+        live_tab = self._live_with_tab(login)
+        created_entry = False
+        moved = False
+        with self._vod_lock:
+            held = self.held_save_items.get(login)
+            queued = self.queued_vods.get(login)
+            if merge_only and held is None and queued is None:
+                return False
+            if held is not None and not live_tab:
+                # The broadcast it waited for is over (its end fell in a
+                # downtime) or the tab is gone: the held item becomes the
+                # page check now, as at the offline edge (O1 (a)).
+                del self.held_save_items[login]
+                self._held_dirty = True
+                check = dict(held, verify=True)
+                if queued is not None:
+                    queued, _ = self._merge_queued_vod(queued, check, now)
+                else:
+                    queued = streak_saves.item_to_queued_vod(check)
+                    created_entry = True
+                self.queued_vods[login] = queued
+                held = None
+                moved = True
+            if held is not None or (queued is None and live_tab):
+                # Their live tab is the remedy for now; the save-streak page
+                # gets a check once the broadcast ends (O1 (a)).
+                if held is not None:
+                    stored, changed = streak_saves.merge_items(held, item, now)
+                    if not changed:
+                        return False
+                else:
+                    stored = item
+                self.held_save_items[login] = stored
+                self._held_dirty = True
+                entry = None
+            else:
+                if queued is not None:
+                    entry, changed = self._merge_queued_vod(queued, item, now)
+                    if not changed and not moved:
+                        return False
+                    stored = entry["item"]
+                else:
+                    entry = streak_saves.item_to_queued_vod(item)
+                    stored = item
+                    created_entry = True
+                self.queued_vods[login] = entry
+            snapshot = dict(self.queued_vods)
+        log_activity(
+            "streak_item_added",
+            streamer=login,
+            kind=stored["kind"],
+            deadline_at=_epoch_to_iso(stored["deadline_at"]),
+            origin=stored["origin"],
+            verify=bool(stored.get("verify")),
+            merged=held is not None or queued is not None,
+            mode="normal",
+        )
+        if entry is None:
+            log.info("Save item for %s held until their broadcast ends (their tab is open)", login)
+            return True
+        ConfigRequestHandler.config_data["queued_vods"] = snapshot
+        log.info("Save-streak link for %s queued (reason=%s)", login, reason)
+        log_activity("vod_queued", streamer=login, url=entry["url"], reason=reason)
+        if offer and created_entry and not self.effectively_paused:
+            self._offer_rescue_or_flush(set(self.live_streamers))
+        return True
+
+    def _normal_item_done(self, login: str, saved_at: Optional[str]) -> bool:
+        """Twitch says the streamer's streak is kept: their held item and
+        their queued save-streak link go (Slot mode off)."""
+        with self._vod_lock:
+            held = self.held_save_items.pop(login, None)
+            queued = self.queued_vods.pop(login, None)
+            if held is not None:
+                self._held_dirty = True
+            snapshot = dict(self.queued_vods)
+        if held is None and queued is None:
+            return False
+        if queued is not None:
+            ConfigRequestHandler.config_data["queued_vods"] = snapshot
+        log.info("Dropping %s's pending save: streak already saved at %s", login, saved_at)
+        log_activity("vod_skipped", streamer=login, reason="streak_already_saved", saved_at=saved_at)
+        return True
+
     def process_state_changes(self, current_status: dict[str, bool]):
         live_count = 0
         # Update config server with live status
@@ -2128,8 +3271,9 @@ class TwitchMonitor:
         ConfigRequestHandler.config_data["auto_paused"] = self.auto_paused
         # Surface the queue so the extension popup and any future UI can
         # show which VODs are waiting for the pause to lift.
-        ConfigRequestHandler.config_data["queued_vods"] = dict(self.queued_vods)
+        self._publish_queued_vods()
         publish_saved_streaks()
+        offer_held_checks = False
 
         # List order is the priority when several streamers go live on the
         # same poll: opens are enqueued top-of-list first.
@@ -2159,7 +3303,14 @@ class TwitchMonitor:
                     )
 
                     claimed_by = self._browsers_with_tab_open(username)
-                    if claimed_by:
+                    if self.slot_active:
+                        # Slot mode: the plan decides when this stream gets
+                        # a tab (a Keep Open slot, a turn, or idle).
+                        log.info("Skipping tab open for %s: Slot mode runs the plan", username)
+                        log_activity("tab_open_skipped", streamer=username, reason="slot_mode")
+                        self.status_callback(f"{username} went LIVE! (Slot mode)")
+                        state.browser_opened = True
+                    elif claimed_by:
                         # Already open in the browser (per the extension's
                         # last report): no second tab. Settled later by
                         # _reconcile_startup_skips.
@@ -2180,7 +3331,8 @@ class TwitchMonitor:
                         log.info("Skipping tab open for %s (effectively paused)", username)
                         self.status_callback(f"{username} went LIVE! (paused)")
                         # Track missed streams while paused
-                        self.missed_while_paused[username] = time.strftime("%H:%M:%S")
+                        with self._vod_lock:
+                            self.missed_while_paused[username] = time.strftime("%H:%M:%S")
                         log_activity(
                             "tab_open_skipped",
                             streamer=username,
@@ -2212,6 +3364,21 @@ class TwitchMonitor:
                     self.status_callback(f"{username} went offline")
                     log_activity("stream_offline", streamer=username)
 
+                    if self.slot_active:
+                        # Slot mode: an unserved broadcast gets its save turn
+                        # from the scheduler (rule 24), never a link here.
+                        # Nothing is ever missed while paused in Slot mode,
+                        # so the end ends a save seen during the broadcast
+                        # exactly when the scheduler did not serve it (A31).
+                        with self._vod_lock:
+                            self.missed_while_paused.pop(username, None)
+                        with self._slot_lock:
+                            served = self.slot.is_broadcast_served(username)
+                        record_stream_offline(username, missed=not served)
+                        state.was_live = False
+                        state.browser_opened = False
+                        continue
+
                     # VOD fallback now fires ONLY when this exact stream was
                     # skipped earlier because Stream Monitor was paused or
                     # auto-paused (im_live_pause for "I'm live"). Previously
@@ -2224,7 +3391,8 @@ class TwitchMonitor:
                     # deep link with ?sm=1 so the extension tracks the tab
                     # and applies the same auto-mute / low-quality /
                     # player-keepalive treatment as a normal stream tab.
-                    was_skipped_due_to_pause = username in self.missed_while_paused
+                    with self._vod_lock:
+                        was_skipped_due_to_pause = username in self.missed_while_paused
                     # An "already maintained" seen while a broadcast skipped
                     # for a pause ran could only speak for the broadcasts
                     # before it, and the owner missed this one, so that save
@@ -2238,20 +3406,39 @@ class TwitchMonitor:
                         # Stale entries used to survive here when the
                         # fallback was disabled and could trigger a
                         # duplicate open on a much later pause lift.
-                        self.missed_while_paused.pop(username, None)
+                        with self._vod_lock:
+                            self.missed_while_paused.pop(username, None)
                     if was_skipped_due_to_pause and self.config.vod_fallback:
                         save_streak_url = f"https://www.twitch.tv/save-streak/{username}?sm=1"
                         if self.effectively_paused:
-                            self.queued_vods[username] = {
-                                "url": save_streak_url,
-                                # Rescue-queue priority key: earliest-ended
-                                # streams have the least save window left.
-                                "ended_at": _activity_timestamp(),
-                            }
+                            ended_at = _streak_clock()
+                            with self._vod_lock:
+                                existing = self.queued_vods.get(username)
+                                if existing is not None:
+                                    # One entry per streamer (plan 3.8, A32): a
+                                    # queued card or check keeps the earlier
+                                    # open deadline.
+                                    missed_item = streak_saves.make_missed_item(
+                                        username, ended_at, self.config.check_interval,
+                                        None, ended_at)
+                                    self.queued_vods[username], _ = self._merge_queued_vod(
+                                        existing, missed_item, ended_at)
+                                else:
+                                    self.queued_vods[username] = {
+                                        "url": save_streak_url,
+                                        # Rescue-queue priority key: earliest-ended
+                                        # streams have the least save window left.
+                                        "ended_at": _epoch_to_iso(ended_at),
+                                        # Past this the link is dropped (A8).
+                                        "deadline_at": _epoch_to_iso(
+                                            ended_at + streak_saves.SAVE_WINDOW_HOURS * 3600),
+                                        "origin": "offline_edge",
+                                    }
+                                queue_size = len(self.queued_vods)
                             reason = "auto_paused" if self.auto_paused else "paused"
                             log.info(
                                 "Save-streak URL for %s queued (reason=%s, queue size now %d)",
-                                username, reason, len(self.queued_vods),
+                                username, reason, queue_size,
                             )
                             log_activity(
                                 "vod_queued",
@@ -2266,6 +3453,8 @@ class TwitchMonitor:
                         else:
                             self.status_callback(f"Opening save-streak page for {username}")
                             self._enqueue_tab_open("vod", username, save_streak_url)
+                    if self._queue_held_check(username):
+                        offer_held_checks = True
 
                     state.was_live = False
                     state.browser_opened = False
@@ -2276,6 +3465,25 @@ class TwitchMonitor:
                     # over now. Nobody knows if it was watched, so it counts
                     # as missed: a lost alert costs more than a stale one.
                     record_stream_offline(username, only_if_open=True)
+                    # A held item waits for its streamer's offline edge (O1
+                    # (a)). A fresh start, or Slot mode turned off after an
+                    # offline edge it took, never sees that edge, so a poll
+                    # that finds the streamer offline releases it as the
+                    # check. A failed re-auth poll is not a poll (rule 7).
+                    if (not self.slot_active and self._poll_authoritative
+                            and self._queue_held_check(username)):
+                        offer_held_checks = True
+
+        if not self.slot_active and self._poll_authoritative:
+            # A streamer taken off the list has no offline edge to wait for.
+            with self._vod_lock:
+                unlisted = [login for login in self.held_save_items if login not in self.streamers]
+            for login in sorted(unlisted):
+                if self._queue_held_check(login):
+                    offer_held_checks = True
+
+        if offer_held_checks and not self.effectively_paused:
+            self._offer_rescue_or_flush(set(self.live_streamers))
 
         if self.auto_paused:
             if live_count > 0:
@@ -2296,86 +3504,516 @@ class TwitchMonitor:
         # a stream that goes live later gets a tab as usual.
         self._startup_seed = {}
         self._reconcile_startup_skips(current_status)
-    
+        # The scheduler runs after every poll; a poll that failed re-auth is
+        # not authoritative (rule 7). A scheduler error is logged as such,
+        # never counted as an API failure by the loop.
+        authoritative = self._poll_authoritative
+        self._poll_authoritative = False
+        self._safe_slot_tick(authoritative=authoritative)
+
+    def _queue_held_check(self, username: str) -> bool:
+        """At a streamer's offline edge (Slot mode off), their held save item
+        becomes a check of the save-streak page (O1 (a)): queued with
+        verify true. Returns True when an entry was queued."""
+        now = _streak_clock()
+        with self._vod_lock:
+            held = self.held_save_items.pop(username, None)
+            if held is None:
+                return False
+            self._held_dirty = True
+            item = dict(held, verify=True)
+            existing = self.queued_vods.get(username)
+            if existing is not None:
+                entry, _ = self._merge_queued_vod(existing, item, now)
+                entry["verify"] = True
+                entry["item"]["verify"] = True
+            else:
+                entry = streak_saves.item_to_queued_vod(item)
+            self.queued_vods[username] = entry
+            snapshot = dict(self.queued_vods)
+        ConfigRequestHandler.config_data["queued_vods"] = snapshot
+        log.info("Save-streak check for %s queued: their broadcast ended", username)
+        log_activity("vod_queued", streamer=username, url=entry["url"], reason="held_check")
+        return True
+
+    # -- the monitor loop -----------------------------------------------------
+
+    def _loop_current(self, gen: int) -> bool:
+        return self.running and self._loop_gen == gen
+
+    def _note_loop_gap(self, gap: float) -> None:
+        """A loop iteration took more than twice check_interval: the system
+        likely slept. The sleep (the gap less one interval) shifts the slot
+        clocks on the next tick, and every run of unbroken watching
+        restarts (sleep never counts as watch time)."""
+        expected_gap = self.config.check_interval
+        log.warning(
+            "Long loop gap: %.1fs (expected ~%ds, system likely slept)",
+            gap, expected_gap,
+        )
+        log_activity(
+            "wake_detected",
+            gap_seconds=round(gap, 1),
+            expected_seconds=expected_gap,
+        )
+        self._pending_wake_gap += max(0.0, gap - expected_gap)
+        self._watch_start = {}
+
     def _monitor_loop(self):
+        # The generation this loop belongs to: start() stamps it on the
+        # thread; a loop from an older start() stops at its next check.
+        gen = getattr(threading.current_thread(), "_sm_loop_gen", self._loop_gen)
+        self._loop_alive_gen = gen
         log.info("Monitor loop started (interval: %ds)", self.config.check_interval)
         last_iteration_mono = time.monotonic()
-        while self.running:
-            # Detect long gaps that suggest the system was asleep/hibernating.
-            # Helpful for cross-checking missed streams against power events.
-            now_mono = time.monotonic()
-            gap = now_mono - last_iteration_mono
-            last_iteration_mono = now_mono
-            expected_gap = self.config.check_interval
-            if gap > expected_gap * 2:
-                log.warning(
-                    "Long loop gap: %.1fs (expected ~%ds, system likely slept)",
-                    gap, expected_gap,
-                )
-                log_activity(
-                    "wake_detected",
-                    gap_seconds=round(gap, 1),
-                    expected_seconds=expected_gap,
-                )
+        try:
+            while self._loop_current(gen):
+                # Detect long gaps that suggest the system was asleep/hibernating.
+                # Helpful for cross-checking missed streams against power events.
+                now_mono = time.monotonic()
+                gap = now_mono - last_iteration_mono
+                last_iteration_mono = now_mono
+                if gap > self.config.check_interval * 2:
+                    self._note_loop_gap(gap)
 
-            try:
-                current_status = self.check_streams()
-                if current_status:
-                    self.process_state_changes(current_status)
-                    if self.consecutive_errors > 0:
-                        log.info("API recovered after %d consecutive error(s)", self.consecutive_errors)
-                        self.notify_callback("Stream Monitor", "Connection restored! Monitoring is working again.")
-                        log_activity(
-                            "api_recovered",
-                            recovered_after=self.consecutive_errors,
-                        )
-                    self.consecutive_errors = 0
-            except Exception as e:
-                self.consecutive_errors += 1
-                log.error("Unexpected error in monitor loop (streak: %d): %s", self.consecutive_errors, e, exc_info=True)
-                log_activity(
-                    "api_error",
-                    error=str(e)[:200],
-                    consecutive_errors_streak=self.consecutive_errors,
-                )
-                if self.consecutive_errors == 1:
-                    self.status_callback("Error: API connection failed")
-                    self.notify_callback(
-                        "Stream Monitor - Error",
-                        f"API calls are failing: {e}\nStreams won't open until this is resolved. Try restarting Stream Monitor."
-                    )
-                elif self.consecutive_errors == 5:
-                    self.status_callback("Error: API still failing")
-                    self.notify_callback(
-                        "Stream Monitor - Error",
-                        "API has been failing for 5 minutes. Stream Monitor needs to be restarted."
-                    )
-
-            # Rescue-offer watchdog: runs even when the API check above
-            # failed, so a network blip can't strand an unacked offer.
-            try:
-                self._maybe_fallback_rescue()
-            except Exception as e:
-                log.error("Rescue fallback check failed: %s", e)
-
-            for _ in range(self.config.check_interval):
-                if not self.running:
+                # Items submitted while this loop polled, or while the
+                # monitor was stopped, first.
+                self._drain_inbox()
+                if not self._loop_current(gen):
                     break
-                time.sleep(1)
-    
+
+                try:
+                    current_status = self.check_streams()
+                    if not self._loop_current(gen):
+                        break
+                    if current_status:
+                        self.process_state_changes(current_status)
+                        if self.consecutive_errors > 0:
+                            log.info("API recovered after %d consecutive error(s)", self.consecutive_errors)
+                            self.notify_callback("Stream Monitor", "Connection restored! Monitoring is working again.")
+                            log_activity(
+                                "api_recovered",
+                                recovered_after=self.consecutive_errors,
+                            )
+                        self.consecutive_errors = 0
+                except Exception as e:
+                    self.consecutive_errors += 1
+                    log.error("Unexpected error in monitor loop (streak: %d): %s", self.consecutive_errors, e, exc_info=True)
+                    log_activity(
+                        "api_error",
+                        error=str(e)[:200],
+                        consecutive_errors_streak=self.consecutive_errors,
+                    )
+                    if self.consecutive_errors == 1:
+                        self.status_callback("Error: API connection failed")
+                        self.notify_callback(
+                            "Stream Monitor - Error",
+                            f"API calls are failing: {e}\nStreams won't open until this is resolved. Try restarting Stream Monitor."
+                        )
+                    elif self.consecutive_errors == 5:
+                        self.status_callback("Error: API still failing")
+                        self.notify_callback(
+                            "Stream Monitor - Error",
+                            "API has been failing for 5 minutes. Stream Monitor needs to be restarted."
+                        )
+
+                if not self._loop_current(gen):
+                    break
+                # Rescue-offer watchdog: runs even when the API check above
+                # failed, so a network blip can't strand an unacked offer.
+                try:
+                    self._maybe_fallback_rescue()
+                except Exception as e:
+                    log.error("Rescue fallback check failed: %s", e)
+                # The slot watchdog: executor liveness, the startup grace and
+                # absent-mode opens need no fresh poll.
+                self._safe_slot_tick()
+
+                self._wait_between_polls(gen)
+        finally:
+            if self._loop_alive_gen == gen:
+                self._loop_alive_gen = None
+
+    def _wait_between_polls(self, gen: int) -> None:
+        """Wait check_interval seconds in slices of at most 1 s. A wake
+        (an inbox item, stop()) drains the inbox and replans at once, and
+        the scheduler re-evaluates at least every SLOT_TICK_MAX_GAP_SECONDS
+        (rule 45)."""
+        deadline = time.monotonic() + self.config.check_interval
+        while self._loop_current(gen):
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                return
+            next_tick_in = self._last_slot_tick_mono + SLOT_TICK_MAX_GAP_SECONDS - now
+            if next_tick_in <= 0:
+                self._safe_slot_tick()
+                continue
+            if self._wake.wait(max(0.01, min(1.0, remaining, next_tick_in))):
+                self._wake.clear()
+                if not self._loop_current(gen):
+                    return
+                self._drain_inbox()
+
+    def _safe_slot_tick(self, authoritative: bool = False, quiet: bool = False) -> None:
+        try:
+            if quiet:
+                self._slot_tick(authoritative=authoritative, quiet=True)
+            else:
+                self._slot_tick(authoritative=authoritative)
+        except Exception as e:
+            # Counted as a tick, so the wait loop does not retry at once.
+            self._last_slot_tick_mono = time.monotonic()
+            log.error("Slot tick failed: %s", e, exc_info=True)
+
+    def submit(self, kind: str, payload: dict) -> _InboxItem:
+        """Called on an HTTP thread (through the registered submitter): put
+        an item on the inbox and wake the loop. The handler may wait only
+        while this monitor's loop runs with a current generation (A6)."""
+        item = _InboxItem(kind, payload,
+                          waitable=self.running and self._loop_alive_gen == self._loop_gen)
+        self._inbox.put(item)
+        self._wake.set()
+        return item
+
+    def _drain_inbox(self) -> None:
+        """Process every queued inbox item on this (the monitor) thread,
+        replan once, then release the waiting handlers."""
+        items = []
+        while True:
+            try:
+                items.append(self._inbox.get_nowait())
+            except queue.Empty:
+                break
+        if not items:
+            return
+        try:
+            with self._slot_lock:
+                for item in items:
+                    try:
+                        item.result = self._process_inbox_item(item)
+                    except Exception as e:
+                        log.error("Inbox item %s failed: %s", item.kind, e, exc_info=True)
+                        item.result = False
+                self._safe_slot_tick()
+        finally:
+            for item in items:
+                item.done.set()
+
+    def _process_inbox_item(self, item: _InboxItem) -> bool:
+        payload = item.payload if isinstance(item.payload, dict) else {}
+        if item.kind == "streak_item":
+            save_item = streak_saves.clean_item(payload.get("item"))
+            if save_item is None:
+                return False
+            merge_only = payload.get("merge_only") is True
+            if self.slot_active:
+                changed, events = self.slot.add_item(
+                    save_item, self._slot_inputs(False, for_tick=False), merge_only)
+                self._log_slot_events(events)
+                return bool(changed)
+            return self._normal_save_item(save_item, merge_only=merge_only, reason="card")
+        if item.kind == "item_done":
+            login = payload.get("login")
+            if not isinstance(login, str):
+                return False
+            if self.slot_active:
+                completed, events = self.slot.complete_item(
+                    login, str(payload.get("reason") or "already_saved"), _streak_clock())
+                self._log_slot_events(events)
+                return bool(completed)
+            return self._normal_item_done(login, payload.get("saved_at"))
+        if item.kind == "report":
+            return True
+        log.warning("Unknown inbox item kind: %r", item.kind)
+        return False
+
+    # -- the Slot mode tick ----------------------------------------------------
+
+    def _slot_inputs(self, authoritative: bool, for_tick: bool = True) -> dict:
+        """The scheduler's inputs (plan 3.13). for_tick False builds them for
+        add_item: nothing is drained or consumed."""
+        now = _streak_clock()
+        mono = time.monotonic()
+        rank: dict[str, int] = {}
+        for name in self.config.streamers:
+            if isinstance(name, str):
+                rank.setdefault(name.lower(), len(rank))
+        listed = frozenset(rank)
+        pinned = frozenset(
+            name.lower() for name in (self.config.pinned_streamers or []) if isinstance(name, str)
+        ) & listed
+        poll = None
+        if authoritative:
+            poll = {name: started for name, started in self.live_started_at.items()
+                    if name in self.streamers}
+        reports = {}
+        for key, rep in extension_open_tabs_snapshot().items():
+            reports[key] = {
+                "browser": rep.get("browser", key),
+                "streamers": rep.get("streamers", frozenset()),
+                "epoch": rep.get("epoch"),
+                "mono": rep.get("mono"),
+                "plan_seq": rep.get("plan_seq"),
+                "busy": rep.get("busy"),
+            }
+        gone = []
+        wake_gap = 0.0
+        seed_capable = False
+        absorb = {}
+        if for_tick:
+            gone = drain_open_tabs_gone()
+            wake_gap = self._pending_wake_gap
+            self._pending_wake_gap = 0.0
+            seed_capable = self._seed_capable_pending
+            self._seed_capable_pending = False
+            absorb = self._absorb_snapshot(now)
+        return {
+            "now": now,
+            "mono": mono,
+            "authoritative": bool(authoritative),
+            "poll": poll,
+            "live_as_of": self._live_as_of,
+            "check_interval": self.config.check_interval,
+            "rank": rank,
+            "listed": listed,
+            "pinned": pinned,
+            "slot_mode": bool(self.config.slot_mode),
+            "auto_save": bool(self.config.auto_save_streaks),
+            "K": self.config.keep_open_slots,
+            "C": self.config.cycle_slots,
+            "M": self.config.slot_minutes * 60,
+            "paused": self.effectively_paused,
+            "auto_paused": self.auto_paused,
+            "reports": reports,
+            "gone": gone,
+            "default_browser": default_browser_family(),
+            "saves": _counting_saves(now),
+            "watch_start": dict(self._watch_start),
+            "wake_gap": wake_gap,
+            "seed_capable": seed_capable,
+            "absorb": absorb,
+        }
+
+    def _absorb_snapshot(self, now: float) -> dict:
+        """What Slot mode absorbs when it becomes active (DESIGN S2a): the
+        VOD queue, the held items, a pending offer, and the last acked offer
+        while it is younger than LAST_ACKED_OFFER_TTL_SECONDS."""
+        with self._vod_lock:
+            vods = {k: dict(v) for k, v in self.queued_vods.items() if isinstance(v, dict)}
+            held = {k: dict(v) for k, v in self.held_save_items.items()}
+        with self._rescue_lock:
+            pending = dict(self.rescue_pending) if self.rescue_pending else None
+            last = self._last_acked_offer
+            if last is not None and now - last["acked_at"] >= LAST_ACKED_OFFER_TTL_SECONDS:
+                self._last_acked_offer = last = None
+            last = dict(last) if last is not None else None
+        return {"queued_vods": vods, "held": held, "pending_offer": pending,
+                "last_acked_offer": last}
+
+    def _slot_tick(self, authoritative: bool = False, quiet: bool = False):
+        """Run the scheduler once and apply what it returns: log its events
+        in order, withdraw and clear what an activation absorbed, run the
+        off transition, enqueue absent-mode opens, publish the plan in one
+        assignment, persist slot_state.json, show notices and the tooltip
+        (not when quiet). A loop of an older generation does nothing.
+        Returns the TickResult, or None when skipped."""
+        gen = getattr(threading.current_thread(), "_sm_loop_gen", None)
+        if gen is not None and gen != self._loop_gen:
+            return None
+        with self._slot_lock:
+            inp = self._slot_inputs(authoritative)
+            result = self.slot.tick(inp)
+            self._last_slot_tick_mono = time.monotonic()
+            self.slot_state = result.state
+            if result.absorbed:
+                self._absorb_for_slot_mode()
+            self._log_slot_events(result.events)
+            if result.off_transition is not None:
+                self._apply_off_transition(result.off_transition)
+            for op in result.opens:
+                self._enqueue_tab_open(op["kind"], op["streamer"], op["url"],
+                                       queue_reason="slot_fallback")
+            ConfigRequestHandler.config_data["slot_plan"] = result.plan
+            # Also refreshed while nothing changes (and after a clock step
+            # back), so saved_at stays current for a quick restart.
+            last = self._last_slot_persist
+            if (result.persist or self._held_dirty or last is None
+                    or not 0 <= inp["now"] - last < SLOT_STATE_REFRESH_SECONDS):
+                self._persist_slot_state(inp["now"])
+            if quiet:
+                return result
+            self._show_slot_notices(result.notices)
+            if self.config.slot_mode and result.tooltip:
+                self.status_callback(result.tooltip)
+            return result
+
+    def prime_slot_plan(self) -> None:
+        """At launch, before the config server answers its first request:
+        load slot_state.json and publish a plan, so /config never serves a
+        null plan while Slot mode is on (3.2; a null plan tells the
+        extension Slot mode is off, and it would strip its slot markers).
+        Quiet: start() reloads and ticks for real before the first poll
+        (A10), and its tick shows the notices and the tooltip."""
+        self._load_slot_state()
+        self._safe_slot_tick(quiet=True)
+
+    def _log_slot_events(self, events) -> None:
+        for name, fields in events:
+            log_activity(name, **fields)
+            log.debug("Slot: %s %s", name, fields)
+
+    def _absorb_for_slot_mode(self) -> None:
+        """Slot mode became active and the scheduler took in the leftovers
+        (rule 33): withdraw a pending rescue offer, and clear the VOD queue,
+        the missed-while-paused list, the held items and the last acked
+        offer, so nothing is absorbed twice or opened the 1.11 way."""
+        with self._rescue_lock:
+            offer = self.rescue_pending
+            self.rescue_pending = None
+        ConfigRequestHandler.config_data["rescue"] = None
+        if offer:
+            log.info("Rescue offer %s withdrawn: Slot mode is active", offer["id"])
+            log_activity("rescue_withdrawn", offer_id=offer["id"], reason="slot_mode")
+        with self._vod_lock:
+            self.queued_vods.clear()
+            self.missed_while_paused.clear()
+            if self.held_save_items:
+                self.held_save_items = {}
+                self._held_dirty = True
+            with self._rescue_lock:
+                self._last_acked_offer = None
+        ConfigRequestHandler.config_data["queued_vods"] = {}
+
+    def _apply_off_transition(self, off: dict) -> None:
+        """Slot mode was turned off (rule 46): every live stream without a
+        tab, except one dismissed for its current broadcast, opens the 1.11
+        way (paced), or is recorded as missed while paused; pending save
+        items move to the normal path."""
+        opened = []
+        for login in off.get("open_live") or []:
+            state = self.streamers.get(login)
+            if state is None:
+                continue
+            if self.effectively_paused:
+                with self._vod_lock:
+                    self.missed_while_paused[login] = time.strftime("%H:%M:%S")
+                state.browser_opened = False
+                log_activity("tab_open_skipped", streamer=login,
+                             reason="auto_paused" if self.auto_paused else "paused")
+            else:
+                state.browser_opened = True
+                self.open_stream(login)
+                opened.append(login)
+        if opened:
+            log.info("Slot mode off: opening %d live stream(s) without a tab: %s",
+                     len(opened), opened)
+        with self._vod_lock:
+            queued_before = set(self.queued_vods)
+        for item in off.get("items") or []:
+            clean = streak_saves.clean_item(item)
+            if clean is not None:
+                self._normal_save_item(clean, reason="slot_mode_off", offer=False)
+        with self._vod_lock:
+            queued_new = set(self.queued_vods) - queued_before
+        if queued_new and not self.effectively_paused:
+            self._offer_rescue_or_flush(set(self.live_streamers))
+
+    def _show_slot_notices(self, notices) -> None:
+        k, c, m = self.config.keep_open_slots, self.config.cycle_slots, self.config.slot_minutes
+        for notice in notices:
+            if notice == "activated":
+                self.notify_callback(
+                    "Stream Monitor",
+                    f"Slot mode on: {k} Keep Open + {c} rotating, {m} min per turn",
+                )
+            elif notice == "outage":
+                self.notify_callback(
+                    "Stream Monitor",
+                    "Slot mode: the browser extension stopped reporting. "
+                    f"Opening at most {k + c} streams until it is back.",
+                )
+            elif notice == "none_ever":
+                if self._never_seen_notified:
+                    continue
+                self._never_seen_notified = True
+                self.notify_callback(
+                    "Stream Monitor",
+                    "Slot mode needs browser extension 1.12 or newer. "
+                    "Opening streams normally until it connects.",
+                )
+
+    def _slot_state_path(self) -> Path:
+        return CONFIG_DIR / "slot_state.json"
+
+    def _persist_slot_state(self, now: float) -> None:
+        """Write slot_state.json atomically (tmp plus _replace_with_retry):
+        the scheduler's state and the held items. Never raises. The callers
+        hold _slot_lock, also through the replace retries."""
+        data = self.slot.to_state(now)
+        with self._vod_lock:
+            data["held"] = {k: dict(v) for k, v in self.held_save_items.items()}
+            self._held_dirty = False
+        path = self._slot_state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            _replace_with_retry(tmp, path)
+            self._last_slot_persist = now
+        except (OSError, TypeError, ValueError) as e:
+            log.warning("Could not write %s: %s", path, e)
+
+    def _load_slot_state(self) -> None:
+        """A fresh start: restore the scheduler and the held items from
+        slot_state.json (a missing or malformed file means an empty state),
+        restart the 90 s grace, and seed the capability flag from a recent
+        report of a capable extension (A24)."""
+        now = _streak_clock()
+        try:
+            data = json.loads(self._slot_state_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict) or data.get("v") != 1:
+            data = {}
+        with self._slot_lock:
+            self.slot.load_state(data, now)
+            held = {}
+            raw_held = data.get("held")
+            for login, raw in (raw_held.items() if isinstance(raw_held, dict) else ()):
+                if not (isinstance(login, str) and _OPEN_TABS_LOGIN_RE.match(login)):
+                    continue
+                item = streak_saves.clean_item(raw, login)
+                if item is not None and not streak_saves.item_expired(item, now):
+                    held[login] = item
+            with self._vod_lock:
+                self.held_save_items = held
+            self._seed_capable_pending = (
+                not self.slot.executor_seen
+                and persisted_capable_report_within(slot_scheduler.SLOT_STATE_MAX_AGE_SECONDS)
+            )
+            self.slot.reset_startup(time.monotonic())
+            self.slot_state = "off"
+
     def start(self, preserve_state: bool = False) -> bool:
         """Begin monitoring. With preserve_state, streamers still on the
         list keep their live/opened state across the restart a settings
         change triggers, so a stream that is live with a tab open is not
         opened a second time (the old restart reset every streamer to
         "never seen" and re-opened everything live). A manual Start from
-        the tray still begins from a clean slate."""
+        the tray still begins from a clean slate, and reloads Slot mode's
+        state from slot_state.json (rule 38)."""
         log.info("Starting monitor...")
         if not self.config.is_valid():
             log.error("Cannot start: config is invalid (missing client_id, client_secret, or streamers)")
             self.status_callback("Invalid config")
             return False
 
+        # A loop left over from before (stop() waits only 2 s for it) is no
+        # longer current from here on, so it cannot tick while this start
+        # reloads the Slot mode state.
+        self._loop_gen += 1
+        gen = self._loop_gen
         self.status_callback("Authenticating...")
         if not self._get_oauth_token():
             # On a restart (a settings save) the refresh can fail on a
@@ -2400,18 +4038,41 @@ class TwitchMonitor:
         set_polled_streamers(self.streamers)
         if not preserve_state:
             self._seed_startup_open_tabs()
+            # A fresh start (a launch, or Stop then Start from the tray):
+            # nothing polled yet, so no run of watching and no live starts.
+            self._watch_start = {}
+            self._last_poll_ok_mono = None
+            self.live_started_at = {}
+            self._live_as_of = None
+            self._load_slot_state()
 
         self.running = True
-        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.thread.start()
         self.status_callback("Monitoring...")
+        # The first tick runs before the first poll, so that poll already
+        # knows whether Slot mode is active (A10).
+        self._safe_slot_tick()
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread._sm_loop_gen = gen
+        self.thread.start()
         return True
 
     def stop(self):
         log.info("Stopping monitor")
+        was_running = self.running
         self.running = False
+        self._wake.set()
         if self.thread:
             self.thread.join(timeout=2)
+        if was_running:
+            # Stamp slot_state.json with the stop time, so a start soon
+            # after (a tray Start, the update relaunch) restores the slots.
+            # A stop of a monitor that was not running writes nothing: that
+            # would give a state from an earlier stop a fresh saved_at.
+            try:
+                with self._slot_lock:
+                    self._persist_slot_state(_streak_clock())
+            except Exception as e:
+                log.warning("Could not save the Slot mode state at stop: %s", e)
         self.status_callback("Stopped")
 
     def _seed_startup_open_tabs(self) -> None:
@@ -2451,8 +4112,15 @@ class TwitchMonitor:
         the skip. Once every browser that claimed the tab has reported
         again without it, or no report has arrived within
         STARTUP_FRESH_REPORT_TIMEOUT_SECONDS (browser closed, extension
-        gone), the stream is opened after all if it is still live."""
+        gone), the stream is opened after all if it is still live. In Slot
+        mode the plan decides what opens, so the skips are dropped
+        unopened."""
         if not self._startup_skipped:
+            return
+        if self.slot_active:
+            log.info("Startup skips dropped unopened (Slot mode runs the plan): %s",
+                     sorted(self._startup_skipped))
+            self._startup_skipped.clear()
             return
         fresh = {
             b: rep for b, rep in extension_open_tabs_snapshot().items()
@@ -2477,7 +4145,8 @@ class TwitchMonitor:
             why = "the tab is gone" if gone else "no report arrived in time"
             if self.effectively_paused:
                 state.browser_opened = False
-                self.missed_while_paused[name] = time.strftime("%H:%M:%S")
+                with self._vod_lock:
+                    self.missed_while_paused[name] = time.strftime("%H:%M:%S")
                 log.info("%s: %s, but paused, so not opening (tracked as missed)", name, why)
                 log_activity(
                     "tab_open_skipped",
@@ -2491,7 +4160,9 @@ class TwitchMonitor:
 
     def restart(self):
         """Restart after a settings change, keeping the state of streamers
-        still on the list so nothing already open is opened again."""
+        still on the list so nothing already open is opened again. The
+        Slot mode scheduler is kept as it is (rule 39): new counts, minutes,
+        ranks and pins apply at the next tick."""
         log.info("Restarting monitor")
         self.stop()
         time.sleep(0.5)
@@ -2631,11 +4302,14 @@ class StreamMonitorApp:
                 self._apply_config_change(new_config)
 
     def _apply_config_change(self, new_config: "Config") -> None:
+        # Turning Slot mode on or off takes effect on the monitor thread at
+        # the next tick (the restart below runs one), never here.
         self.config = new_config
         ConfigRequestHandler.config_data.update({
             "streamers": self.config.streamers,
             "pinned_streamers": self.config.pinned_streamers,
             "version": VERSION,
+            "auto_save_streaks": self.config.auto_save_streaks,
         })
         log_activity(
             "config_loaded",
@@ -2643,6 +4317,7 @@ class StreamMonitorApp:
             pinned_streamers=list(self.config.pinned_streamers),
             interval=self.config.check_interval,
             reason="settings_changed",
+            **_slot_config_fields(self.config),
         )
         if self.monitor:
             self.monitor.config = self.config
@@ -2890,9 +4565,9 @@ class StreamMonitorApp:
             Item("Check for Updates", self.on_check_updates),
             pystray.Menu.SEPARATOR,
             Item(
-                lambda item: f"Queued VODs ({len(self.monitor.queued_vods) if self.monitor else 0})",
+                lambda item: f"Queued VODs ({self._queued_vod_count()})",
                 pystray.Menu(lambda: tuple(self._iter_queued_vod_menu_items())),
-                visible=lambda item: bool(self.monitor and self.monitor.queued_vods),
+                visible=lambda item: self._queued_vod_count() > 0,
             ),
             Item("Start", self.on_start, checked=lambda item: self._is_running()),
             Item("Stop", self.on_stop, checked=lambda item: not self._is_running()),
@@ -2902,16 +4577,28 @@ class StreamMonitorApp:
             Item("Exit", self.on_exit)
         )
 
+    def _queued_vod_count(self) -> int:
+        """How many save-streak links wait in the VOD queue (the submenu
+        hides itself at 0, as it always is in Slot mode)."""
+        if not self.monitor:
+            return 0
+        with self.monitor._vod_lock:
+            return len(self.monitor.queued_vods)
+
     def _iter_queued_vod_menu_items(self):
         """Yield one menu item per queued VOD, plus a separator and a clear-all
         item at the bottom. pystray re-evaluates this every time the submenu
         opens, so we always show the current queue state.
         """
-        if not self.monitor or not self.monitor.queued_vods:
+        snapshot = []
+        if self.monitor:
+            # Snapshot to avoid mutation during iteration if a flush fires.
+            with self.monitor._vod_lock:
+                snapshot = list(self.monitor.queued_vods.items())
+        if not snapshot:
             yield Item("(none queued)", None, enabled=False)
             return
-        # Snapshot to avoid mutation during iteration if a flush fires.
-        for streamer, entry in list(self.monitor.queued_vods.items()):
+        for streamer, entry in snapshot:
             yield Item(
                 f"Open {streamer}'s VOD",
                 # Bind streamer and url in default args; closure-over-loop-var
@@ -2933,7 +4620,8 @@ class StreamMonitorApp:
                 "vod", streamer, vod_url,
                 from_queue=True, queue_reason="manual_tray",
             )
-            self.monitor.queued_vods.pop(streamer, None)
+            with self.monitor._vod_lock:
+                self.monitor.queued_vods.pop(streamer, None)
         if self.icon:
             try:
                 self.icon.update_menu()
@@ -2945,10 +4633,12 @@ class StreamMonitorApp:
         anything."""
         if not self.monitor:
             return
-        count = len(self.monitor.queued_vods)
-        for streamer in list(self.monitor.queued_vods.keys()):
+        with self.monitor._vod_lock:
+            cleared = list(self.monitor.queued_vods.keys())
+            self.monitor.queued_vods.clear()
+        count = len(cleared)
+        for streamer in cleared:
             log_activity("vod_queue_cleared", streamer=streamer)
-        self.monitor.queued_vods.clear()
         log.info("Cleared %d queued VOD(s) from tray", count)
         if self.icon:
             try:
@@ -3093,7 +4783,13 @@ class StreamMonitorApp:
 
         return result["completed"]
 
-    def run(self):
+    def start_services(self) -> bool:
+        """Everything run() does before the tray icon's loop: the state
+        loads, the config server, the monitor and the hooks the HTTP
+        handlers use, the watcher threads, the update check and the welcome
+        page. Returns False when the app must exit instead (first-time setup
+        cancelled, or another instance holds the port). The real-app test
+        harness calls it with no icon (A33)."""
         log.info("Stream Monitor v%s starting", VERSION)
         log.info("Config path: %s", CONFIG_FILE)
         log.info("Log path: %s", LOG_FILE)
@@ -3105,13 +4801,14 @@ class StreamMonitorApp:
             if not self._run_first_time_setup():
                 log.info("First-time setup cancelled, exiting")
                 log_activity("app_stopped", reason="setup_cancelled")
-                return
+                return False
 
         log_activity(
             "config_loaded",
             streamers=list(self.config.streamers),
             pinned_streamers=list(self.config.pinned_streamers),
             interval=self.config.check_interval,
+            **_slot_config_fields(self.config),
         )
 
         # Streaks Twitch already confirmed as kept, and broadcast times, from
@@ -3131,28 +4828,37 @@ class StreamMonitorApp:
         if config_server is None:
             log.error("Another instance is already running on port %d. Exiting.", CONFIG_SERVER_PORT)
             log_activity("app_stopped", reason="port_in_use")
-            return
+            return False
 
-        threading.Thread(target=lambda: run_config_server(config_server), daemon=True).start()
-
-        # Create monitor with notification callback
+        # Create monitor with notification callback. Its start() loads
+        # slot_state.json before the first poll. The port is bound already
+        # (a request waits in the backlog), so the plan is published before
+        # the server answers anything.
         self.monitor = TwitchMonitor(self.config, self.update_status, self.send_notification)
+        self.monitor.prime_slot_plan()
+        threading.Thread(target=lambda: run_config_server(config_server), daemon=True).start()
 
         # Allow the HTTP handler (POST /streak_event) to raise tray
         # notifications without holding a direct reference to the app.
         set_tray_notifier(self.send_notification)
 
         # Allow POST /rescue_ack to hand rescue ownership to the extension.
+        # The claim handler also names the claimant, so the same browser
+        # profile can re-ack an offer whose first answer it lost.
         set_rescue_ack_handler(
             lambda offer_id: bool(self.monitor and self.monitor.acknowledge_rescue(offer_id))
         )
-
-        # Create system tray icon
-        self.icon = pystray.Icon(
-            "stream_monitor",
-            create_icon_image("purple"),
-            "Stream Monitor",
-            self.create_menu()
+        set_rescue_claim_handler(
+            lambda offer_id, claimant: bool(
+                self.monitor and self.monitor.acknowledge_rescue(offer_id, claimant))
+        )
+        # Streak events and tab reports reach the monitor thread through its
+        # inbox; the card verdict reads the monitor's runs of watching.
+        set_monitor_submitter(
+            lambda kind, payload: self.monitor.submit(kind, payload) if self.monitor else None
+        )
+        set_watch_start_provider(
+            lambda name: self.monitor.watch_start_for(name) if self.monitor else None
         )
 
         # Auto-start monitoring
@@ -3177,25 +4883,23 @@ class StreamMonitorApp:
         threading.Thread(target=self._startup_update_check, daemon=True).start()
         threading.Thread(target=self._config_watch_loop, daemon=True).start()
         threading.Thread(target=self._usage_ping_loop, daemon=True).start()
+        return True
+
+    def run(self):
+        # The icon object exists before the monitor starts, so the first
+        # status lands in its tooltip; its window is created only by
+        # icon.run().
+        self.icon = pystray.Icon(
+            "stream_monitor",
+            create_icon_image("purple"),
+            "Stream Monitor",
+            self.create_menu()
+        )
+        if not self.start_services():
+            return
 
         # Run the icon (blocking)
         self.icon.run()
-    
-    def _show_missed_streak_alert(self, missed: dict[str, str]):
-        """Show a dismissible alert about missed streams while paused."""
-        import ctypes
-        streamer_lines = "\n".join(
-            f"  - {name} (went live at {t})" for name, t in missed.items()
-        )
-        ctypes.windll.user32.MessageBoxW(
-            0,
-            f"While Stream Monitor was paused, the following streamers went live:\n\n"
-            f"{streamer_lines}\n\n"
-            f"You may have missed a stream streak!\n"
-            f"Consider watching their latest VOD or a clip to keep your streak.",
-            "Stream Monitor - Missed Streams",
-            0x30  # MB_ICONWARNING
-        )
 
     def _startup_update_check(self):
         """Launch-time update check: prompt to download and install when a

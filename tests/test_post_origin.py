@@ -9,7 +9,7 @@ Content-Type application/json (415 otherwise): a page can only send that
 after a preflight, and a page's preflight is refused. The extension's own
 requests carry no Origin, an extension origin, or "null", send JSON, and
 go through. Also here: POST /streak_event answers 400 to a malformed
-report and 204 to an ignored one, and GET /config recomputes saved_streaks
+report and 200 to an ignored one, and GET /config recomputes saved_streaks
 for each answer, so a save that ran out drops off without waiting for a
 poll.
 """
@@ -121,7 +121,7 @@ def test_an_unknown_route_is_refused_to_a_web_page_too(port):
     "null",
 ])
 def test_the_extension_gets_through_on_every_post_route(port, acks, origin):
-    assert _post(port, "/streak_event", REQUESTS["/streak_event"], origin) == 204
+    assert _post(port, "/streak_event", REQUESTS["/streak_event"], origin) == 200
     assert _post(port, "/open_tabs", REQUESTS["/open_tabs"], origin) == 204
     assert _post(port, "/rescue_ack", REQUESTS["/rescue_ack"], origin) == 204
     assert sm.streak_saved_since_last_live("alice") == DETECTED_AT
@@ -152,7 +152,7 @@ def test_a_post_without_a_json_content_type_is_refused(port, acks, path, origin,
 def test_a_json_content_type_with_parameters_is_accepted(port):
     status = _post(port, "/streak_event", REQUESTS["/streak_event"],
                    content_type="Application/JSON; charset=utf-8")
-    assert status == 204
+    assert status == 200
     assert sm.streak_saved_since_last_live("alice") == DETECTED_AT
 
 
@@ -187,21 +187,21 @@ def test_an_extension_preflight_is_answered_as_before(port, origin):
     assert resp_headers["access-control-allow-origin"] == "*"
 
 
-def test_streak_event_answers_400_to_malformed_and_204_to_ignored(port):
+def test_streak_event_answers_400_to_malformed_and_200_to_ignored(port):
     bad_login = dict(REQUESTS["/streak_event"], streamer="not a login!")
     assert _post(port, "/streak_event", bad_login) == 400
     assert _post(port, "/streak_event", dict(REQUESTS["/streak_event"], count="four")) == 400
     assert sm._streak_state["saved"] == {}
 
-    # Well formed but older than alice's last go-live: ignored, still 204.
+    # Well formed but older than alice's last go-live: ignored, still 200.
     sm.record_stream_live("alice", "2026-09-28T05:00:00.000Z")
-    assert _post(port, "/streak_event", REQUESTS["/streak_event"]) == 204
+    assert _post(port, "/streak_event", REQUESTS["/streak_event"]) == 200
     assert sm._streak_state["saved"] == {}
 
 
 def test_config_drops_a_save_that_ran_out_without_waiting_for_a_poll(port, monkeypatch):
     unpolled = dict(REQUESTS["/streak_event"], streamer="driveyabatty")
-    assert _post(port, "/streak_event", unpolled) == 204
+    assert _post(port, "/streak_event", unpolled) == 200
     assert _config(port)["saved_streaks"] == {"driveyabatty": DETECTED_AT}
 
     # A day after the detection, and nothing ever polled that login.

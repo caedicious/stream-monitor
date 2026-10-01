@@ -1,10 +1,10 @@
-# Stream Monitor v1.11.2 release artifacts
-# Generated: 2026-09-28T14:05:03.343862+00:00
+# Stream Monitor v1.12.0 release artifacts
+# Generated: 2026-10-01T14:25:52.826748+00:00
 # Verify a download with: Get-FileHash <file> -Algorithm SHA256
 #
-ef8f71688ec014686f0ff744423000022090dbaf141b0af1e0581eda88d7bb93  StreamMonitorInstaller.exe
-68c2da5775be8899991c94518268f0ca7c4b8ab0ee375ad4abb5262713b5e112  StreamMonitor.exe
-0bda394c50b729d6b066d020cf1ff3dec442bf6917f65655cf0ca2850431782d  StreamMonitorSetup.exe
-fe0ace7cd28ea0b3efe1132df9a1ef5f3cf4cc8fca6c6a56e9dc4e9c5793e4c2  StreamMonitorSettings.exe
-da9413d586629ae34eb354e8ea1ea179e5126556b0971ecb318366530d7c2c7f  stream_monitor_tab_closer.xpi
-4072cfa693f77c123367b9eb38495d47060bd601a7c231b6e2ec8c374cb8030f  stream_monitor_chrome_1.11.2.zip
+acdf1ab21d44d616c8a102a855c0622d8ad49389a70586b96be5fb14146d4595  StreamMonitorInstaller.exe
+9c76d8e6b876c9608d9a76f6abae93626cdbc8ad453560f2e855fac14ae7fd3d  StreamMonitor.exe
+23677cada08aa29b8be9c4e1f9ada9202743be76f5a9e09c6563829b43411458  StreamMonitorSetup.exe
+23ccfcfb6b793de3d82015634bd1a0967ea29a099e73ee20c5dbaaeee3545cd1  StreamMonitorSettings.exe
+f994fe20e5f5c9fbc88a88c954c99aa9dd212b276b438d645fda61d676d2ec97  stream_monitor_tab_closer.xpi
+979f906dd3b290ae51128f1494e0145774fd8353a3cf184bf27b87034ac32c6a  stream_monitor_chrome_1.12.0.zip
