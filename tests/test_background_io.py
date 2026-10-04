@@ -99,10 +99,14 @@ let nextTabId = 100;
 // Tabs made by tabs.create are not added. calls records moves, updates,
 // removes and window creations; onMove(id, windowId) runs right after a
 // move lands. lastFocused, when a case sets it, is what
-// windows.getLastFocused answers (by default window 1, focused).
-const world = { windows: {}, tabs: {}, calls: [], onMove: null, nextWindowId: 50, lastFocused: null };
+// windows.getLastFocused answers (by default window 1, focused). alarms
+// holds the alarms alarms.get finds (WORLD.alarms and every one created);
+// alarmsCreated lists the alarms.create calls.
+const world = { windows: {}, tabs: {}, calls: [], onMove: null, nextWindowId: 50, lastFocused: null,
+  alarms: {}, alarmsCreated: [] };
 Object.assign(world.windows, clone(WORLD.windows || {}));
 Object.assign(world.tabs, clone(WORLD.tabs || {}));
+Object.assign(world.alarms, clone(WORLD.alarms || {}));
 
 function windowView(w, populate) {
   const out = clone(w);
@@ -161,7 +165,14 @@ const api = stub({
       return world.windows[id] ? windowView(world.windows[id], false) : undefined;
     },
   },
-  alarms: { get: async () => undefined },
+  alarms: {
+    get: async (name) => clone(world.alarms[name]),
+    create: async (name, info) => {
+      world.alarmsCreated.push([name, clone(info)]);
+      world.alarms[name] = { name, scheduledTime: info && info.when };
+    },
+    clear: async (name) => { delete world.alarms[name]; return true; },
+  },
   runtime: { getURL: (p) => `ext://test/${p}` },
   action: {
     setBadgeText: async (d) => { badgeTexts.push(d.text); },
@@ -1555,3 +1566,646 @@ def test_am41_am16_not_eligible_follows_the_switch(kind, closes, tmp_path):
         assert got["tracked"] is True and got["removed"] == [] and got["gone"] == [] and got["ack"] is False
         assert got["lines"] == ["Nothing to watch on dave's save-streak page (tab 70); left as it is"]
         assert got["afterTurn"] == {"tracked": False, "removed": [70], "ack": True}
+
+
+# ---------------------------------------------------------------------------
+# Max open streams by list order (v1.12.1)
+# ---------------------------------------------------------------------------
+
+MAX_TABS_ORDER_CASE = r"""async (ctx) => {
+  const MIN = 60 * 1000;
+  const now = Date.now();
+  const list = ["khaosvt", "caedvt", "faenilia", "mervynova", "sw33t_exe", "krytouz", "maachuh", "siigynn",
+    "itsthefluffs"];
+  const tab = (name, ageMin, extra = {}) => ({ originalStreamer: name, raidHopCount: 0,
+    openedAt: now - ageMin * MIN, saveStreak: false, ...extra });
+  const allLive = () => Object.fromEntries(list.map((n) => [n, now]));
+  // A reading now, at the end of two hours of unbroken readings.
+  const reading = (seen = allLive(), o = {}) => ({ at: now, since: now - 120 * MIN, seen, ...o });
+  // leaving: keys of tabs already scheduled to close (the record names the
+  // tab's streamer, or leavingAs).
+  const C = (tabs, o = {}) => ({ pinned: new Set(o.pinned || []), order: new Map(list.map((n, i) => [n, i])),
+    liveSeen: "liveSeen" in o ? o.liveSeen : reading(),
+    leaving: new Map((o.leaving || []).map((k) => [k, o.leavingAs || tabs[k].originalStreamer])), now });
+  const brief = (d) => (d ? [d.kind, d.why || (d.target ? d.target.streamer : null), d.target ? d.target.tabKey : null]
+    : null);
+  const decide = (tabs, key, o) => brief(ctx.maxTabsDecision(tabs, key, 3, C(tabs, o)));
+  const trio = (a, b, c) => ({ "1": tab("khaosvt", a), "2": tab("caedvt", b), "3": tab("maachuh", c) });
+  const everyone = ["khaosvt", "caedvt", "maachuh", "itsthefluffs"];
+  const out = {};
+
+  // The reported case: Khaos, Caed and maachuh open, itsthefluffs goes live.
+  out.reported = decide({ ...trio(9, 8, 7), "4": tab("itsthefluffs", 0) }, "4");
+  // A newcomer above maachuh: maachuh gives way, at its grace end or at once.
+  out.higherInGrace = decide({ ...trio(9, 8, 7), "4": tab("faenilia", 0) }, "4");
+  out.higherPastGrace = decide({ ...trio(90, 80, 70), "4": tab("faenilia", 0) }, "4");
+  // Keep Open: maachuh is protected, so faenilia (below Khaos and Caed) goes.
+  out.keepOpenOther = decide({ ...trio(90, 80, 70), "4": tab("faenilia", 0) }, "4", { pinned: ["maachuh"] });
+  out.pinnedNewcomer = decide({ ...trio(90, 80, 70), "4": tab("itsthefluffs", 0) }, "4",
+    { pinned: ["itsthefluffs"] });
+  out.allProtected = decide({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80),
+    "3": tab("maachuh", 70, { rescue: true }), "4": tab("itsthefluffs", 0) }, "4", { pinned: ["khaosvt", "caedvt"] });
+  // A Keep Open newcomer is never closed for the limit, also when nobody else can give way.
+  out.keptNewcomerAllProtected = decide({ ...trio(90, 80, 70), "4": tab("itsthefluffs", 0) }, "4",
+    { pinned: everyone });
+  // Manual save and slot tabs are never chosen, however low their streamer.
+  out.manualAndSlot = decide({ "1": tab("khaosvt", 90), "2": tab("siigynn", 80, { manualSave: true }),
+    "3": tab("itsthefluffs", 70, { slot: "cycle-1" }), "4": tab("maachuh", 0) }, "4");
+
+  // A stream that ended gives way before any live one, even the top of the list.
+  const ended = { ...allLive(), khaosvt: now - 30 * MIN };
+  out.endedFirst = decide({ ...trio(120, 80, 70), "4": tab("itsthefluffs", 0) }, "4", { liveSeen: reading(ended) });
+  // Ended while its tab is still in grace: closed at once, there is nothing left to watch.
+  out.endedInGrace = decide({ ...trio(15, 80, 70), "4": tab("itsthefluffs", 0) }, "4",
+    { liveSeen: reading({ ...allLive(), khaosvt: now - 12 * MIN }) });
+  // One missed poll is not an end.
+  out.missedPoll = decide({ ...trio(120, 80, 70), "4": tab("itsthefluffs", 0) }, "4",
+    { liveSeen: reading({ ...allLive(), khaosvt: now - 2 * MIN }) });
+  // An old reading (the desktop app is not answering) or none says nothing.
+  out.staleData = decide({ ...trio(120, 80, 70), "4": tab("itsthefluffs", 0) }, "4",
+    { liveSeen: reading(ended, { at: now - 10 * MIN }) });
+  out.noLiveData = decide({ ...trio(120, 80, 70), "4": tab("itsthefluffs", 0) }, "4", { liveSeen: undefined });
+  // Readings that only resumed 5 minutes ago (the desktop app was closed,
+  // the computer asleep) cannot say that a stream ended.
+  out.runTooShort = decide({ ...trio(120, 80, 70), "4": tab("itsthefluffs", 0) }, "4",
+    { liveSeen: reading(ended, { since: now - 5 * MIN }) });
+  // Keep Open protects even after the stream ended (the owner's choice).
+  out.endedKeepOpen = decide({ ...trio(120, 80, 70), "4": tab("itsthefluffs", 0) }, "4",
+    { pinned: ["khaosvt"], liveSeen: reading(ended) });
+  // A save visit plays a recording: its streamer being offline is no end.
+  const offline = { ...allLive(), maachuh: now - 30 * MIN };
+  out.saveVisit = decide({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80), "3": tab("maachuh", 20, { saveStreak: true }),
+    "4": tab("faenilia", 0) }, "4", { liveSeen: reading(offline) });
+  out.landedVisit = decide({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80),
+    "3": tab("maachuh", 20, { landing: "/videos/1" }), "4": tab("faenilia", 0) }, "4", { liveSeen: reading(offline) });
+
+  // A streamer not on the list (a raid that was followed) counts as lowest
+  // but is never an ended stream; two of them: the oldest tab first.
+  out.unlisted = decide({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80), "3": tab("raidtarget", 12),
+    "4": tab("itsthefluffs", 0) }, "4");
+  out.unlistedTie = decide({ "1": tab("khaosvt", 90), "2": tab("raid_a", 6), "3": tab("raid_b", 4),
+    "4": tab("caedvt", 0) }, "4");
+
+  // An older tab of a streamer with a newer one goes before any live stream, at once.
+  out.duplicate = decide({ "1": tab("khaosvt", 5), "2": tab("caedvt", 80), "3": tab("maachuh", 70),
+    "4": tab("khaosvt", 0) }, "4");
+  out.endedBeforeDuplicate = decide({ "1": tab("khaosvt", 5), "2": tab("caedvt", 80), "3": tab("maachuh", 70),
+    "4": tab("khaosvt", 0) }, "4", { liveSeen: reading({ ...allLive(), caedvt: now - 30 * MIN }) });
+
+  // Tabs already scheduled to close do not count, and are not chosen again.
+  const five = { ...trio(90, 80, 70), "4": tab("itsthefluffs", 5), "5": tab("faenilia", 0) };
+  out.leavingNotChosenAgain = decide(five, "5", { leaving: ["4"] });
+  out.leavingMakesRoom = decide({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80), "4": tab("itsthefluffs", 5),
+    "5": tab("maachuh", 0) }, "5", { leaving: ["4"] });
+  // A record for another streamer (the tab id was used again) says nothing about this tab.
+  out.leavingOtherStreamer = decide({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80), "4": tab("itsthefluffs", 5),
+    "5": tab("maachuh", 0) }, "5", { leaving: ["4"], leavingAs: "someoneelse" });
+  out.selfLeaving = decide(five, "4", { leaving: ["4"] });
+  out.withinLimit = decide({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80), "4": tab("maachuh", 0) }, "4");
+  out.goneMeanwhile = decide(trio(90, 80, 70), "9");
+
+  // A scheduled close that has come due is decided again.
+  const due = (tabs, key, max, o) => brief(ctx.maxTabsDueDecision(tabs, key, max, C(tabs, o)));
+  const four = { ...trio(90, 80, 70), "4": tab("itsthefluffs", 31) };
+  const pair = (a, b) => ({ "2": tab("caedvt", 80), "3": tab("maachuh", 70), "4": tab("itsthefluffs", a),
+    "5": tab("siigynn", b) });
+  out.due = {
+    stillOver: due(four, "4", 3),
+    limitOff: due(four, "4", 0),
+    roomAgain: due({ "2": tab("caedvt", 80), "3": tab("maachuh", 70), "4": tab("itsthefluffs", 31) }, "4", 3),
+    gone: due(trio(90, 80, 70), "9", 2),
+    // A stream ended in the meantime: its tab closes, the due one stays.
+    endedStandIn: due(four, "4", 3, { liveSeen: reading(ended) }),
+    // Keep Open since it was scheduled: the lowest unprotected gives way, at once or after its grace.
+    keptNow: due(four, "4", 3, { pinned: ["itsthefluffs"] }),
+    keptNowInGrace: due({ ...trio(9, 8, 7), "4": tab("itsthefluffs", 31) }, "4", 3, { pinned: ["itsthefluffs"] }),
+    allKept: due(four, "4", 3, { pinned: everyone }),
+    // A lower stream that arrived while there was room.
+    lowerInGrace: due({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80), "3": tab("maachuh", 31),
+      "4": tab("itsthefluffs", 10) }, "3", 3),
+    lowerPastGrace: due({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80), "3": tab("maachuh", 31),
+      "4": tab("itsthefluffs", 40) }, "3", 3),
+    duplicateStandIn: due({ "1": tab("khaosvt", 50), "2": tab("caedvt", 80), "3": tab("khaosvt", 20),
+      "4": tab("itsthefluffs", 31) }, "4", 3),
+    // Two tabs waiting and room for one: the first to come due stays; at
+    // the second the lower of the two gives way.
+    firstOfTwo: due(pair(31, 20), "4", 3, { leaving: ["5"] }),
+    secondOfTwo: due(pair(41, 31), "5", 3),
+    bothGo: due({ "1": tab("khaosvt", 90), ...pair(31, 20) }, "5", 3, { leaving: ["4"] }),
+  };
+
+  // The live record the desktop's list feeds.
+  await ctx.noteLiveSeen(["KhaosVT", "caedvt"], now - 20 * MIN);
+  await ctx.noteLiveSeen(["caedvt"], now - 18 * MIN);
+  out.run = { sinceAgoMin: (now - local.liveSeen.since) / MIN, atAgoMin: (now - local.liveSeen.at) / MIN };
+  await ctx.noteLiveSeen(["caedvt"], now);
+  local.liveSeen.seen.longgone = now - 25 * 60 * MIN;
+  out.live = { at: local.liveSeen.at === now, newRun: local.liveSeen.since === now,
+    khaosAgoMin: (now - local.liveSeen.seen.khaosvt) / MIN, caedAgoMin: (now - local.liveSeen.seen.caedvt) / MIN };
+  await ctx.noteLiveSeen([], now + 1000);
+  out.live.pruned = !("longgone" in local.liveSeen.seen) && "caedvt" in local.liveSeen.seen;
+  out.live.sameRun = local.liveSeen.since === now;
+  const E = (info, liveSeen) => ctx.streamEnded(info, liveSeen, now);
+  const run = (seen, sinceMin = 60) => ({ at: now, since: now - sinceMin * MIN, seen });
+  out.ended = {
+    young: E(tab("khaosvt", 5), run({})),
+    neverSeen: E(tab("khaosvt", 40), run({})),
+    neverSeenShortRun: E(tab("khaosvt", 40), run({}, 5)),
+    noRunStart: E(tab("khaosvt", 40), { at: now, seen: {} }),
+    seenLately: E(tab("khaosvt", 40), run({ khaosvt: now - 9 * MIN })),
+    seenLongAgo: E(tab("khaosvt", 40), run({ khaosvt: now - 10 * MIN })),
+    seenBeforeTheGap: E(tab("khaosvt", 40), run({ khaosvt: now - 30 * MIN }, 5)),
+    staleReading: E(tab("khaosvt", 40), { at: now - 4 * MIN, since: now - 60 * MIN, seen: {} }),
+    saveVisit: E(tab("khaosvt", 40, { saveStreak: true }), run({})),
+    landedVisit: E(tab("khaosvt", 40, { landing: "/videos/1" }), run({})),
+  };
+  return out;
+}"""
+
+
+@pytest.mark.parametrize("kind", ["chrome", "firefox"])
+def test_max_tabs_list_order_decides_who_gives_way(kind, tmp_path):
+    """v1.12.1 (the owner's request of 2026-10-03): at the limit the open
+    stream lowest in the desktop's list order gives way, the new one
+    included; a stream that ended and an older duplicate tab go before any
+    live one; Keep Open, rescue, manual save and slot tabs are never
+    chosen; a tab already scheduled to close neither counts nor is chosen
+    again; and a scheduled close is decided again when it comes due."""
+    got = _run(kind, MAX_TABS_ORDER_CASE, tmp_path)
+    lowest = ["expire", "lowest", None]
+    assert got["reported"] == lowest
+    assert got["higherInGrace"] == ["swap", "maachuh", "3"]
+    assert got["higherPastGrace"] == ["close", "maachuh", "3"]
+    assert got["keepOpenOther"] == lowest
+    assert got["pinnedNewcomer"] == ["close", "maachuh", "3"]
+    assert got["allProtected"] == ["expire", "protected", None]
+    assert got["keptNewcomerAllProtected"] is None
+    assert got["manualAndSlot"] == lowest
+    assert got["endedFirst"] == ["close", "khaosvt", "1"]
+    assert got["endedInGrace"] == ["close", "khaosvt", "1"]
+    assert got["missedPoll"] == lowest
+    assert got["staleData"] == lowest
+    assert got["noLiveData"] == lowest
+    assert got["runTooShort"] == lowest
+    assert got["endedKeepOpen"] == lowest
+    assert got["saveVisit"] == ["swap", "maachuh", "3"]
+    assert got["landedVisit"] == ["swap", "maachuh", "3"]
+    assert got["unlisted"] == ["swap", "raidtarget", "3"]
+    assert got["unlistedTie"] == ["swap", "raid_a", "2"]
+    assert got["duplicate"] == ["close", "khaosvt", "1"]
+    assert got["endedBeforeDuplicate"] == ["close", "caedvt", "2"]
+    assert got["leavingNotChosenAgain"] == ["close", "maachuh", "3"]
+    assert got["leavingMakesRoom"] is None
+    assert got["leavingOtherStreamer"] == ["swap", "itsthefluffs", "4"]
+    assert got["selfLeaving"] is None
+    assert got["withinLimit"] is None
+    assert got["goneMeanwhile"] is None
+    assert got["due"] == {
+        "stillOver": ["close", "itsthefluffs", "4"],
+        "limitOff": ["room", None, None],
+        "roomAgain": ["room", None, None],
+        "gone": ["room", None, None],
+        "endedStandIn": ["instead", "khaosvt", "1"],
+        "keptNow": ["instead", "maachuh", "3"],
+        "keptNowInGrace": ["defer", "maachuh", "3"],
+        "allKept": ["kept", None, None],
+        "lowerInGrace": ["defer", "itsthefluffs", "4"],
+        "lowerPastGrace": ["instead", "itsthefluffs", "4"],
+        "duplicateStandIn": ["instead", "khaosvt", "1"],
+        "firstOfTwo": ["room", None, None],
+        "secondOfTwo": ["instead", "itsthefluffs", "4"],
+        "bothGo": ["close", "siigynn", "5"],
+    }
+    assert got["run"] == {"sinceAgoMin": 20, "atAgoMin": 18}
+    assert got["live"] == {"at": True, "newRun": True, "khaosAgoMin": 20, "caedAgoMin": 0, "pruned": True,
+                           "sameRun": True}
+    assert got["ended"] == {
+        "young": False, "neverSeen": True, "neverSeenShortRun": False, "noRunStart": False, "seenLately": False,
+        "seenLongAgo": True, "seenBeforeTheGap": False, "staleReading": False, "saveVisit": False,
+        "landedVisit": False,
+    }
+
+
+MAX_TABS_FLOW_CASE = r"""async (ctx) => {
+  const MIN = 60 * 1000;
+  const now = Date.now();
+  const list = ["khaosvt", "caedvt", "faenilia", "maachuh", "siigynn", "itsthefluffs"];
+  const tab = (name, ageMin) => ({ originalStreamer: name, raidHopCount: 0, openedAt: now - ageMin * MIN,
+    saveStreak: false });
+  const lines = (re) => logs.filter((l) => re.test(l)).map((l) => l.replace(/^\[Stream Monitor\] /, ""));
+  const removed = () => world.calls.filter((c) => c[0] === "tabs.remove").map((c) => c[1]);
+  const tracked = () => Object.keys(local.trackedTabs || {}).sort();
+  const expirations = () => local.pendingExpirations.map((e) => [e.tabKey, e.streamer,
+    Math.round((e.scheduledAt - now) / MIN)]);
+  const swaps = () => local.pendingSwaps.map((s) => [s.targetTabKey, s.targetStreamer, s.newTabKey, s.newStreamer,
+    Math.round((s.scheduledAt - now) / MIN)]);
+  const asked = () => requests.filter((r) => r.path === "/config").length;
+  const down = () => ({ status: 503, text: "" });
+  const reset = (tabs) => {
+    local.trackedTabs = tabs;
+    local.pendingSwaps = [];
+    local.pendingExpirations = [];
+    local.maxTabs = 3;
+    local.monitoredStreamers = list;
+    local.pinnedStreamers = [];
+    local.liveSeen = { at: now, since: now - 120 * MIN, seen: Object.fromEntries(list.map((n) => [n, now])) };
+    responder = down;
+    world.calls.length = 0;
+    logs.length = 0;
+    requests.length = 0;
+  };
+  const young = (newcomer) => ({ "1": tab("khaosvt", 9), "2": tab("caedvt", 8), "3": tab("maachuh", 7),
+    "4": tab(newcomer, 0) });
+  const everyone = ["khaosvt", "caedvt", "maachuh", "itsthefluffs"];
+  const out = {};
+
+  // The reported case: the newcomer is the lowest, so it is the one to go,
+  // after its 30 minutes. Nothing closes now.
+  reset(young("itsthefluffs"));
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  out.lowest = { expirations: expirations(), swaps: local.pendingSwaps.length, removed: removed(),
+    tracked: tracked(), lines: lines(/Max tabs \(3\) reached/), asked: asked() };
+  await ctx.executePendingExpiration("4");
+  out.lowestDue = { removed: removed(), tracked: tracked() };
+
+  // Khaos's tab closed before the timer: there is room, the newcomer stays.
+  reset(young("itsthefluffs"));
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  delete local.trackedTabs["1"];
+  await ctx.executePendingExpiration("4");
+  out.roomAgain = { removed: removed(), tracked: tracked(), lines: lines(/has room again/),
+    expirations: local.pendingExpirations.length };
+
+  // The limit was turned off before the timer.
+  reset(young("itsthefluffs"));
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  local.maxTabs = 0;
+  await ctx.executePendingExpiration("4");
+  out.limitOff = { removed: removed(), tracked: tracked() };
+
+  // A newcomer above maachuh: maachuh is the lowest and still in grace, so
+  // both stay open until its 30 minutes are up.
+  reset(young("faenilia"));
+  await ctx.enforceMaxTabs("4", "faenilia", 3, now);
+  out.swap = { swaps: swaps(), expirations: local.pendingExpirations.length, removed: removed(),
+    lines: lines(/Max tabs \(3\) reached/) };
+  await ctx.executePendingSwap("4");
+  out.swapDue = { removed: removed(), tracked: tracked(), lines: lines(/Executing pending swap/) };
+
+  reset(young("faenilia"));
+  await ctx.enforceMaxTabs("4", "faenilia", 3, now);
+  delete local.trackedTabs["2"];
+  await ctx.executePendingSwap("4");
+  out.swapRoom = { removed: removed(), tracked: tracked(), lines: lines(/has room again/) };
+
+  // A plan made the swap's new tab a slot tab since: the swap is left to the plan.
+  reset(young("faenilia"));
+  await ctx.enforceMaxTabs("4", "faenilia", 3, now);
+  local.trackedTabs["4"].slot = "cycle-1";
+  await ctx.executePendingSwap("4");
+  out.swapSlotPartner = { removed: removed(), tracked: tracked(), lines: lines(/Slot plan: skipped/) };
+
+  // The swap's new tab goes away: the target's close stays scheduled, as a
+  // pending expiration, and is dropped when it comes due with room again.
+  reset(young("faenilia"));
+  await ctx.enforceMaxTabs("4", "faenilia", 3, now);
+  delete local.trackedTabs["4"];
+  await ctx.cancelPendingSwapsForTab("4");
+  out.newTabGone = { swaps: swaps(), expirations: expirations(), lines: lines(/^\[Stream Monitor\] Pending swap \(/) };
+  await ctx.executePendingExpiration("3");
+  out.newTabGoneDue = { removed: removed(), tracked: tracked(), lines: lines(/has room again/) };
+  // The swap's target goes away: the swap is dropped.
+  reset(young("faenilia"));
+  await ctx.enforceMaxTabs("4", "faenilia", 3, now);
+  delete local.trackedTabs["3"];
+  await ctx.cancelPendingSwapsForTab("3");
+  out.targetGone = { swaps: swaps(), expirations: expirations(), lines: lines(/Cancelled pending swap/) };
+
+  // Past its grace, the lowest closes at once.
+  reset({ "1": tab("khaosvt", 90), "2": tab("caedvt", 80), "3": tab("maachuh", 70), "4": tab("faenilia", 0) });
+  await ctx.enforceMaxTabs("4", "faenilia", 3, now);
+  out.closeNow = { removed: removed(), tracked: tracked(), lines: lines(/Max tabs \(3\) reached/) };
+
+  // An ended stream goes first, with its reason in the log. The desktop is
+  // asked again before the verdict is acted on; here it does not answer.
+  const old = () => ({ "1": tab("khaosvt", 120), "2": tab("caedvt", 80), "3": tab("maachuh", 70),
+    "4": tab("itsthefluffs", 0) });
+  reset(old());
+  local.liveSeen.seen.khaosvt = now - 30 * MIN;
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  out.endedCloses = { removed: removed(), tracked: tracked(), lines: lines(/Max tabs \(3\) reached/), asked: asked() };
+  // The same, but the desktop answers that Khaos is live (the stored
+  // reading was behind): nothing ended, the newcomer is the lowest.
+  reset(old());
+  local.liveSeen.seen.khaosvt = now - 30 * MIN;
+  responder = (path) => (path === "/config"
+    ? { status: 200, text: JSON.stringify({ streamers: list, live_streamers: ["KhaosVT", "caedvt", "maachuh"] }) }
+    : down());
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  out.confirmedLive = { removed: removed(), expirations: expirations(), asked: asked() };
+
+  // A stream ends while a lower one waits to close: when the timer comes
+  // due the ended tab closes and the live newcomer stays.
+  reset({ "1": tab("khaosvt", 20), "2": tab("caedvt", 8), "3": tab("maachuh", 7), "4": tab("itsthefluffs", 0) });
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  local.liveSeen.seen.khaosvt = now - 12 * MIN;
+  await ctx.executePendingExpiration("4");
+  out.dueEnded = { removed: removed(), tracked: tracked(), expirations: expirations(),
+    lines: lines(/Pending expiration fired/) };
+
+  // The owner puts the waiting stream on Keep Open: it stays, and the
+  // lowest unprotected stream closes when its own 30 minutes are up.
+  reset(young("itsthefluffs"));
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  local.pinnedStreamers = ["itsthefluffs"];
+  await ctx.executePendingExpiration("4");
+  out.dueKeepOpen = { removed: removed(), tracked: tracked(), expirations: expirations(),
+    lines: lines(/Pending expiration fired/) };
+  // Everything open is on Keep Open by then: nothing closes.
+  reset(young("itsthefluffs"));
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  local.pinnedStreamers = everyone;
+  await ctx.executePendingExpiration("4");
+  out.dueAllKept = { removed: removed(), expirations: expirations(), lines: lines(/Pending expiration fired/) };
+  // The due tab is also the target of a swap still pending: its own timer
+  // decides now, the other record does not make it count as leaving.
+  reset(young("itsthefluffs"));
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  local.pendingSwaps = [{ newTabKey: "1", newStreamer: "khaosvt", targetTabKey: "4", targetStreamer: "itsthefluffs",
+    scheduledAt: now + 30 * MIN }];
+  await ctx.executePendingExpiration("4");
+  out.dueTwoRecords = { removed: removed(), tracked: tracked() };
+  // A swap target put on Keep Open: the newcomer, now the lowest unprotected, is the one that waits.
+  reset(young("faenilia"));
+  await ctx.enforceMaxTabs("4", "faenilia", 3, now);
+  local.pinnedStreamers = ["maachuh"];
+  await ctx.executePendingSwap("4");
+  out.dueSwapKeepOpen = { removed: removed(), expirations: expirations(), lines: lines(/Pending swap fired/) };
+
+  // A Keep Open newcomer with only protected tabs open is not scheduled to close.
+  reset(young("itsthefluffs"));
+  local.pinnedStreamers = everyone;
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  out.keptNewcomer = { expirations: expirations(), swaps: swaps(), removed: removed(), lines: lines(/Max tabs/) };
+  // A newcomer that is not protected, with only protected tabs open, gets its 30 minutes.
+  reset(young("itsthefluffs"));
+  local.pinnedStreamers = ["khaosvt", "caedvt", "maachuh"];
+  await ctx.enforceMaxTabs("4", "itsthefluffs", 3, now);
+  out.allProtected = { expirations: expirations(), removed: removed(), lines: lines(/Max tabs/) };
+
+  // A second tab of a stream that dropped and came back: the older tab closes at once.
+  reset({ "1": tab("khaosvt", 5), "2": tab("caedvt", 80), "3": tab("maachuh", 70), "4": tab("khaosvt", 0) });
+  await ctx.enforceMaxTabs("4", "khaosvt", 3, now);
+  out.duplicate = { removed: removed(), tracked: tracked(), lines: lines(/Max tabs \(3\) reached/) };
+
+  // Two streams tracked in the same moment: each sees the other's record.
+  reset({ ...young("itsthefluffs"), "5": tab("siigynn", 0) });
+  await Promise.all([ctx.enforceMaxTabs("4", "itsthefluffs", 3, now), ctx.enforceMaxTabs("5", "siigynn", 3, now)]);
+  out.twoAtOnce = { expirations: expirations().sort(), swaps: swaps(), removed: removed() };
+  return out;
+}"""
+
+
+@pytest.mark.parametrize("kind", ["chrome", "firefox"])
+def test_max_tabs_by_list_order_end_to_end_in_the_background(kind, tmp_path):
+    """enforceMaxTabs and the two timers with real storage: the lowest
+    newcomer gets 30 minutes and then closes; a scheduled close is dropped
+    when there is room again or the limit is off, and goes to another tab
+    when a stream ended or Keep Open changed meanwhile; a higher newcomer
+    swaps out the lowest open stream at its grace end, or at once when
+    past it; Keep Open newcomers and duplicates; two arrivals at once."""
+    got = _run(kind, MAX_TABS_FLOW_CASE, tmp_path)
+    assert got["lowest"] == {
+        "expirations": [["4", "itsthefluffs", 30]], "swaps": 0, "removed": [], "tracked": ["1", "2", "3", "4"],
+        "lines": ["Max tabs (3) reached and itsthefluffs is the lowest in list order among the open streams. "
+                  "Keeping its tab open for 30m to preserve streak, then closing."],
+        "asked": 0,
+    }
+    assert got["lowestDue"] == {"removed": [4], "tracked": ["1", "2", "3"]}
+    assert got["roomAgain"] == {
+        "removed": [], "tracked": ["2", "3", "4"], "expirations": 0,
+        "lines": ["Pending expiration fired but Max tabs has room again; itsthefluffs (tab 4) stays open"],
+    }
+    assert got["limitOff"] == {"removed": [], "tracked": ["1", "2", "3", "4"]}
+    assert got["swap"] == {
+        "swaps": [["3", "maachuh", "4", "faenilia", 23]], "expirations": 0, "removed": [],
+        "lines": ["Max tabs (3) reached but unpinned maachuh (tab 3), the lowest in list order, is in grace "
+                  "(23m left). Keeping both tabs open; swap scheduled."],
+    }
+    assert got["swapDue"] == {
+        "removed": [3], "tracked": ["1", "2", "4"],
+        "lines": ["Executing pending swap: closing maachuh (tab 3) now that grace has expired; "
+                  "faenilia keeps its slot"],
+    }
+    assert got["swapRoom"] == {
+        "removed": [], "tracked": ["1", "3", "4"],
+        "lines": ["Pending swap fired but Max tabs has room again; maachuh (tab 3) stays open"],
+    }
+    assert got["swapSlotPartner"] == {
+        "removed": [], "tracked": ["1", "2", "3", "4"],
+        "lines": ["Slot plan: skipped the pending swap for maachuh (tab 3); the plan manages slot tabs"],
+    }
+    assert got["newTabGone"] == {
+        "swaps": [], "expirations": [["3", "maachuh", 23]],
+        "lines": ["Pending swap (faenilia <- maachuh): tab 4 is gone; the close of maachuh (tab 3) stays scheduled"],
+    }
+    assert got["newTabGoneDue"] == {
+        "removed": [], "tracked": ["1", "2", "3"],
+        "lines": ["Pending expiration fired but Max tabs has room again; maachuh (tab 3) stays open"],
+    }
+    assert got["targetGone"] == {
+        "swaps": [], "expirations": [],
+        "lines": ["Cancelled pending swap (faenilia <- maachuh) because tab 3 is gone"],
+    }
+    assert got["closeNow"] == {
+        "removed": [3], "tracked": ["1", "2", "4"],
+        "lines": ["Max tabs (3) reached. Closing unpinned tab 3 (maachuh) to make room for faenilia "
+                  "(lowest in list order)"],
+    }
+    assert got["endedCloses"] == {
+        "removed": [1], "tracked": ["2", "3", "4"],
+        "lines": ["Max tabs (3) reached. Closing unpinned tab 1 (khaosvt) to make room for itsthefluffs "
+                  "(its stream ended)"],
+        "asked": 1,
+    }
+    assert got["confirmedLive"] == {"removed": [], "expirations": [["4", "itsthefluffs", 30]], "asked": 1}
+    assert got["dueEnded"] == {
+        "removed": [1], "tracked": ["2", "3", "4"], "expirations": [],
+        "lines": ["Pending expiration fired but khaosvt (tab 1) gives way before itsthefluffs (tab 4): "
+                  "its stream ended. Closing it; itsthefluffs stays open"],
+    }
+    assert got["dueKeepOpen"] == {
+        "removed": [], "tracked": ["1", "2", "3", "4"], "expirations": [["3", "maachuh", 23]],
+        "lines": ["Pending expiration fired but maachuh (tab 3) gives way before itsthefluffs (tab 4) and is in "
+                  "grace (23m left). itsthefluffs stays open; maachuh closes then."],
+    }
+    assert got["dueAllKept"] == {
+        "removed": [], "expirations": [],
+        "lines": ["Pending expiration fired but every open tab is protected now; itsthefluffs (tab 4) stays open"],
+    }
+    assert got["dueTwoRecords"] == {"removed": [4], "tracked": ["1", "2", "3"]}
+    assert got["dueSwapKeepOpen"] == {
+        "removed": [], "expirations": [["4", "faenilia", 30]],
+        "lines": ["Pending swap fired but faenilia (tab 4) gives way before maachuh (tab 3) and is in grace "
+                  "(30m left). maachuh stays open; faenilia closes then."],
+    }
+    assert got["keptNewcomer"] == {"expirations": [], "swaps": [], "removed": [], "lines": []}
+    assert got["allProtected"] == {
+        "expirations": [["4", "itsthefluffs", 30]], "removed": [],
+        "lines": ["Max tabs (3) reached and all open tabs are pinned or rescue-protected. Keeping itsthefluffs's "
+                  "tab open for 30m to preserve streak, then closing."],
+    }
+    assert got["duplicate"] == {
+        "removed": [1], "tracked": ["2", "3", "4"],
+        "lines": ["Max tabs (3) reached. Closing unpinned tab 1 (khaosvt) to make room for khaosvt "
+                  "(a newer tab of this stream is open)"],
+    }
+    assert got["twoAtOnce"] == {
+        "expirations": [["4", "itsthefluffs", 30], ["5", "siigynn", 30]], "swaps": [], "removed": [],
+    }
+
+
+MAX_TABS_LISTENER_CASE = r"""async (ctx) => {
+  const MIN = 60 * 1000;
+  const now = Date.now();
+  const list = ["KhaosVT", "caedvt", "faenilia", "maachuh", "siigynn", "itsthefluffs"];
+  const tab = (name, ageMin) => ({ originalStreamer: name, raidHopCount: 0, openedAt: now - ageMin * MIN,
+    saveStreak: false });
+  const lines = (re) => logs.filter((l) => re.test(l)).map((l) => l.replace(/^\[Stream Monitor\] /, ""));
+  // Open: Khaos, Caed, maachuh (Keep Open in the desktop's settings),
+  // itsthefluffs (waiting to close) and siigynn (the target of a swap).
+  local.trackedTabs = { "1": tab("khaosvt", 90), "2": tab("caedvt", 80), "3": tab("maachuh", 70),
+    "5": tab("itsthefluffs", 5), "6": tab("siigynn", 6) };
+  local.pendingExpirations = [{ tabKey: "5", streamer: "itsthefluffs", scheduledAt: now + 25 * MIN }];
+  local.pendingSwaps = [{ newTabKey: "2", newStreamer: "caedvt", targetTabKey: "6", targetStreamer: "siigynn",
+    scheduledAt: now + 24 * MIN }];
+  local.maxTabs = 3;
+  delete local.liveSeen;
+  responder = (path) => (path === "/config"
+    ? { status: 200, text: JSON.stringify({ streamers: list, pinned_streamers: ["Maachuh"],
+      live_streamers: list }) }
+    : { status: 503, text: "" });
+  await ctx.fetchConfig({ applyPlan: false });
+  const out = { seenKhaos: typeof ((local.liveSeen || {}).seen || {}).khaosvt === "number",
+    runStarted: typeof (local.liveSeen || {}).since === "number" };
+  world.calls.length = 0;
+  logs.length = 0;
+
+  // faenilia goes live: the desktop opens her stream.
+  const url = "https://www.twitch.tv/faenilia?sm=1";
+  await ctx.onTabUpdated(4, { url }, { id: 4, windowId: 1, url });
+  out.tracked = Object.keys(local.trackedTabs).sort();
+  out.removed = world.calls.filter((c) => c[0] === "tabs.remove").map((c) => c[1]);
+  out.expirations = local.pendingExpirations.map((e) => [e.tabKey, e.streamer,
+    Math.round((e.scheduledAt - local.trackedTabs["4"].openedAt) / MIN)]);
+  out.swaps = local.pendingSwaps.map((s) => s.targetTabKey);
+  out.lines = lines(/Max tabs \(3\) reached/);
+  return out;
+}"""
+
+
+@pytest.mark.parametrize("kind", ["chrome", "firefox"])
+def test_max_tabs_from_the_config_refresh_to_the_tab_listener(kind, tmp_path):
+    """The whole path: fetchConfig stores the list order, Keep Open and the
+    live record; the tab listener then applies the limit with them and with
+    the pending records in storage. faenilia is the lowest of the streams
+    that stay (maachuh is on Keep Open, itsthefluffs and siigynn are
+    already waiting to close), so she gets her 30 minutes and nothing
+    closes."""
+    got = _run(kind, MAX_TABS_LISTENER_CASE, tmp_path)
+    assert got["seenKhaos"] is True and got["runStarted"] is True
+    assert got["tracked"] == ["1", "2", "3", "4", "5", "6"] and got["removed"] == []
+    assert got["expirations"] == [["5", "itsthefluffs", 25], ["4", "faenilia", 30]]
+    assert got["swaps"] == ["6"]
+    assert got["lines"] == ["Max tabs (3) reached and faenilia is the lowest in list order among the open streams. "
+                            "Keeping its tab open for 30m to preserve streak, then closing."]
+
+
+REARM_CASE = r"""async (ctx) => {
+  const lines = (re) => logs.filter((l) => re.test(l)).map((l) => l.replace(/^\[Stream Monitor\] /, ""));
+  return {
+    swaps: (local.pendingSwaps || []).map((s) => `${s.newTabKey}->${s.targetTabKey}`),
+    expirations: (local.pendingExpirations || []).map((e) => [e.tabKey, e.streamer, e.scheduledAt]),
+    created: world.alarmsCreated.filter(([name]) => /^pending-/.test(name)).map(([name, info]) => [name, info.when]),
+    lines: lines(/Re-armed|stale pending/),
+    startedAt: STARTED_AT,
+  };
+}"""
+
+
+@pytest.mark.parametrize("kind", ["chrome", "firefox"])
+def test_max_tabs_the_init_arms_pending_closes_that_lost_their_alarm(kind, tmp_path):
+    """An extension update clears every alarm while the records and the
+    tabs stay. The init arms each surviving record that has no alarm (a
+    tab waiting to close does not count against the limit, so without its
+    alarm it would stay for good), keeps the close of a swap whose new tab
+    is gone, and still drops the records of tabs that are gone."""
+    now = int(time.time() * 1000)
+    minute = 60 * 1000
+
+    def entry(login):
+        return {"originalStreamer": login, "raidHopCount": 0, "openedAt": now - 50 * minute, "saveStreak": False}
+
+    def tab(tab_id, login):
+        return {"id": tab_id, "windowId": 1, "url": f"https://www.twitch.tv/{login}?sm=1", "active": False,
+                "incognito": False}
+
+    logins = {"3": "maachuh", "4": "itsthefluffs", "5": "faenilia", "6": "siigynn", "7": "krytouz"}
+    seed = {
+        "monitoredStreamers": list(logins.values()),
+        "maxTabs": 3,
+        "trackedTabs": {key: entry(login) for key, login in logins.items()},
+        "pendingExpirations": [
+            {"tabKey": "4", "streamer": "itsthefluffs", "scheduledAt": now + 20 * minute},
+            {"tabKey": "8", "streamer": "gone", "scheduledAt": now + 5 * minute},
+            {"tabKey": "7", "streamer": "krytouz", "scheduledAt": now + 9 * minute},
+        ],
+        "pendingSwaps": [
+            # Overdue by an hour: armed for 30 seconds from now.
+            {"newTabKey": "5", "newStreamer": "faenilia", "targetTabKey": "3", "targetStreamer": "maachuh",
+             "scheduledAt": now - 60 * minute},
+            # Its new tab is gone, its target is still open.
+            {"newTabKey": "9", "newStreamer": "gone", "targetTabKey": "6", "targetStreamer": "siigynn",
+             "scheduledAt": now + 10 * minute},
+        ],
+    }
+    world = {
+        "tabs": {key: tab(int(key), login) for key, login in logins.items()},
+        # Tab 7's alarm survived.
+        "alarms": {"pending-expire-7": {"name": "pending-expire-7", "scheduledTime": now + 9 * minute}},
+    }
+    case = REARM_CASE.replace("STARTED_AT", str(now))
+    got = _run(kind, case, tmp_path, seed=seed, world=world)
+    assert got["swaps"] == ["5->3"]
+    assert got["expirations"] == [["4", "itsthefluffs", now + 20 * minute], ["7", "krytouz", now + 9 * minute],
+                                  ["6", "siigynn", now + 10 * minute]]
+    created = dict(got["created"])
+    assert sorted(created) == ["pending-expire-4", "pending-expire-6", "pending-swap-5"]
+    assert created["pending-expire-4"] == now + 20 * minute
+    assert created["pending-expire-6"] == now + 10 * minute
+    assert 25 * 1000 <= created["pending-swap-5"] - now <= 3 * minute
+    assert got["lines"] == ["Dropped 1 stale pending swap(s) on startup",
+                            "Dropped 1 stale pending expiration(s) on startup",
+                            "Re-armed 2 pending close(s) that had no alarm"]
+
+
+def test_max_tabs_rules_are_the_same_in_both_backgrounds():
+    """The list-order rules are one block of code, identical in both
+    backgrounds apart from the chrome and browser namespaces, and so are
+    the two timers. Max open streams gives 30 minutes; Slot mode's
+    deferral of an unplanned close keeps its own 10."""
+    def block(text, start, end):
+        a = text.index(start)
+        return text[a:text.index(end, a)]
+
+    texts = {kind: path.read_text(encoding="utf-8") for kind, path in BACKGROUNDS.items()}
+    for start, end in (("// Max open streams: who gives way", "// removeInfo.isWindowClosing tells"),
+                       ("async function cancelPendingSwapsForTab(", "// Pending expirations:"),
+                       ("function executePendingExpiration(", "async function shouldAutoMute(")):
+        chrome = block(texts["chrome"], start, end)
+        firefox = block(texts["firefox"], start, end)
+        assert firefox.replace("browser.", "chrome.") == chrome
+    for text in texts.values():
+        assert "function maxTabsDecision(" in text and "function maxTabsDueDecision(" in text
+        assert "const GRACE_MINUTES = 30;" in text
+        assert "const UNPLANNED_CLOSE_DEFER_MINUTES = 10;" in text

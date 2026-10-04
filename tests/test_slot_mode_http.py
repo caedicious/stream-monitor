@@ -142,6 +142,25 @@ def test_c02_config_has_slot_plan_auto_save_and_sources(monkeypatch):
         server.server_close()
 
 
+def test_config_has_no_live_list_before_the_first_poll(monkeypatch):
+    """v1.12.1: the extensions take an empty live list for "nobody is
+    live", and Max open streams closes a tab whose stream ended first. So
+    /config carries null until the first successful poll publishes the
+    real list (every extension since v1.6 skips a value that is not a
+    list)."""
+    monkeypatch.setattr(sm, "CONFIG_SERVER_PORT", 0)  # never the app's own port
+    config = sm.Config(client_id="a", client_secret="b", streamers=["alice"])
+    server = sm.create_config_server(config)
+    assert server is not None
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    try:
+        _, _, body = _send(server.server_address[1], "GET", "/config")
+        assert json.loads(body)["live_streamers"] is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_c01_c02_a_settings_change_updates_auto_save_in_config_and_config_loaded(monkeypatch, activity):
     """O10: automatic saves are off by default and usually turned on in
     Settings while the tray runs. The change reaches /config (the

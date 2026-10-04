@@ -11,7 +11,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-VERSION = "1.12.0"
+VERSION = "1.12.1"
 
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
@@ -281,9 +281,9 @@ def build_settings_window(root, config: dict) -> dict:
         text="The list order is your priority: streams higher in the list open first "
              "when several go live at once and come first in the streak rescue queue. "
              "Drag a row or use Move Up / Move Down to reorder. Add puts a new name "
-             "right below the selected row. Keep Open protects a stream from being "
-             "closed when max tabs is reached; in Slot mode it also decides who gets "
-             "the Keep Open slots, in list order.",
+             "right below the selected row. When max tabs is reached, the lowest open "
+             "stream in the list closes first. Keep Open protects a stream from that; in "
+             "Slot mode it also decides who gets the Keep Open slots, in list order.",
         font=("", 8),
         foreground="gray",
         wraplength=460,
