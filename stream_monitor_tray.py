@@ -55,7 +55,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.12.0"
+VERSION = "1.12.1"
 GITHUB_REPO = "caedicious/stream-monitor"
 
 # Anonymous install counter (v1.9.0): a random install id, the version, and
@@ -2162,7 +2162,11 @@ def create_config_server(config: "Config") -> Optional[HTTPServer]:
         "streamers": config.streamers,
         "pinned_streamers": config.pinned_streamers,
         "version": VERSION,
-        "live_streamers": [],
+        # None until the first successful poll: an empty list would tell
+        # the extensions that nobody is live (since v1.12.1 Max open
+        # streams closes a tab whose stream ended first). Every extension
+        # since v1.6 skips a value that is not a list.
+        "live_streamers": None,
         "paused": config.paused,
         "auto_paused": False,
         "rescue": None,
@@ -2878,9 +2882,10 @@ class TwitchMonitor:
         """Position of a streamer in the settings list (0 = top). The list
         order is the user's priority for OPEN order: rescue queue order
         within each tier and which live streams open first when several
-        go live at once. It never decides which tab gets closed; max-tabs
-        displacement stays oldest-first plus Keep Open. Unlisted names
-        (bell/sidebar rescue finds) sort after every listed one."""
+        go live at once. Since v1.12.1 the extensions also close by it: at
+        Max open streams the lowest open stream in the list gives way
+        (Keep Open streams never do). Unlisted names (bell/sidebar rescue
+        finds) sort after every listed one."""
         try:
             return [s.lower() for s in self.config.streamers].index(name.lower())
         except ValueError:

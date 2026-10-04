@@ -26,10 +26,24 @@ const MAX_LOG_ENTRIES = 2000;
 // opened streams. When a higher-priority streamer needs the slot and the
 // only candidate to displace is still in grace, both tabs stay open
 // temporarily and the displacement is scheduled for when grace expires.
-const GRACE_MINUTES = 10;
+// 30 minutes since v1.12.1 (10 before): the owner's safe viewing time for
+// a streak, the same as a Slot mode turn.
+const GRACE_MINUTES = 30;
 const GRACE_MS = GRACE_MINUTES * 60 * 1000;
+// Slot mode's safety net for an unplanned close (DESIGN 8.3 step 3) keeps
+// the 10 minutes it was designed with.
+const UNPLANNED_CLOSE_DEFER_MINUTES = 10;
+const UNPLANNED_CLOSE_DEFER_MS = UNPLANNED_CLOSE_DEFER_MINUTES * 60 * 1000;
 const PENDING_SWAP_ALARM_PREFIX = "pending-swap-";
 const PENDING_EXPIRE_ALARM_PREFIX = "pending-expire-";
+// Max open streams by list order (v1.12.1): how old the desktop's live list
+// may be and still say that a stream ended, and how long a streamer's
+// last-seen-live time is kept.
+const LIVE_DATA_FRESH_MS = 3 * 60 * 1000;
+const LIVE_SEEN_KEEP_MS = 24 * 60 * 60 * 1000;
+// A stream counts as ended once its streamer has been out of the desktop's
+// live list this long (one missed poll is not an end).
+const STREAM_ENDED_AFTER_MS = 10 * 60 * 1000;
 
 // Load-failure recovery: a tracked tab whose page never actually loaded
 // (DNS failure, network drop, "Server Not Found") runs no content script,
@@ -229,6 +243,8 @@ const trackedTabsChain = makeChain();
 const slotStateChain = makeChain();
 const streamWindowChain = makeChain();
 const tabPlacementChain = makeChain();
+const liveSeenChain = makeChain();
+const maxTabsChain = makeChain();
 
 // Every write of trackedTabs. fn(trackedTabs) changes the map in place; a
 // changed map is saved, which also sends the desktop an open-tabs report
@@ -390,15 +406,24 @@ async function schedulePendingSwap(swap) {
   );
 }
 
+// tabKey is gone (closed, raided away, untracked). A swap that was to close
+// it is dropped. A swap it was the new tab of keeps its target's close, as
+// a pending expiration due at the same time: whether the limit still needs
+// that close is decided when it comes due (maxTabsDueDecision). Dropping it
+// left the browser over the limit with nothing scheduled.
 async function cancelPendingSwapsForTab(tabKey) {
   const swaps = await loadPendingSwaps();
   const remaining = [];
+  const orphaned = [];
   for (const s of swaps) {
-    if (s.newTabKey === tabKey || s.targetTabKey === tabKey) {
+    if (s.targetTabKey === tabKey) {
       await browser.alarms.clear(pendingSwapAlarmName(s.newTabKey));
       await log("info",
         `Cancelled pending swap (${s.newStreamer} <- ${s.targetStreamer}) because tab ${tabKey} is gone`
       );
+    } else if (s.newTabKey === tabKey) {
+      await browser.alarms.clear(pendingSwapAlarmName(s.newTabKey));
+      orphaned.push(s);
     } else {
       remaining.push(s);
     }
@@ -406,9 +431,19 @@ async function cancelPendingSwapsForTab(tabKey) {
   if (remaining.length !== swaps.length) {
     await savePendingSwaps(remaining);
   }
+  for (const s of orphaned) {
+    await log("info",
+      `Pending swap (${s.newStreamer} <- ${s.targetStreamer}): tab ${tabKey} is gone; the close of ${s.targetStreamer} (tab ${s.targetTabKey}) stays scheduled`
+    );
+    await schedulePendingExpiration(s.targetTabKey, s.targetStreamer, s.scheduledAt);
+  }
 }
 
-async function executePendingSwap(newTabKey) {
+function executePendingSwap(newTabKey) {
+  return maxTabsChain(() => executePendingSwapNow(newTabKey));
+}
+
+async function executePendingSwapNow(newTabKey) {
   const swaps = await loadPendingSwaps();
   const swap = swaps.find(s => s.newTabKey === newTabKey);
   if (!swap) {
@@ -419,37 +454,34 @@ async function executePendingSwap(newTabKey) {
   const remaining = swaps.filter(s => s.newTabKey !== newTabKey);
   await savePendingSwaps(remaining);
 
-  // Untracked before the close, so onTabRemoved does not take it for the
-  // owner's. A tab with a slot marker belongs to the desktop's plan; a swap
-  // recorded before the plan arrived never closes it.
-  const outcome = await withTrackedTabs((trackedTabs) => {
-    const target = trackedTabs[swap.targetTabKey];
-    if (!target || target.originalStreamer !== swap.targetStreamer) return "target-untracked";
-    const kept = trackedTabs[swap.newTabKey];
-    if (!kept) return "new-untracked";
-    if (typeof target.slot === "string" || typeof kept.slot === "string") return "slot";
-    delete trackedTabs[swap.targetTabKey];
-    return "close";
-  });
+  // Who gives way is decided again now (settleDueClose). A tab with a slot
+  // marker belongs to the desktop's plan; a swap recorded before the plan
+  // arrived never closes it.
+  const d = await settleDueClose(swap.targetTabKey, swap.targetStreamer, swap.newTabKey);
 
-  if (outcome === "target-untracked") {
+  if (d.kind === "untracked") {
     await log("info",
       `Pending swap fired but target ${swap.targetStreamer} (tab ${swap.targetTabKey}) is no longer tracked; slot already free`
     );
     return;
   }
 
-  if (outcome === "new-untracked") {
+  if (d.kind === "slot") {
     await log("info",
-      `Pending swap fired but new tab ${swap.newTabKey} (${swap.newStreamer}) is no longer tracked; nothing to preserve`
+      `Slot plan: skipped the pending swap for ${swap.targetStreamer} (tab ${swap.targetTabKey}); the plan manages slot tabs`
     );
     return;
   }
 
-  if (outcome === "slot") {
+  if (d.kind === "room") {
     await log("info",
-      `Slot plan: skipped the pending swap for ${swap.targetStreamer} (tab ${swap.targetTabKey}); the plan manages slot tabs`
+      `Pending swap fired but Max tabs has room again; ${swap.targetStreamer} (tab ${swap.targetTabKey}) stays open`
     );
+    return;
+  }
+
+  if (d.kind !== "close") {
+    await finishDueStay("Pending swap", swap.targetStreamer, swap.targetTabKey, d);
     return;
   }
 
@@ -469,8 +501,8 @@ async function executePendingSwap(newTabKey) {
 }
 
 // ---------------------------------------------------------------------------
-// Pending expirations — lowest-priority streamer gets a 10-min viewing
-// window before being closed to respect max_tabs
+// Pending expirations: the stream lowest in list order gets its
+// GRACE_MINUTES viewing window before being closed to respect max_tabs
 // ---------------------------------------------------------------------------
 //
 // When a monitored streamer goes live and their rank is the lowest among
@@ -518,7 +550,11 @@ async function cancelPendingExpirationForTab(tabKey) {
   }
 }
 
-async function executePendingExpiration(tabKey) {
+function executePendingExpiration(tabKey) {
+  return maxTabsChain(() => executePendingExpirationNow(tabKey));
+}
+
+async function executePendingExpirationNow(tabKey) {
   const expirations = await loadPendingExpirations();
   const exp = expirations.find(e => e.tabKey === tabKey);
   if (!exp) {
@@ -529,25 +565,31 @@ async function executePendingExpiration(tabKey) {
   const remaining = expirations.filter(e => e.tabKey !== tabKey);
   await savePendingExpirations(remaining);
 
-  // Untracked before the close; a slot tab is left to the plan (see
-  // executePendingSwap).
-  const outcome = await withTrackedTabs((trackedTabs) => {
-    const tracked = trackedTabs[tabKey];
-    if (!tracked || tracked.originalStreamer !== exp.streamer) return "untracked";
-    if (typeof tracked.slot === "string") return "slot";
-    delete trackedTabs[tabKey];
-    return "close";
-  });
-  if (outcome === "untracked") {
+  // Who gives way is decided again now; a slot tab is left to the plan
+  // (see executePendingSwapNow).
+  const d = await settleDueClose(tabKey, exp.streamer);
+  if (d.kind === "untracked") {
     await log("info",
       `Pending expiration fired but ${exp.streamer} (tab ${tabKey}) is no longer the tracked streamer; skipping`
     );
     return;
   }
-  if (outcome === "slot") {
+  if (d.kind === "slot") {
     await log("info",
       `Slot plan: skipped the pending expiration for ${exp.streamer} (tab ${tabKey}); the plan manages slot tabs`
     );
+    return;
+  }
+
+  if (d.kind === "room") {
+    await log("info",
+      `Pending expiration fired but Max tabs has room again; ${exp.streamer} (tab ${tabKey}) stays open`
+    );
+    return;
+  }
+
+  if (d.kind !== "close") {
+    await finishDueStay("Pending expiration", exp.streamer, tabKey, d);
     return;
   }
 
@@ -3231,9 +3273,9 @@ async function sendSaveTurnToChannel(tabKey, login) {
   return true;
 }
 
-// DESIGN 8.3 step 3. An unplanned close of a tab younger than GRACE_MS is
-// deferred, a safety net against a desktop bug; it is logged once per plan
-// seq.
+// DESIGN 8.3 step 3. An unplanned close of a tab younger than
+// UNPLANNED_CLOSE_DEFER_MS is deferred, a safety net against a desktop bug;
+// it is logged once per plan seq.
 async function applyPlanCloses(plan, byStreamer, planned) {
   const seq = planSeqOf(plan);
   const deferred = new Set();
@@ -3245,7 +3287,7 @@ async function applyPlanCloses(plan, byStreamer, planned) {
     // slot wins, since the close would only be reopened.
     if (!login || planned.has(login)) continue;
     for (const { tabKey, entry } of byStreamer.get(login) || []) {
-      if (reason === "unplanned" && Date.now() - (entry.openedAt || 0) < GRACE_MS) {
+      if (reason === "unplanned" && Date.now() - (entry.openedAt || 0) < UNPLANNED_CLOSE_DEFER_MS) {
         deferred.add(login);
         continue;
       }
@@ -3264,7 +3306,7 @@ async function applyPlanCloses(plan, byStreamer, planned) {
   });
   for (const login of firstTime) {
     await log("info",
-      `Slot plan: deferred closing ${login} (unplanned); its tab is younger than ${GRACE_MINUTES} minutes`
+      `Slot plan: deferred closing ${login} (unplanned); its tab is younger than ${UNPLANNED_CLOSE_DEFER_MINUTES} minutes`
     );
   }
 }
@@ -4423,6 +4465,8 @@ async function fetchConfig({ applyPlan = true } = {}) {
       // Save live status from desktop app for popup display
       if (Array.isArray(data.live_streamers)) {
         await browser.storage.local.set({ liveStreamers: data.live_streamers });
+        // Max open streams tells an ended stream from a live one by this.
+        await noteLiveSeen(data.live_streamers);
       }
 
       // Streaks the desktop counts as already saved (v1.11.2). Older
@@ -4907,7 +4951,7 @@ async function onTabUpdated(tabId, changeInfo, tab) {
 
     // While a plan runs here the plan is the cap, not Max open streams.
     if (maxTabs > 0 && !viaRescue && !viaSlot && !(await planActiveHere())) {
-      await enforceMaxTabs(tabKey, newStreamer, maxTabs, pinnedStreamers, now);
+      await enforceMaxTabs(tabKey, newStreamer, maxTabs, now);
     }
   }
 }
@@ -4959,63 +5003,296 @@ async function noteSaveLanding(tabKey, streamer, url) {
   await log("info", `Save visit for ${streamer} (tab ${tabKey}) moved to ${path}; still tracked`);
 }
 
-// Max open streams, when a newly tracked tab goes over it: try to displace
-// an open tab. Protected from displacement: pinned tabs (streamers the user
-// marked "Keep Open" in settings), rescue tabs (the streak-rescue rotation
-// manages their lifecycle itself), manual save tabs (a Streaks at Risk
-// click) and slot tabs (the desktop's plan manages them). Core invariant:
-// every newly-opened tab is guaranteed at least GRACE_MINUTES of viewing
-// time so the viewer builds a Twitch view streak. The new tab is never
-// closed immediately by max-tabs; the three options:
-//   - an unprotected tab is past its grace window: close it immediately,
-//     and the new tab keeps the slot;
-//   - the only unprotected tabs are still in grace: schedule a pending
-//     swap for the earliest grace expiry (both tabs stay open until then);
-//   - everything else is protected: schedule a pending expiration on the
-//     new tab at now + GRACE_MS so it still gets its 10 minutes before
-//     closing.
-async function enforceMaxTabs(tabKey, newStreamer, maxTabs, pinnedStreamers, now) {
-  const decision = await withTrackedTabs((trackedTabs) => {
-    if (!trackedTabs[tabKey]) return null; // closed meanwhile
-    const tabCount = Object.keys(trackedTabs).length;
-    if (tabCount <= maxTabs) return null;
-    const candidates = Object.entries(trackedTabs).map(([k, info]) => {
-      const openedAt = info.openedAt || 0;
-      return {
-        tabKey: k,
-        streamer: info.originalStreamer,
-        pinned: pinnedStreamers.has(info.originalStreamer),
-        shielded: !!info.rescue || !!info.manualSave || typeof info.slot === "string",
-        openedAt,
-        graceUntil: openedAt + GRACE_MS,
-        inGrace: now - openedAt < GRACE_MS,
-      };
-    });
-    const others = candidates.filter(c => c.tabKey !== tabKey);
-    // Unprotected tabs past their grace window are the first to close.
-    // FIFO eviction (oldest first) so the longest-running tab cycles out
-    // and newer ones get more time to build streak.
-    const displaceable = others
-      .filter(c => !c.pinned && !c.shielded && !c.inGrace)
-      .sort((a, b) => a.openedAt - b.openedAt);
-    // Unprotected but in grace: swap at the earliest expiry.
-    const inGrace = others
-      .filter(c => !c.pinned && !c.shielded && c.inGrace)
-      .sort((a, b) => a.graceUntil - b.graceUntil);
-    if (displaceable.length > 0) {
-      const target = displaceable[0];
-      delete trackedTabs[target.tabKey];
-      return { kind: "close", target };
+// ---------------------------------------------------------------------------
+// Max open streams: who gives way
+// ---------------------------------------------------------------------------
+//
+// Since v1.12.1 list order decides it (the owner's request of 2026-10-03,
+// change control section 6.1): when a newly tracked tab goes over the
+// limit, the open stream lowest in the desktop's list is the one that
+// closes, the new one included. Two kinds of tab give way before any live
+// stream, and at once: a tab left on a stream that ended, and an older tab
+// of a streamer who has a newer one open. Never closed for the limit: Keep
+// Open streamers (even after their stream ended, the owner's choice),
+// rescue tabs (the streak-rescue rotation manages their lifecycle itself),
+// manual save tabs (a Streaks at Risk click) and slot tabs (the desktop's
+// plan manages them). Core invariant: every other tab gets at least
+// GRACE_MINUTES of viewing time before Max open streams closes it, so the
+// viewer builds a Twitch view streak. A close that was scheduled is decided
+// again when it comes due (maxTabsDueDecision): the list, Keep Open and
+// the streams may all have changed in those minutes.
+
+// When each streamer was last in the desktop's live list: {at, since,
+// seen}. at is the time of the last reading, since the start of the
+// unbroken run of readings it belongs to (readings no more than
+// LIVE_DATA_FRESH_MS apart) and seen a map of login to time.
+function withLiveSeen(fn) {
+  return liveSeenChain(async () => {
+    const result = await browser.storage.local.get("liveSeen");
+    const rec = isPlainObject(result.liveSeen) ? result.liveSeen : {};
+    if (!isPlainObject(rec.seen)) rec.seen = {};
+    const out = await fn(rec);
+    await browser.storage.local.set({ liveSeen: rec });
+    return out;
+  });
+}
+
+// Called on every config refresh with the desktop's live list.
+async function noteLiveSeen(liveLogins, now = Date.now()) {
+  await withLiveSeen((rec) => {
+    if (typeof rec.at !== "number" || typeof rec.since !== "number" || now - rec.at > LIVE_DATA_FRESH_MS) {
+      rec.since = now;
     }
-    if (inGrace.length > 0) return { kind: "swap", target: inGrace[0] };
-    return { kind: "expire" };
+    rec.at = now;
+    for (const name of liveLogins) {
+      if (typeof name === "string" && name) rec.seen[name.toLowerCase()] = now;
+    }
+    for (const [login, at] of Object.entries(rec.seen)) {
+      if (typeof at !== "number" || now - at > LIVE_SEEN_KEEP_MS) delete rec.seen[login];
+    }
+  });
+}
+
+// A reading taken now, before a verdict that a stream ended is acted on:
+// the stored one can be a minute old, and the desktop publishes its list
+// before it opens a tab. A desktop that does not answer leaves the stored
+// reading as it is.
+async function refreshLiveSeen() {
+  try {
+    const data = await getDesktopConfig();
+    if (Array.isArray(data?.live_streamers)) await noteLiveSeen(data.live_streamers);
+  } catch (e) {
+    // Not answering: the stored reading stands while it is recent.
+  }
+}
+
+// A tab whose stream ended: through an unbroken run of readings at least
+// STREAM_ENDED_AFTER_MS long its streamer was never in the desktop's live
+// list (one missed poll is not an end, and neither is the silence while
+// the desktop app was closed or the computer asleep), and the tab is at
+// least that old (a tab that just opened may be ahead of the list). Only a
+// recent reading can say so: with the desktop app not answering, every
+// open stream counts as live. A save visit plays a recording, so it is
+// never an ended stream.
+function streamEnded(info, liveSeen, now) {
+  if (info.saveStreak === true || typeof info.landing === "string") return false;
+  if (!isPlainObject(liveSeen) || typeof liveSeen.at !== "number") return false;
+  if (now - liveSeen.at > LIVE_DATA_FRESH_MS) return false;
+  if (now - (info.openedAt || 0) < STREAM_ENDED_AFTER_MS) return false;
+  const since = typeof liveSeen.since === "number" ? liveSeen.since : liveSeen.at;
+  const seen = isPlainObject(liveSeen.seen) ? liveSeen.seen[info.originalStreamer] : undefined;
+  const last = typeof seen === "number" && seen > since ? seen : since;
+  return liveSeen.at - last >= STREAM_ENDED_AFTER_MS;
+}
+
+// The tracked tabs as Max open streams sees them. ctx: {pinned: Set of Keep
+// Open logins, order: Map of login to list position, liveSeen, leaving: Map
+// of tab key to streamer for the tabs already scheduled to close, now}.
+// ended is judged only for streamers on the list: the desktop polls no
+// others, so a raid target it never lists is not an ended stream.
+// duplicate: an older tab of a streamer who has a newer tab open (the
+// desktop opens a second one when a stream drops and comes back).
+function maxTabsCandidates(trackedTabs, ctx) {
+  const entries = Object.entries(trackedTabs);
+  const newest = new Map();
+  for (const [k, info] of entries) {
+    const best = newest.get(info.originalStreamer);
+    if (!best || (info.openedAt || 0) > best.openedAt) {
+      newest.set(info.originalStreamer, { tabKey: k, openedAt: info.openedAt || 0 });
+    }
+  }
+  return entries.map(([k, info]) => {
+    const openedAt = info.openedAt || 0;
+    return {
+      tabKey: k,
+      streamer: info.originalStreamer,
+      kept: ctx.pinned.has(info.originalStreamer) || !!info.rescue || !!info.manualSave ||
+        typeof info.slot === "string",
+      rank: ctx.order.has(info.originalStreamer) ? ctx.order.get(info.originalStreamer) : Infinity,
+      ended: ctx.order.has(info.originalStreamer) && streamEnded(info, ctx.liveSeen, ctx.now),
+      duplicate: newest.get(info.originalStreamer).tabKey !== k,
+      leaving: ctx.leaving.get(k) === info.originalStreamer,
+      openedAt,
+      graceUntil: openedAt + GRACE_MS,
+      inGrace: ctx.now - openedAt < GRACE_MS,
+    };
+  });
+}
+
+// Who gives way first: a stream that ended, then a duplicate, then the
+// lowest in list order (a streamer not on the list counts as lowest), then
+// the oldest tab.
+function maxTabsGiveWayOrder(a, b) {
+  if (a.ended !== b.ended) return a.ended ? -1 : 1;
+  if (a.duplicate !== b.duplicate) return a.duplicate ? -1 : 1;
+  if (a.rank !== b.rank) return a.rank > b.rank ? -1 : 1;
+  return a.openedAt - b.openedAt;
+}
+
+// Nothing is lost by closing these now: an ended stream has nothing left to
+// watch, a duplicate's stream plays on in the newer tab, and the rest have
+// had their grace.
+function maxTabsClosesAtOnce(c) {
+  return c.ended || c.duplicate || !c.inGrace;
+}
+
+function maxTabsWhy(c) {
+  if (c.ended) return "its stream ended";
+  if (c.duplicate) return "a newer tab of this stream is open";
+  return "lowest in list order";
+}
+
+// What to do about the newly tracked tab tabKey: null (within the limit, or
+// the new tab is protected and so is every other open tab),
+// {kind: "close", target} (close target now, see maxTabsClosesAtOnce),
+// {kind: "swap", target} (target is live and still in grace: close it when
+// that ends, both tabs stay open until then) or {kind: "expire", why} (the
+// new tab itself closes after its grace; why is "lowest" when it is the
+// first to give way in the order above, "protected" when every other open
+// tab is protected). Tabs already scheduled to close do not count against
+// the limit.
+function maxTabsDecision(trackedTabs, tabKey, maxTabs, ctx) {
+  if (!trackedTabs[tabKey]) return null; // closed meanwhile
+  const staying = maxTabsCandidates(trackedTabs, ctx).filter(c => !c.leaving);
+  if (staying.length <= maxTabs) return null;
+  const self = staying.find(c => c.tabKey === tabKey);
+  if (!self) return null; // already scheduled to close
+  const pool = staying.filter(c => !c.kept).sort(maxTabsGiveWayOrder);
+  if (!pool.some(c => c.tabKey !== tabKey)) return self.kept ? null : { kind: "expire", why: "protected" };
+  const target = pool[0];
+  if (target.tabKey === tabKey) return { kind: "expire", why: "lowest" };
+  return { kind: maxTabsClosesAtOnce(target) ? "close" : "swap", target };
+}
+
+// The scheduled close of tabKey has come due. Decided again as if the tab
+// arrived now: {kind: "room"} (the limit is off, or a tab closed meanwhile:
+// nothing closes), {kind: "kept"} (every open tab is protected now, this
+// one included), {kind: "close", target} (target is tabKey: it closes),
+// {kind: "instead", target} (another tab gives way before it and closes
+// now; tabKey stays) or {kind: "defer", target} (another tab gives way
+// before it but is still in grace: it closes when that ends; tabKey
+// stays). ctx.leaving must not hold tabKey (maxTabsContext's skipTabKey).
+function maxTabsDueDecision(trackedTabs, tabKey, maxTabs, ctx) {
+  if (!(maxTabs > 0)) return { kind: "room" };
+  const staying = maxTabsCandidates(trackedTabs, ctx).filter(c => !c.leaving);
+  if (!staying.some(c => c.tabKey === tabKey) || staying.length <= maxTabs) return { kind: "room" };
+  const target = staying.filter(c => !c.kept).sort(maxTabsGiveWayOrder)[0];
+  if (!target) return { kind: "kept" };
+  if (target.tabKey === tabKey) return { kind: "close", target };
+  return { kind: maxTabsClosesAtOnce(target) ? "instead" : "defer", target };
+}
+
+// What the rules above need besides the tracked tabs. skipTabKey names the
+// tab whose own timer has come due, so it is not counted as leaving.
+async function maxTabsContext(now, skipTabKey = null) {
+  const stored = await browser.storage.local.get(["monitoredStreamers", "pinnedStreamers", "liveSeen", "maxTabs"]);
+  const order = new Map();
+  (Array.isArray(stored.monitoredStreamers) ? stored.monitoredStreamers : []).forEach((name, i) => {
+    if (!order.has(name)) order.set(name, i);
+  });
+  const leaving = new Map();
+  for (const s of await loadPendingSwaps()) leaving.set(String(s.targetTabKey), s.targetStreamer);
+  for (const e of await loadPendingExpirations()) leaving.set(String(e.tabKey), e.streamer);
+  if (skipTabKey !== null) leaving.delete(String(skipTabKey));
+  return {
+    maxTabs: stored.maxTabs || 0,
+    pinned: new Set(Array.isArray(stored.pinnedStreamers) ? stored.pinnedStreamers : []),
+    order,
+    liveSeen: stored.liveSeen,
+    leaving,
+    now,
+  };
+}
+
+// The context for a decision that is acted on. When it would call an
+// unprotected tab's stream ended, the desktop is asked again first
+// (refreshLiveSeen).
+async function maxTabsContextConfirmed(now, skipTabKey = null) {
+  const ctx = await maxTabsContext(now, skipTabKey);
+  const { trackedTabs } = await loadState();
+  if (!maxTabsCandidates(trackedTabs, ctx).some(c => c.ended && !c.kept)) return ctx;
+  await refreshLiveSeen();
+  return maxTabsContext(now, skipTabKey);
+}
+
+// A scheduled close of tabKey (streamer) has come due: decides who gives
+// way now. The tab that closes is untracked in the same step, so
+// onTabRemoved does not take the close for the owner's. partnerKey: a
+// swap's new tab, looked at only for a slot marker. Besides the kinds of
+// maxTabsDueDecision: "untracked" (the tab is gone or shows another
+// streamer) and "slot" (a slot tab is the plan's).
+async function settleDueClose(tabKey, streamer, partnerKey = null) {
+  const ctx = await maxTabsContextConfirmed(Date.now(), tabKey);
+  return withTrackedTabs((trackedTabs) => {
+    const tracked = trackedTabs[tabKey];
+    if (!tracked || tracked.originalStreamer !== streamer) return { kind: "untracked" };
+    const partner = partnerKey === null ? null : trackedTabs[partnerKey];
+    if (typeof tracked.slot === "string" || (partner && typeof partner.slot === "string")) return { kind: "slot" };
+    const d = maxTabsDueDecision(trackedTabs, tabKey, ctx.maxTabs, ctx);
+    if (d.kind === "close" || d.kind === "instead") delete trackedTabs[d.target.tabKey];
+    return d;
+  });
+}
+
+// A due close whose own tab stays open (the kinds "kept", "instead" and
+// "defer" of maxTabsDueDecision). what: "Pending swap" or "Pending
+// expiration", for the log.
+async function finishDueStay(what, streamer, tabKey, d) {
+  if (d.kind === "kept") {
+    await log("info",
+      `${what} fired but every open tab is protected now; ${streamer} (tab ${tabKey}) stays open`
+    );
+    return;
+  }
+  const target = d.target;
+  if (d.kind === "defer") {
+    const minutesLeft = Math.max(1, Math.ceil((target.graceUntil - Date.now()) / 60000));
+    await log("info",
+      `${what} fired but ${target.streamer} (tab ${target.tabKey}) gives way before ${streamer} (tab ${tabKey}) and is in grace (${minutesLeft}m left). ${streamer} stays open; ${target.streamer} closes then.`
+    );
+    notifyUser(
+      "Stream Monitor",
+      `${streamer} stays open. ${target.streamer} is lower in your list and closes in ~${minutesLeft}m.`
+    );
+    await schedulePendingExpiration(target.tabKey, target.streamer, target.graceUntil);
+    return;
+  }
+  const why = maxTabsWhy(target);
+  await log("info",
+    `${what} fired but ${target.streamer} (tab ${target.tabKey}) gives way before ${streamer} (tab ${tabKey}): ${why}. Closing it; ${streamer} stays open`
+  );
+  notifyUser(
+    "Stream Monitor",
+    `Closed ${target.streamer} (${why}), so ${streamer} stays open.`
+  );
+  await cancelPendingSwapsForTab(target.tabKey);
+  await cancelPendingExpirationForTab(target.tabKey);
+  try {
+    await browser.tabs.remove(Number(target.tabKey));
+  } catch (e) {
+    await log("warn", `Failed to close tab ${target.tabKey}:`, e.message);
+  }
+}
+
+// One arrival or due close at a time (maxTabsChain): each reads the pending
+// records, decides, and writes its own before the next one reads them.
+function enforceMaxTabs(tabKey, newStreamer, maxTabs, now) {
+  return maxTabsChain(() => enforceMaxTabsNow(tabKey, newStreamer, maxTabs, now));
+}
+
+async function enforceMaxTabsNow(tabKey, newStreamer, maxTabs, now) {
+  const ctx = await maxTabsContextConfirmed(now);
+  const decision = await withTrackedTabs((trackedTabs) => {
+    const d = maxTabsDecision(trackedTabs, tabKey, maxTabs, ctx);
+    if (d && d.kind === "close") delete trackedTabs[d.target.tabKey];
+    return d;
   });
   if (!decision) return;
 
   if (decision.kind === "close") {
     const target = decision.target;
     await log("info",
-      `Max tabs (${maxTabs}) reached. Closing unpinned tab ${target.tabKey} (${target.streamer}) to make room for ${newStreamer}`
+      `Max tabs (${maxTabs}) reached. Closing unpinned tab ${target.tabKey} (${target.streamer}) to make room for ${newStreamer} (${maxTabsWhy(target)})`
     );
     notifyUser(
       "Stream Monitor",
@@ -5032,7 +5309,7 @@ async function enforceMaxTabs(tabKey, newStreamer, maxTabs, pinnedStreamers, now
     const target = decision.target;
     const minutesLeft = Math.max(1, Math.ceil((target.graceUntil - now) / 60000));
     await log("info",
-      `Max tabs (${maxTabs}) reached but unpinned ${target.streamer} (tab ${target.tabKey}) is in grace (${minutesLeft}m left). Keeping both tabs open; swap scheduled.`
+      `Max tabs (${maxTabs}) reached but unpinned ${target.streamer} (tab ${target.tabKey}), the lowest in list order, is in grace (${minutesLeft}m left). Keeping both tabs open; swap scheduled.`
     );
     notifyUser(
       "Stream Monitor",
@@ -5045,9 +5322,20 @@ async function enforceMaxTabs(tabKey, newStreamer, maxTabs, pinnedStreamers, now
       targetStreamer: target.streamer,
       scheduledAt: target.graceUntil,
     });
+  } else if (decision.why === "lowest") {
+    // The new stream is the lowest in list order among the open ones, so it
+    // is the one to go. It still gets its full streak window first.
+    await log("info",
+      `Max tabs (${maxTabs}) reached and ${newStreamer} is the lowest in list order among the open streams. Keeping its tab open for ${GRACE_MINUTES}m to preserve streak, then closing.`
+    );
+    notifyUser(
+      "Stream Monitor",
+      `Max tabs (${maxTabs}) reached. ${newStreamer} is the lowest in your list among the open streams, so its tab will close in ${GRACE_MINUTES} minutes after its streak is preserved.`
+    );
+    await schedulePendingExpiration(tabKey, newStreamer, now + GRACE_MS);
   } else {
     // Every other open tab is protected, so none is displaced. The new tab
-    // still gets its 10-minute streak window before closing.
+    // still gets its full streak window before closing.
     await log("info",
       `Max tabs (${maxTabs}) reached and all open tabs are pinned or rescue-protected. Keeping ${newStreamer}'s tab open for ${GRACE_MINUTES}m to preserve streak, then closing.`
     );
@@ -5248,6 +5536,11 @@ browser.runtime.onInstalled.addListener((details) => {
         for (const s of pending) {
           if (!alive.includes(s)) {
             await browser.alarms.clear(pendingSwapAlarmName(s.newTabKey));
+            // Only the new tab is gone: the target's close stays scheduled
+            // (see cancelPendingSwapsForTab).
+            if (liveTabIds.has(s.targetTabKey)) {
+              await schedulePendingExpiration(s.targetTabKey, s.targetStreamer, s.scheduledAt);
+            }
           }
         }
         await log("info", `Dropped ${dropped} stale pending swap(s) on startup`);
@@ -5269,6 +5562,25 @@ browser.runtime.onInstalled.addListener((details) => {
         await log("info", `Dropped ${dropped} stale pending expiration(s) on startup`);
       }
     }
+
+    // An extension update clears every alarm while the records and the tabs
+    // stay, and so can a browser restart. A record without its alarm would
+    // never close its tab, and Max open streams does not count a tab that
+    // is waiting to close: arm it again.
+    let rearmed = 0;
+    for (const s of await loadPendingSwaps()) {
+      const name = pendingSwapAlarmName(s.newTabKey);
+      if (await browser.alarms.get(name)) continue;
+      await browser.alarms.create(name, { when: Math.max(s.scheduledAt, Date.now() + 30000) });
+      rearmed++;
+    }
+    for (const e of await loadPendingExpirations()) {
+      const name = pendingExpireAlarmName(e.tabKey);
+      if (await browser.alarms.get(name)) continue;
+      await browser.alarms.create(name, { when: Math.max(e.scheduledAt, Date.now() + 30000) });
+      rearmed++;
+    }
+    if (rearmed > 0) await log("info", `Re-armed ${rearmed} pending close(s) that had no alarm`);
 
     // Same cleanup for load-recovery state.
     const recovery = await loadLoadRecovery();
