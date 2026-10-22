@@ -351,7 +351,9 @@ def card_verdict(card: dict, save, *, lapsed_by_age: bool, watch_start) -> tuple
         return "stale", 2
     count = card.get("count")
     saved_count = save.get("count")
-    if _is_int(count) and _is_int(saved_count):
+    # A saved count of 0 is a count not known (Twitch's dialog shows
+    # "0-stream" before it loads the number) and compares with nothing.
+    if _is_int(count) and _is_int(saved_count) and saved_count > 0:
         if count > saved_count:
             return "fresh", 3
         if count < saved_count:
@@ -377,7 +379,7 @@ def save_covers(item: dict, save, watch_start) -> bool:
         return item["break_at"] <= saved_at
     count = item.get("count")
     saved_count = save.get("count")
-    if _is_int(count) and _is_int(saved_count):
+    if _is_int(count) and _is_int(saved_count) and saved_count > 0:
         if count > saved_count:
             return False
         if count < saved_count:

@@ -1138,8 +1138,10 @@ function pruneExpiredAtRiskStreaks() {
 
 // The desktop's count rule: a card whose count is above the saved count is
 // about a break after the save (the streak grew since). Needs both counts.
+// A saved count of 0 is a count not known (Twitch's dialog shows "0-stream"
+// before it loads the number) and no card outgrows it.
 function cardOutgrowsSave(card, save) {
-  return Number.isInteger(card.count) && Number.isInteger(save.count) && card.count > save.count;
+  return Number.isInteger(card.count) && Number.isInteger(save.count) && save.count > 0 && card.count > save.count;
 }
 
 // The largest label unit that divides an age in seconds ("just now" is 0

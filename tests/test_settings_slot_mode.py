@@ -437,3 +437,93 @@ def test_r01_settings_window_centers_without_a_work_area(tk_root, monkeypatch):
     tk_root.update_idletasks()
     centered = (tk_root.winfo_screenheight() - 700) // 2
     assert tk_root.geometry().endswith(f"+{centered}"), tk_root.geometry()
+
+
+# ---------------------------------------------------------------------------
+# Channel names are logins (v1.12.2)
+# ---------------------------------------------------------------------------
+
+def test_form_to_config_reads_the_login_out_of_a_link_or_handle():
+    """A user put https://www.twitch.tv/<name> into "Your Twitch Channel" and
+    every Twitch poll failed with HTTP 400. Links and @handles become the
+    login on save, in the list, the pins and the channel field alike."""
+    form = _full_form(streamers=["https://www.twitch.tv/Alice/videos", "@Bob", "carol"], pinned={"twitch.tv/bob"},
+                      own_channel=" https://www.twitch.tv/Adayics ")
+    saved = se.form_to_config(OLD_CONFIG, form)
+    assert saved["streamers"] == ["alice", "bob", "carol"]
+    assert saved["pinned_streamers"] == ["bob"]
+    assert saved["own_channel"] == "adayics"
+
+
+def _label_texts(widget):
+    from tkinter import ttk as _ttk
+    out = []
+    for child in widget.winfo_children():
+        if isinstance(child, _ttk.Label):
+            out.append(str(child.cget("text")))
+        out.extend(_label_texts(child))
+    return out
+
+
+def test_the_channel_label_asks_for_the_handle(tk_root):
+    _build(tk_root, OLD_CONFIG)
+    labels = [text for text in _label_texts(tk_root) if "Your Twitch Channel" in text]
+    assert labels == ["Your Twitch Channel (the handle, like caedvt, not the link):"]
+
+
+def test_the_add_box_takes_a_channel_link_and_refuses_a_name_twitch_would(tk_root, monkeypatch):
+    w = _build(tk_root, OLD_CONFIG)
+    errors = []
+    monkeypatch.setattr(se.messagebox, "showerror", lambda title, msg: errors.append((title, msg)))
+    entry = w["add_entry"]
+    add = next(b for b in _buttons(tk_root) if str(b.cget("text")) == "Add")
+    entry.insert(0, "https://www.twitch.tv/Carol?sm=1")
+    add.invoke()
+    tk_root.update()
+    rows = [str(r) for r in w["listbox"].get(0, "end")]
+    assert any(r.endswith("carol") for r in rows), rows
+    assert not any("twitch.tv" in r for r in rows), rows
+    assert entry.get() == ""
+
+    entry.insert(0, "my friend")
+    add.invoke()
+    tk_root.update()
+    assert errors and errors[0][0] == "Not a channel name" and "my friend" in errors[0][1], errors
+    assert not any("friend" in r for r in [str(r) for r in w["listbox"].get(0, "end")])
+
+
+def test_save_refuses_a_channel_field_that_holds_no_login(tk_root, monkeypatch):
+    w = _build(tk_root, OLD_CONFIG)
+    errors = []
+    saved = []
+    monkeypatch.setattr(se.messagebox, "showerror", lambda title, msg: errors.append((title, msg)))
+    monkeypatch.setattr(se, "save_config", lambda config: saved.append(dict(config)))
+    own = next(c for c in _entries(tk_root) if c.get() == "me")
+    own.delete(0, "end")
+    own.insert(0, "my channel")
+    w["save_settings"]()
+    assert errors and errors[0][0] == "Not a channel name" and saved == []
+    own.delete(0, "end")
+    own.insert(0, "https://www.twitch.tv/Me")
+    w["save_settings"]()
+    assert saved and saved[0]["own_channel"] == "me"
+
+
+def _buttons(widget):
+    from tkinter import ttk as _ttk
+    out = []
+    for child in widget.winfo_children():
+        if isinstance(child, _ttk.Button):
+            out.append(child)
+        out.extend(_buttons(child))
+    return out
+
+
+def _entries(widget):
+    from tkinter import ttk as _ttk
+    out = []
+    for child in widget.winfo_children():
+        if isinstance(child, _ttk.Entry):
+            out.append(child)
+        out.extend(_entries(child))
+    return out

@@ -36,6 +36,7 @@ from PIL import Image, ImageDraw
 # bundles them.
 import slot_scheduler
 import streak_saves
+from twitch_login import is_login, login_from_text
 
 # Fix for PyInstaller --onefile: the _MEI temp extraction folder can be cleaned
 # up by Windows or a new exe instance while this process is still running. This
@@ -55,7 +56,7 @@ def _stable_ca_bundle():
 _stable_ca_bundle()
 
 # Version
-VERSION = "1.12.1"
+VERSION = "1.12.2"
 GITHUB_REPO = "caedicious/stream-monitor"
 
 # Anonymous install counter (v1.9.0): a random install id, the version, and
@@ -1370,11 +1371,14 @@ def _handle_already_saved(name: str, count: int, payload: dict) -> SaveReport:
             # save. A real break once the save ends reads exactly the same,
             # so forget the cards this save covers (its count or lower). A
             # link event's key has no count and is not covered.
+            # A count of 0 is a count not known (Twitch's dialog shows
+            # "0-stream" before it loads the number): the save covers
+            # every card of this streamer.
             covered = [
                 seen for seen in list(_streak_event_seen) + list(_streak_event_seen_at)
                 + list(_streak_item_keys)
                 if seen[0] in _CARD_STATUSES and seen[1] == name
-                and isinstance(seen[2], int) and not isinstance(seen[2], bool) and seen[2] <= count
+                and isinstance(seen[2], int) and not isinstance(seen[2], bool) and (count == 0 or seen[2] <= count)
             ]
             for seen in covered:
                 _streak_event_seen.discard(seen)
@@ -1413,7 +1417,7 @@ def _handle_already_saved(name: str, count: int, payload: dict) -> SaveReport:
         saved_at=result.at,
         page_url=page_url,
     )
-    title = f"{name}: {count}-stream streak is already safe"
+    title = f"{name}: {count}-stream streak is already safe" if count > 0 else f"{name}: streak is already safe"
     msg = "Twitch says it was kept. Nothing to rescue for now."
     log.info("Streak event: %s - %s", title, msg)
     _notify_tray(title, msg)
@@ -2376,6 +2380,7 @@ class TwitchMonitor:
         self.running = False
         self.paused = False
         self.auto_paused = False  # True when user's own channel is live
+        self._unpollable_warned: set = set()  # names left out of the poll, logged once
         self.thread: Optional[threading.Thread] = None
         self.status_callback = status_callback or (lambda x: None)
         self.notify_callback = notify_callback or (lambda t, m: None)
@@ -2606,15 +2611,33 @@ class TwitchMonitor:
         response.raise_for_status()
         return response.json()
 
+    def _pollable_login(self, name: str, what: str) -> bool:
+        """Whether name can go into a Twitch poll; a name that cannot is
+        logged once ("use the handle, not the link")."""
+        if is_login(name):
+            return True
+        if name not in self._unpollable_warned:
+            self._unpollable_warned.add(name)
+            log.warning("Not polling %s '%s': not a Twitch channel name. Use the handle (like caedvt), "
+                        "not a link or a display name.", what, name)
+            log_activity("login_skipped", what=what, value=str(name)[:80])
+        return False
+
     def check_streams(self) -> dict[str, bool]:
         if not self.streamers:
             return {}
 
-        monitored = list(self.streamers.keys())
+        # A name Twitch would refuse (a pasted link, a space) is left out,
+        # or the whole request would fail with HTTP 400 and nobody would
+        # ever read as live. Logged once per name.
+        monitored = [name for name in self.streamers if self._pollable_login(name, "streamer")]
         params = [("user_login", name) for name in monitored]
 
-        # Also check user's own channel if "I'm live" pause is enabled
-        own_channel = self.config.own_channel.lower().strip() if self.config.own_channel else ""
+        # Also check user's own channel if "I'm live" pause is enabled. A
+        # channel link or @handle in that field reads as the login.
+        own_channel = login_from_text(self.config.own_channel)
+        if self.config.own_channel and not own_channel:
+            self._pollable_login(self.config.own_channel, "your channel")
         if own_channel and self.config.im_live_pause:
             params.append(("user_login", own_channel))
 

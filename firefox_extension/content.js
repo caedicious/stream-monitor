@@ -1617,6 +1617,13 @@
   // In-app navigation fires no event a content script can hear, so the
   // top frame compares its path on this cadence.
   const ROUTE_POLL_MS = 1000;
+  // Twitch draws the dialog with "0-stream" before it has the number (42 of
+  // the owner's 257 saves were read that way). A count of 0 is a count not
+  // loaded yet: the scan rescans every second and waits this long for the
+  // number, then reports the save with count 0, which the background and
+  // the desktop take as a count not known.
+  const ALREADY_SAVED_COUNT_WAIT_MS = 20000;
+  const ALREADY_SAVED_COUNT_POLL_MS = 1000;
 
   let _saveStreakRoute = null; // routeKey() the current check belongs to
   let _saveStreakReported = false; // this visit already reported
@@ -1626,6 +1633,8 @@
   let _saveStreakRescanTimer = null;
   let _saveStreakMutationScan = null; // the pending 500 ms rescan, if any
   let _saveStreakObserver = null;
+  let _keptCountPlaceholderAt = 0; // first scan of this visit that read a 0 count
+  let _keptCountTimer = null; // the rescan a 0 count is waiting on
   // "login:count" of every kept streak this page reported, so a dialog that
   // stays up through a move (or is drawn again) reports once.
   const _keptStreaksReported = new Set();
@@ -1757,6 +1766,23 @@
     return null;
   }
 
+  // Whether a count read from the page can be reported: a number at once;
+  // a 0 only after ALREADY_SAVED_COUNT_WAIT_MS of reading 0, with a rescan
+  // every ALREADY_SAVED_COUNT_POLL_MS until then.
+  function keptCountSettled(count) {
+    if (count > 0) return true;
+    const now = Date.now();
+    if (!_keptCountPlaceholderAt) _keptCountPlaceholderAt = now;
+    if (now - _keptCountPlaceholderAt >= ALREADY_SAVED_COUNT_WAIT_MS) return true;
+    if (!_keptCountTimer) {
+      _keptCountTimer = setTimeout(() => {
+        _keptCountTimer = null;
+        scanForAlreadySaved();
+      }, ALREADY_SAVED_COUNT_POLL_MS);
+    }
+    return false;
+  }
+
   // Sends already_saved and ends this visit's scans.
   function reportAlreadySaved(streamer, count) {
     _saveStreakReported = true;
@@ -1784,6 +1810,7 @@
     if (routeKey() !== _saveStreakRoute) return false;
     const kept = findKeptStreakDialog();
     if (!kept || _keptStreaksReported.has(`${kept.streamer}:${kept.count}`)) return false;
+    if (!keptCountSettled(kept.count)) return false;
     reportAlreadySaved(kept.streamer, kept.count);
     return true;
   }
@@ -1803,6 +1830,7 @@
       const parsed = parseAlreadySavedText(text);
       if (!parsed || !cardNameFitsLogin(parsed.streamer, login)) continue;
       if (!isSaveStreakCardSentence(el)) continue;
+      if (!keptCountSettled(parsed.count)) return false;
       reportAlreadySaved(login || parsed.streamer, parsed.count);
       return true;
     }
@@ -1820,6 +1848,10 @@
     if (_saveStreakMutationScan) {
       clearTimeout(_saveStreakMutationScan);
       _saveStreakMutationScan = null;
+    }
+    if (_keptCountTimer) {
+      clearTimeout(_keptCountTimer);
+      _keptCountTimer = null;
     }
     if (_saveStreakObserver) {
       _saveStreakObserver.disconnect();
@@ -1840,6 +1872,7 @@
     _saveStreakReported = false;
     _notEligibleReported = false;
     _notEligibleSeenAt = 0;
+    _keptCountPlaceholderAt = 0;
     if (scanForKeptStreakDialog()) return;
     for (const delay of SAVE_STREAK_SCAN_DELAYS_MS) {
       _saveStreakTimers.push(setTimeout(scanForAlreadySaved, delay));
@@ -1859,6 +1892,12 @@
         if (_saveStreakMutationScan) return;
         let relevant = false;
         for (const m of mutations) {
+          if (m.type === "characterData") {
+            // The dialog's number lands in the text node it already has.
+            const holder = m.target.parentElement;
+            const text = holder ? holder.textContent : m.target.data;
+            if (text && /maintained/i.test(text)) relevant = true;
+          }
           for (const node of m.addedNodes) {
             const text = node.textContent;
             if (text && /maintained/i.test(text)) {
@@ -1874,7 +1913,7 @@
           scanForAlreadySaved();
         }, 500);
       });
-      obs.observe(document.body, { childList: true, subtree: true });
+      obs.observe(document.body, { childList: true, subtree: true, characterData: true });
       _saveStreakObserver = obs;
     }
   }
