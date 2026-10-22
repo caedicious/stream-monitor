@@ -13,9 +13,11 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+from twitch_login import login_from_text
+
 import requests
 
-VERSION = "1.12.1"
+VERSION = "1.12.2"
 
 # Configuration
 APP_NAME = "StreamMonitor"
@@ -229,12 +231,24 @@ The setup takes about 5 minutes. Let's get started!
     
     def validate_streamers(self):
         text = self.streamers_text.get("1.0", tk.END).strip()
-        streamers = [s.strip() for s in text.replace(",", "\n").split("\n") if s.strip()]
-        
-        if not streamers:
+        typed = [s.strip() for s in text.replace(",", "\n").split("\n") if s.strip()]
+
+        if not typed:
             messagebox.showerror("Error", "Please enter at least one streamer username.")
             return False
-        
+
+        # A pasted channel link or @handle becomes the login; a name Twitch
+        # would refuse fails the whole poll, so it is not accepted.
+        bad = [s for s in typed if not login_from_text(s)]
+        if bad:
+            messagebox.showerror("Not a channel name",
+                                 f"'{bad[0]}' is not a Twitch channel name. Enter the handle, like caedvt, "
+                                 "one per line, or paste channel links.")
+            return False
+        streamers = []
+        for name in (login_from_text(s) for s in typed):
+            if name not in streamers:
+                streamers.append(name)
         self.streamers = streamers
         return True
     

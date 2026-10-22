@@ -231,3 +231,44 @@ def test_pause_lift_offers_ended_stream_as_ended_candidate(monitor):
         monitor._maybe_fallback_rescue()
         assert monitor.wait_for_pending_opens(timeout=5)
     mopen.assert_called_once_with("https://www.twitch.tv/save-streak/bob?sm=1")
+
+
+# ---------------------------------------------------------------------------
+# Names Twitch would refuse stay out of the poll (v1.12.2)
+# ---------------------------------------------------------------------------
+
+def _poll_logins(mon):
+    with patch.object(mon, "_api_get", return_value={"data": []}) as mapi, \
+         patch("stream_monitor_tray.log_activity") as mlog:
+        result = mon.check_streams()
+    params = mapi.call_args.args[1]
+    skipped = [(c.kwargs["what"], c.kwargs["value"]) for c in mlog.call_args_list if c.args[0] == "login_skipped"]
+    return result, [v for k, v in params if k == "user_login"], skipped
+
+
+def test_a_channel_link_in_your_channel_is_polled_as_the_login(fresh_config):
+    """A user pasted https://www.twitch.tv/<name> into "Your Twitch Channel"
+    and every poll failed with HTTP 400. The login is read out of it."""
+    fresh_config.own_channel = "https://www.twitch.tv/Adayics"
+    fresh_config.im_live_pause = True
+    mon = sm.TwitchMonitor(fresh_config)
+    mon.streamers = {name: sm.StreamerState(name=name) for name in fresh_config.streamers}
+    result, logins, skipped = _poll_logins(mon)
+    assert logins == ["alice", "bob", "adayics"]
+    assert skipped == []
+    assert result == {"alice": False, "bob": False}
+
+
+def test_a_name_twitch_would_refuse_is_left_out_of_the_poll_and_logged_once(fresh_config):
+    fresh_config.streamers = ["alice", "my friend"]
+    fresh_config.own_channel = "my channel"
+    fresh_config.im_live_pause = True
+    mon = sm.TwitchMonitor(fresh_config)
+    mon.streamers = {name: sm.StreamerState(name=name) for name in fresh_config.streamers}
+    result, logins, skipped = _poll_logins(mon)
+    assert logins == ["alice"]
+    assert result == {"alice": False, "my friend": False}
+    assert skipped == [("streamer", "my friend"), ("your channel", "my channel")]
+    # The next poll says nothing more about them.
+    _, logins2, skipped2 = _poll_logins(mon)
+    assert logins2 == ["alice"] and skipped2 == []

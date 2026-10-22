@@ -1211,3 +1211,34 @@ def test_as03_dc5_prune_on_every_write(tmp_config_dir):
     on_disk = json.loads((tmp_config_dir / "streak_state.json").read_text(encoding="utf-8"))
     assert set(on_disk["saved"]) == {"alice"}
     assert on_disk["last_live"] == {"bob": "2026-09-27T20:00:00.000Z"}
+
+
+# ---------------------------------------------------------------------------
+# A count of 0 is a count not known (v1.12.2)
+# ---------------------------------------------------------------------------
+
+def test_a_save_with_an_unknown_count_is_a_save_and_covers_every_card(toasts):
+    """Twitch's dialog reads "0-stream" before it loads the number, and 42
+    of the owner's 257 saves had been read that way. Such a report still
+    records the save; its toast names no number; a later card with any
+    count is the stale one and ends nothing."""
+    sm.handle_streak_event(_event("already_saved", count=0))
+    assert sm.streak_saved_since_last_live("alice") == SAVED_AT
+    assert toasts == [("alice: streak is already safe", "Twitch says it was kept. Nothing to rescue for now.")]
+    toasts.clear()
+
+    with patch("stream_monitor_tray.log_activity") as mlog:
+        sm.handle_streak_event(_event("broke", count=4, detected_at="2026-09-28T05:00:00.000Z"))
+        sm.handle_streak_event(_event("in_danger", count=9, detected_at="2026-09-28T05:10:00.000Z"))
+    assert toasts == []
+    assert sm.streak_saved_since_last_live("alice") == SAVED_AT
+    assert [c.args[0] for c in mlog.call_args_list] == ["streak_event_ignored"] * 2
+    assert all(c.kwargs["reason"] == "already_saved" for c in mlog.call_args_list)
+
+
+def test_the_number_read_a_moment_later_replaces_an_unknown_count(toasts):
+    sm.handle_streak_event(_event("already_saved", count=0))
+    sm.handle_streak_event(_event("already_saved", count=43, detected_at="2026-09-28T04:00:30.000Z"))
+    assert sm._streak_state["saved"]["alice"]["count"] == 43
+    assert [title for title, _ in toasts] == ["alice: streak is already safe",
+                                              "alice: 43-stream streak is already safe"]

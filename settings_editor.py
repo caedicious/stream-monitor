@@ -11,7 +11,9 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-VERSION = "1.12.1"
+from twitch_login import login_from_text
+
+VERSION = "1.12.2"
 
 APP_NAME = "StreamMonitor"
 if sys.platform == "win32":
@@ -158,8 +160,11 @@ def form_to_config(config: dict, form: dict) -> dict:
     own_channel, im_live_pause, vod_fallback, usage_ping, and the five
     Slot mode keys. A missing key keeps the config's value."""
     new = dict(config)
-    streamers = list(form.get("streamers", config.get("streamers", [])))
-    pinned_set = set(form.get("pinned", config.get("pinned_streamers", [])))
+    # Names are kept as logins: a channel link or @handle becomes the login,
+    # a name no login can be read from stays as it is.
+    as_login = lambda name: login_from_text(name) or str(name).strip().lower()  # noqa: E731
+    streamers = [as_login(name) for name in form.get("streamers", config.get("streamers", []))]
+    pinned_set = {as_login(name) for name in form.get("pinned", config.get("pinned_streamers", []))}
     try:
         interval = int(form.get("check_interval", config.get("check_interval", 60)))
         if interval < 10:
@@ -171,7 +176,8 @@ def form_to_config(config: dict, form: dict) -> dict:
     new["client_id"] = str(form.get("client_id", config.get("client_id", ""))).strip()
     new["client_secret"] = str(form.get("client_secret", config.get("client_secret", ""))).strip()
     new["check_interval"] = interval
-    new["own_channel"] = str(form.get("own_channel", config.get("own_channel", ""))).strip()
+    own = str(form.get("own_channel", config.get("own_channel", ""))).strip()
+    new["own_channel"] = login_from_text(own) or own
     for key, default in (("im_live_pause", False), ("vod_fallback", False), ("usage_ping", True)):
         new[key] = bool(form.get(key, config.get(key, default)))
     new.update(slot_settings({key: form.get(key, config.get(key)) for key in SLOT_DEFAULTS}))
@@ -373,8 +379,16 @@ def build_settings_window(root, config: dict) -> dict:
     add_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def _add_streamer(_event=None):
-        name = add_entry.get().strip().lower()
+        typed = add_entry.get().strip()
+        if not typed:
+            return
+        # A pasted channel link or @handle becomes the login; anything else
+        # Twitch would refuse, and one such name fails the whole poll.
+        name = login_from_text(typed)
         if not name:
+            messagebox.showerror("Not a channel name",
+                                 f"'{typed}' is not a Twitch channel name. Enter the handle, like caedvt, "
+                                 "or paste the channel link.")
             return
         if name in streamer_list:
             messagebox.showinfo("Already added", f"'{name}' is already in the list.")
@@ -493,7 +507,8 @@ def build_settings_window(root, config: dict) -> dict:
     interval_entry.insert(0, str(config.get("check_interval", 60)))
     
     # Your channel section
-    ttk.Label(main_frame, text="Your Twitch Channel:", font=("", 10, "bold")).pack(anchor=tk.W, pady=(10, 0))
+    ttk.Label(main_frame, text="Your Twitch Channel (the handle, like caedvt, not the link):",
+              font=("", 10, "bold")).pack(anchor=tk.W, pady=(10, 0))
     own_channel_entry = ttk.Entry(main_frame, width=45)
     own_channel_entry.pack(fill=tk.X, pady=(5, 0))
     own_channel_entry.insert(0, config.get("own_channel", ""))
@@ -643,6 +658,13 @@ def build_settings_window(root, config: dict) -> dict:
             messagebox.showerror("Error", "Please enter your Client Secret.")
             return
         
+        own_typed = own_channel_entry.get().strip()
+        if own_typed and not login_from_text(own_typed):
+            messagebox.showerror("Not a channel name",
+                                 f"'{own_typed}' is not a Twitch channel name. Enter your handle, like caedvt, "
+                                 "or paste your channel link.")
+            return
+
         form = {
             "streamers": streamers,
             "pinned": pinned,
